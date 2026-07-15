@@ -31,6 +31,10 @@ internal sealed class RemoteAvatar : IDisposable
         if (snapshot.SpriteId != 0 && _sprites.TryGetValue(snapshot.SpriteId, out var sprite))
             _renderer.sprite = sprite;
         _renderer.flipX = snapshot.Flipped;
+        _gameObject.transform.localScale = new Vector3(
+            snapshot.ScaleX,
+            snapshot.ScaleY,
+            _gameObject.transform.localScale.z);
 
         if (!_initialized || (_gameObject.transform.position - _target).sqrMagnitude > 64f)
         {

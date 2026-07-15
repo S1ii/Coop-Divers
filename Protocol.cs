@@ -22,14 +22,16 @@ internal readonly record struct PlayerSnapshot(
     float VelocityX,
     float VelocityY,
     uint SpriteId,
+    float ScaleX,
+    float ScaleY,
     bool Flipped);
 
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 3;
+    private const byte Version = 4;
     internal const int HeaderSize = 10;
-    private const int SnapshotSize = HeaderSize + 33;
+    private const int SnapshotSize = HeaderSize + 41;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -71,7 +73,9 @@ internal static class Protocol
         WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.VelocityX);
         WriteSingle(packet.AsSpan(HeaderSize + 24), snapshot.VelocityY);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 28), snapshot.SpriteId);
-        packet[HeaderSize + 32] = snapshot.Flipped ? (byte)1 : (byte)0;
+        WriteSingle(packet.AsSpan(HeaderSize + 32), snapshot.ScaleX);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), snapshot.ScaleY);
+        packet[HeaderSize + 40] = snapshot.Flipped ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -90,16 +94,19 @@ internal static class Protocol
         var rotation = ReadSingle(packet.Slice(HeaderSize + 16));
         var velocityX = ReadSingle(packet.Slice(HeaderSize + 20));
         var velocityY = ReadSingle(packet.Slice(HeaderSize + 24));
+        var scaleX = ReadSingle(packet.Slice(HeaderSize + 32));
+        var scaleY = ReadSingle(packet.Slice(HeaderSize + 36));
         if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
             !float.IsFinite(rotation) || !float.IsFinite(velocityX) || !float.IsFinite(velocityY) ||
-            packet[HeaderSize + 32] > 1)
+            !float.IsFinite(scaleX) || !float.IsFinite(scaleY) || scaleX == 0f || scaleY == 0f ||
+            packet[HeaderSize + 40] > 1)
             return false;
 
         snapshot = new PlayerSnapshot(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
             x, y, z, rotation, velocityX, velocityY,
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 28)),
-            packet[HeaderSize + 32] == 1);
+            scaleX, scaleY, packet[HeaderSize + 40] == 1);
         return true;
     }
 
@@ -182,7 +189,7 @@ internal static class Protocol
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,
-            SceneId("Dave_Swim_0042"), true);
+            SceneId("Dave_Swim_0042"), -1.25f, 1.25f, true);
         var snapshotPacket = EncodeSnapshot(43, expected);
         if (!TryDecodeSnapshot(snapshotPacket, out sequence, out var actual) ||
             sequence != 43 || actual != expected)
@@ -190,6 +197,10 @@ internal static class Protocol
         WriteSingle(snapshotPacket.AsSpan(HeaderSize + 16), float.NaN);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid movement data");
+        snapshotPacket = EncodeSnapshot(44, expected);
+        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 32), 0f);
+        if (TryDecodeSnapshot(snapshotPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid visual scale");
     }
 
     private static void WriteSingle(Span<byte> target, float value) =>

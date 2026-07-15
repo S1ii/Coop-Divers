@@ -9,7 +9,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.3.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.4.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -120,6 +120,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
             var spriteId = _playerRenderer != null && _playerRenderer.sprite != null
                 ? Protocol.SceneId(_playerRenderer.sprite.name)
                 : 0u;
+            var visualScale = _playerRenderer != null
+                ? _playerRenderer.transform.lossyScale
+                : _player.transform.lossyScale;
             _session.SendSnapshot(new PlayerSnapshot(
                 _sceneId,
                 position.x,
@@ -129,6 +132,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 velocity.x,
                 velocity.y,
                 spriteId,
+                visualScale.x,
+                visualScale.y,
                 flipped));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
@@ -169,10 +174,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
             var spriteName = _playerRenderer != null && _playerRenderer.sprite != null
                 ? _playerRenderer.sprite.name
                 : "none";
+            var visualScale = _playerRenderer != null
+                ? _playerRenderer.transform.lossyScale
+                : player.transform.lossyScale;
             Logger.LogInfo(
                 $"PlayerCharacter: ({position.x:F2}, {position.y:F2}, {position.z:F2}); " +
                 $"rotation={rotation:F1}/{visualRotation:F1}; velocity=({velocity.x:F2}, {velocity.y:F2}); " +
-                $"sprite={spriteName}");
+                $"scale=({visualScale.x:F2}, {visualScale.y:F2}); sprite={spriteName}");
             _nextPositionLog = Time.realtimeSinceStartup + 5f;
         }
 
