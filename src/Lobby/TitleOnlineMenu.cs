@@ -22,6 +22,7 @@ internal static class TitleOnlineMenu
     private const int Ready = 107;
     private const int Start = 108;
     private const string OnlineObjectName = "DaveTheDiverMP_Online";
+    private const float NativePanelTimeout = 2f;
 
     private enum OnlineText
     {
@@ -74,12 +75,14 @@ internal static class TitleOnlineMenu
     private static readonly List<TitleMenuButton> RoomButtons = new();
     private static readonly List<TitleMenuButton> RoomLabels = new();
     private static readonly Dictionary<int, TitleMenuButton> ActionButtons = new();
+    private static readonly Dictionary<GameObject, bool> NativeContentStates = new();
     private static TitleManager _manager;
     private static TitleMenuButton _template;
-    private static GameObject _panelObject;
+    private static SettingAppPanel _nativePanel;
     private static RectTransform _roomContent;
     private static bool _titleFallback;
     private static Text _panelTitle;
+    private static string _nativeTitle = string.Empty;
     private static TitleMenuButton _editingButton;
     private static Action<string> _editingApply;
     private static string _editingValue = string.Empty;
@@ -106,6 +109,9 @@ internal static class TitleOnlineMenu
     private static string _port = "27777";
     private static string _message = string.Empty;
     private static bool _openAfterHostLoss;
+    private static bool _opening;
+    private static bool _nativeSettingsRequested;
+    private static float _nativePanelDeadline;
 
     internal static void RequestHostDisconnect()
     {
@@ -229,6 +235,8 @@ internal static class TitleOnlineMenu
 
     internal static void Tick(ProbeBehaviour probe)
     {
+        if (_opening)
+            TryFinishOpen();
         if (!_visible || _manager == null || probe == null)
             return;
 
@@ -340,7 +348,7 @@ internal static class TitleOnlineMenu
 
     private static void Open(TitleManager manager)
     {
-        if (manager == null || _visible)
+        if (manager == null || _visible || _opening)
             return;
         _manager = manager;
         _template = null;
@@ -352,12 +360,60 @@ internal static class TitleOnlineMenu
                 continue;
             TitleButtons.Add(button);
             _template ??= button;
-            button.gameObject.SetActive(false);
         }
-        if (_template == null || !CreatePanel(manager))
+        if (_template == null)
         {
             Close();
             return;
+        }
+
+        _opening = true;
+        _nativeSettingsRequested = true;
+        _nativePanelDeadline = Time.realtimeSinceStartup + NativePanelTimeout;
+        try
+        {
+            manager.OnClickSetting();
+        }
+        catch (Exception exception)
+        {
+            ProbeBehaviour.Logger?.LogWarning($"Online room: settings open failed: {exception.Message}");
+        }
+        TryFinishOpen();
+    }
+
+    private static void TryFinishOpen()
+    {
+        if (!_opening || _manager == null)
+            return;
+
+        var source = FindSettingsPanel(_manager);
+        if (source != null && source.gameObject.activeInHierarchy && source.scrollContent != null)
+        {
+            UseNativePanel(source);
+            FinishOpen();
+            return;
+        }
+        if (Time.realtimeSinceStartup < _nativePanelDeadline)
+            return;
+        ProbeBehaviour.Logger?.LogWarning("Online room: native settings panel did not open; using title fallback");
+        if (CreateFallbackPanel())
+            FinishOpen();
+        else
+            Close();
+    }
+
+    private static void FinishOpen()
+    {
+        if (_manager == null)
+        {
+            Close();
+            return;
+        }
+        for (var index = 0; index < TitleButtons.Count; index++)
+        {
+            var button = TitleButtons[index];
+            if (button != null)
+                button.gameObject.SetActive(false);
         }
 
         var probe = ProbeBehaviour.Instance;
@@ -375,10 +431,11 @@ internal static class TitleOnlineMenu
         _lastConnected = false;
         _lastRemoteName = string.Empty;
         _lastLanguage = Languages.Unknown;
-        manager.buttons.Clear();
+        _opening = false;
+        _manager.buttons.Clear();
         MarkDirty();
         Rebuild(probe, probe?._session);
-        ProbeBehaviour.Logger?.LogInfo("Title online room opened");
+        ProbeBehaviour.Logger?.LogInfo($"Title online room opened ({(_titleFallback ? "fallback" : "native settings")})");
     }
 
     private static void OpenAfterHostLoss(TitleManager manager)
@@ -387,60 +444,28 @@ internal static class TitleOnlineMenu
             Open(manager);
     }
 
-    private static bool CreatePanel(TitleManager manager)
+    private static void UseNativePanel(SettingAppPanel panel)
     {
-        var source = FindSettingsPanel(manager);
-        var openedNativeSettings = false;
-        if (source == null)
-        {
-            try
-            {
-                manager.OnClickSetting();
-            }
-            catch (Exception exception)
-            {
-                ProbeBehaviour.Logger?.LogWarning($"Online room: settings warm-up failed: {exception.Message}");
-            }
-            source = FindSettingsPanel(manager);
-            openedNativeSettings = source != null;
-        }
-        if (source == null || source.scrollContent == null)
-        {
-            ProbeBehaviour.Logger?.LogWarning("Online room: settings panel is not loaded; using title fallback");
-            _titleFallback = true;
-            _roomContent = _template.transform.parent.GetComponent<RectTransform>();
-            return _roomContent != null;
-        }
-
-        var panelObject = UnityEngine.Object.Instantiate(source.gameObject, source.transform.parent);
-        if (openedNativeSettings)
-            source.gameObject.SetActive(false);
-        panelObject.name = "DaveTheDiverMP_OnlineRoom";
-        panelObject.SetActive(false);
-        var panel = panelObject.GetComponent<SettingAppPanel>();
-        if (panel == null || panel.scrollContent == null)
-        {
-            UnityEngine.Object.Destroy(panelObject);
-            return false;
-        }
-        panel.enabled = false;
+        _nativePanel = panel;
         _roomContent = panel.scrollContent;
+        NativeContentStates.Clear();
         for (var index = 0; index < _roomContent.childCount; index++)
-            _roomContent.GetChild(index).gameObject.SetActive(false);
+        {
+            var content = _roomContent.GetChild(index).gameObject;
+            NativeContentStates[content] = content.activeSelf;
+            content.SetActive(false);
+        }
         _roomContent.gameObject.SetActive(true);
         _panelTitle = panel.text;
-        var groups = panelObject.GetComponentsInChildren<CanvasGroup>(true);
-        for (var index = 0; index < groups.Length; index++)
-        {
-            groups[index].alpha = 1f;
-            groups[index].interactable = true;
-            groups[index].blocksRaycasts = true;
-        }
-        panelObject.transform.localScale = Vector3.one;
-        panelObject.SetActive(true);
-        _panelObject = panelObject;
+        _nativeTitle = _panelTitle?.text ?? string.Empty;
         _titleFallback = false;
-        return true;
+    }
+
+    private static bool CreateFallbackPanel()
+    {
+        _roomContent = _template?.transform.parent.GetComponent<RectTransform>();
+        _titleFallback = _roomContent != null;
+        return _titleFallback;
     }
 
     private static SettingAppPanel FindSettingsPanel(TitleManager manager)
@@ -461,11 +486,10 @@ internal static class TitleOnlineMenu
     {
         FinishEdit(false, string.Empty);
         DestroyRoom();
-        if (_panelObject != null)
-            UnityEngine.Object.Destroy(_panelObject);
-        _panelObject = null;
+        RestoreNativePanel();
         _roomContent = null;
         _panelTitle = null;
+        _nativeTitle = string.Empty;
         _titleFallback = false;
 
         if (_manager != null)
@@ -503,6 +527,33 @@ internal static class TitleOnlineMenu
         _lastConnected = false;
         _lastRemoteName = string.Empty;
         _lastLanguage = Languages.Unknown;
+        _opening = false;
+        _nativeSettingsRequested = false;
+        _nativePanelDeadline = 0f;
+    }
+
+    private static void RestoreNativePanel()
+    {
+        if (_nativePanel != null)
+        {
+            foreach (var state in NativeContentStates)
+            {
+                if (state.Key != null)
+                    state.Key.SetActive(state.Value);
+            }
+            if (_nativePanel.text != null)
+                _nativePanel.text.text = _nativeTitle;
+            if (_nativePanel.gameObject.activeInHierarchy)
+                _nativePanel.Close();
+        }
+        else if (_nativeSettingsRequested)
+        {
+            var panel = FindSettingsPanel(_manager);
+            if (panel != null && panel.gameObject.activeInHierarchy)
+                panel.Close();
+        }
+        NativeContentStates.Clear();
+        _nativePanel = null;
     }
 
     private static void Rebuild(ProbeBehaviour probe, UdpSession session)
