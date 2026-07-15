@@ -18,7 +18,7 @@
     <Reference Include="UnityEngine.CoreModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
   </ItemGroup>
 
-  <Target Name="Deploy" AfterTargets="Build">
+  <Target Name="Deploy" AfterTargets="Build" Condition="'$(DeployPlugin)' != 'false'">
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="..\DAVE THE DIVER\BepInEx\plugins\DaveTheDiverMP" />
   </Target>
 </Project>

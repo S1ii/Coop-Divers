@@ -1,5 +1,6 @@
 using System;
 using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
 using Steamworks;
@@ -13,7 +14,19 @@ public sealed class Plugin : BasePlugin
 {
     public override void Load()
     {
+        Protocol.SelfTest();
+
+        var role = Config.Bind("Network", "Role", SessionRole.Offline,
+            "Offline, Host, or Client");
+        var address = Config.Bind("Network", "Address", "127.0.0.1",
+            "Host IPv4 address used by clients");
+        var port = Config.Bind("Network", "Port", 27777,
+            new ConfigDescription("UDP listen port", new AcceptableValueRange<int>(1024, 65535)));
+
         ProbeBehaviour.Logger = Log;
+        ProbeBehaviour.Role = role.Value;
+        ProbeBehaviour.Address = address.Value;
+        ProbeBehaviour.Port = port.Value;
         Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
         AddComponent<ProbeBehaviour>();
     }
@@ -22,18 +35,30 @@ public sealed class Plugin : BasePlugin
 public sealed class ProbeBehaviour : MonoBehaviour
 {
     internal static ManualLogSource Logger { get; set; }
+    internal static SessionRole Role { get; set; }
+    internal static string Address { get; set; } = string.Empty;
+    internal static int Port { get; set; }
 
     private string _scene = string.Empty;
     private bool _playerPresent;
     private float _nextScan;
     private float _nextPositionLog;
+    private UdpSession _session;
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
     {
     }
 
+    private void Start()
+    {
+        _session = new UdpSession(Logger);
+        _session.Start(Role, Address, Port);
+    }
+
     private void Update()
     {
+        _session?.Update(Time.realtimeSinceStartup);
+
         if (Time.realtimeSinceStartup < _nextScan)
             return;
 
@@ -63,5 +88,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
 
         _playerPresent = true;
+    }
+
+    private void OnDestroy()
+    {
+        _session?.Dispose();
     }
 }
