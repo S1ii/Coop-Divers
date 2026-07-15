@@ -83,8 +83,8 @@ internal static class TitleOnlineMenu
     private static SettingAppPanel _nativePanel;
     private static RectTransform _roomContent;
     private static bool _titleFallback;
-    private static Text _panelTitle;
-    private static string _nativeTitle = string.Empty;
+    private static Text _nativeHeader;
+    private static string _nativeHeaderTitle = string.Empty;
     private static Vector2 _nativeContentSize;
     private static bool _visible;
     private static bool _dirty;
@@ -443,12 +443,17 @@ internal static class TitleOnlineMenu
             DisableNativeControl(layout);
         foreach (var fitter in _roomContent.GetComponents<ContentSizeFitter>())
             DisableNativeControl(fitter);
+        foreach (var scroll in panel.GetComponentsInChildren<ScrollRect>(true))
+        {
+            DisableNativeControl(scroll);
+            HideNativeObject(scroll.horizontalScrollbar?.gameObject);
+            HideNativeObject(scroll.verticalScrollbar?.gameObject);
+        }
         _roomContent.gameObject.SetActive(true);
         _roomContent.sizeDelta = new Vector2(_roomContent.sizeDelta.x, 460f);
-        _panelTitle = panel.text;
-        _nativeTitle = _panelTitle?.text ?? string.Empty;
-        if (_panelTitle != null)
-            _panelTitle.text = Text(OnlineText.Online, CurrentLanguage());
+        _nativeHeader = FindPanelHeader(panel);
+        _nativeHeaderTitle = _nativeHeader?.text ?? string.Empty;
+        SetPanelTitle();
         _titleFallback = false;
     }
 
@@ -478,8 +483,8 @@ internal static class TitleOnlineMenu
         DestroyRoom();
         RestoreNativePanel();
         _roomContent = null;
-        _panelTitle = null;
-        _nativeTitle = string.Empty;
+        _nativeHeader = null;
+        _nativeHeaderTitle = string.Empty;
         _titleFallback = false;
 
         if (_manager != null)
@@ -531,8 +536,8 @@ internal static class TitleOnlineMenu
                 if (state.Key != null)
                     state.Key.SetActive(state.Value);
             }
-            if (_nativePanel.text != null)
-                _nativePanel.text.text = _nativeTitle;
+            if (_nativeHeader != null)
+                _nativeHeader.text = _nativeHeaderTitle;
             if (_roomContent != null)
                 _roomContent.sizeDelta = _nativeContentSize;
             foreach (var state in NativeControlStates)
@@ -554,6 +559,38 @@ internal static class TitleOnlineMenu
         _nativePanel = null;
     }
 
+    private static void HideNativeObject(GameObject gameObject)
+    {
+        if (gameObject == null)
+            return;
+        if (!NativeContentStates.ContainsKey(gameObject))
+            NativeContentStates.Add(gameObject, gameObject.activeSelf);
+        gameObject.SetActive(false);
+    }
+
+    private static Text FindPanelHeader(SettingAppPanel panel)
+    {
+        Text header = null;
+        var highest = float.MinValue;
+        foreach (var text in panel.GetComponentsInChildren<Text>(true))
+        {
+            if (text == null || (_roomContent != null && text.transform.IsChildOf(_roomContent)))
+                continue;
+            var y = text.rectTransform.position.y;
+            if (y <= highest)
+                continue;
+            highest = y;
+            header = text;
+        }
+        return header;
+    }
+
+    private static void SetPanelTitle()
+    {
+        if (_nativeHeader != null)
+            _nativeHeader.text = Text(OnlineText.Online, CurrentLanguage());
+    }
+
     private static void DisableNativeControl(Behaviour control)
     {
         if (control == null || NativeControlStates.ContainsKey(control))
@@ -569,16 +606,15 @@ internal static class TitleOnlineMenu
         _dirty = false;
         DestroyRoom();
         _manager.buttons.Clear();
-        if (_panelTitle != null)
-            _panelTitle.text = Text(OnlineText.Online, CurrentLanguage());
+        SetPanelTitle();
 
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
-            AddAction(language => Text(OnlineText.CreateLobby, language), Host);
-            AddAction(language => Text(OnlineText.Join, language), Join);
             AddInput(OnlineText.Name, _name, 24, InputField.ContentType.Standard, value => _name = value);
             AddInput(OnlineText.HostIp, _address, 45, InputField.ContentType.Standard, value => _address = value);
             AddInput(OnlineText.Port, _port, 5, InputField.ContentType.IntegerNumber, value => _port = value);
+            AddAction(language => Text(OnlineText.CreateLobby, language), Host);
+            AddAction(language => Text(OnlineText.Join, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
         }
         else if (ProbeBehaviour.Role == SessionRole.Host)
@@ -670,22 +706,7 @@ internal static class TitleOnlineMenu
         labelRect.offsetMin = Vector2.zero;
         labelRect.offsetMax = Vector2.zero;
 
-        Image inputTemplate = null;
-        foreach (var candidate in row.GetComponentsInChildren<Image>(true))
-        {
-            if (candidate != null)
-            {
-                inputTemplate = candidate;
-                break;
-            }
-        }
-        if (inputTemplate == null)
-        {
-            UnityEngine.Object.Destroy(row);
-            return;
-        }
-
-        var fieldObject = UnityEngine.Object.Instantiate(inputTemplate.gameObject, row.transform);
+        var fieldObject = UnityEngine.Object.Instantiate(labelText.gameObject, row.transform);
         fieldObject.name = "DaveTheDiverMP_Input";
         fieldObject.transform.SetParent(row.transform, false);
         var fieldRect = fieldObject.GetComponent<RectTransform>();
@@ -693,30 +714,13 @@ internal static class TitleOnlineMenu
         fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
         fieldRect.offsetMin = Vector2.zero;
         fieldRect.offsetMax = Vector2.zero;
-        foreach (var text in fieldObject.GetComponentsInChildren<Text>(true))
-            text.enabled = false;
-        foreach (var pointer in fieldObject.GetComponentsInChildren<PointerEventComponent>(true))
-            pointer.enabled = false;
-        var inputButton = fieldObject.GetComponent<TitleMenuButton>();
-        if (inputButton != null)
-            inputButton.enabled = false;
-        var image = fieldObject.GetComponent<Image>();
-        image.raycastTarget = true;
-        image.color = new Color(0.02f, 0.12f, 0.18f, 0.75f);
-
-        var valueObject = UnityEngine.Object.Instantiate(labelText.gameObject, fieldObject.transform);
-        valueObject.name = "Text";
-        var valueText = valueObject.GetComponent<Text>();
+        var valueText = fieldObject.GetComponent<Text>();
+        valueText.text = value ?? string.Empty;
         valueText.alignment = TextAnchor.MiddleLeft;
-        valueText.raycastTarget = false;
-        var valueRect = valueText.rectTransform;
-        valueRect.anchorMin = new Vector2(0.06f, 0f);
-        valueRect.anchorMax = new Vector2(0.94f, 1f);
-        valueRect.offsetMin = Vector2.zero;
-        valueRect.offsetMax = Vector2.zero;
+        valueText.raycastTarget = true;
 
         var input = fieldObject.AddComponent<InputField>();
-        input.targetGraphic = image;
+        input.targetGraphic = valueText;
         input.textComponent = valueText;
         input.characterLimit = limit;
         input.contentType = contentType;
