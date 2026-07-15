@@ -15,11 +15,8 @@
     <Reference Include="Assembly-CSharp" HintPath="..\DAVE THE DIVER\BepInEx\interop\Assembly-CSharp.dll" Private="false" />
     <Reference Include="Il2Cppmscorlib" HintPath="..\DAVE THE DIVER\BepInEx\interop\Il2Cppmscorlib.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="..\DAVE THE DIVER\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
-    <Reference Include="Unity.TextMeshPro" HintPath="..\DAVE THE DIVER\BepInEx\interop\Unity.TextMeshPro.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
-    <Reference Include="UnityEngine.TextCoreTextEngineModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.TextCoreTextEngineModule.dll" Private="false" />
-    <Reference Include="UnityEngine.UI" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.UI.dll" Private="false" />
-    <Reference Include="UnityEngine.UIModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="UnityEngine.TextRenderingModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.TextRenderingModule.dll" Private="false" />
   </ItemGroup>
 
   <Target Name="Deploy" AfterTargets="Build" Condition="'$(DeployPlugin)' != 'false'">

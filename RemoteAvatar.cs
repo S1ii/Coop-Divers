@@ -1,5 +1,4 @@
 using System;
-using TMPro;
 using UnityEngine;
 
 namespace DaveTheDiverMP;
@@ -10,7 +9,7 @@ internal sealed class RemoteAvatar : IDisposable
     private SpriteRenderer _renderer;
     private SpriteRenderer _sourceRenderer;
     private GameObject _nameObject;
-    private TextMeshPro _nameText;
+    private TextMesh _nameText;
     private Vector3 _target;
     private Vector3 _velocity;
     private float _targetRotation;
@@ -107,25 +106,22 @@ internal sealed class RemoteAvatar : IDisposable
         }
 
         _nameObject = new GameObject("DTMP Remote Name");
-        _nameText = _nameObject.AddComponent<TextMeshPro>();
+        _nameText = _nameObject.AddComponent<TextMesh>();
         _nameText.text = Protocol.NormalizePlayerName(playerName);
-        _nameText.alignment = TextAlignmentOptions.Center;
-        _nameText.fontSize = 4f;
+        _nameText.anchor = TextAnchor.MiddleCenter;
+        _nameText.alignment = TextAlignment.Center;
+        _nameText.fontSize = 64;
+        _nameText.characterSize = 0.08f;
         _nameText.color = Color.white;
-        _nameText.outlineColor = new Color32(0, 0, 0, 230);
-        _nameText.outlineWidth = 0.22f;
-        foreach (var existingText in Resources.FindObjectsOfTypeAll<TMP_Text>())
+        var font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        if (font != null)
         {
-            if (existingText != null && existingText.font != null)
-            {
-                _nameText.font = existingText.font;
-                break;
-            }
+            _nameText.font = font;
+            _nameObject.GetComponent<MeshRenderer>().sharedMaterial = font.material;
         }
-        _nameText.sortingLayerID = _renderer.sortingLayerID;
-        _nameText.sortingOrder = _renderer.sortingOrder + 100;
-        _nameText.rectTransform.sizeDelta = new Vector2(20f, 4f);
-        _nameObject.transform.localScale = Vector3.one * 0.1f;
+        var nameRenderer = _nameObject.GetComponent<MeshRenderer>();
+        nameRenderer.sortingLayerID = _renderer.sortingLayerID;
+        nameRenderer.sortingOrder = _renderer.sortingOrder + 100;
         _nameObject.transform.position = position + Vector3.up * _nameOffset;
     }
 
