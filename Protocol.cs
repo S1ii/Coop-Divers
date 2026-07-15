@@ -99,6 +99,9 @@ internal static class Protocol
         if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
             !float.IsFinite(rotation) || !float.IsFinite(velocityX) || !float.IsFinite(velocityY) ||
             !float.IsFinite(scaleX) || !float.IsFinite(scaleY) || scaleX == 0f || scaleY == 0f ||
+            MathF.Abs(x) > 1_000_000f || MathF.Abs(y) > 1_000_000f || MathF.Abs(z) > 1_000_000f ||
+            MathF.Abs(velocityX) > 10_000f || MathF.Abs(velocityY) > 10_000f ||
+            MathF.Abs(scaleX) > 100f || MathF.Abs(scaleY) > 100f ||
             packet[HeaderSize + 40] > 1)
             return false;
 
@@ -201,6 +204,10 @@ internal static class Protocol
         WriteSingle(snapshotPacket.AsSpan(HeaderSize + 32), 0f);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid visual scale");
+        snapshotPacket = EncodeSnapshot(45, expected);
+        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 4), float.MaxValue);
+        if (TryDecodeSnapshot(snapshotPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted unsafe transform data");
     }
 
     private static void WriteSingle(Span<byte> target, float value) =>
