@@ -10,7 +10,8 @@ internal enum PacketType : byte
     HelloAck = 2,
     Heartbeat = 3,
     Disconnect = 4,
-    PlayerSnapshot = 5
+    PlayerSnapshot = 5,
+    SceneState = 6
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -29,7 +30,7 @@ internal readonly record struct PlayerSnapshot(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 4;
+    private const byte Version = 5;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
     private const int MaxPlayerNameCharacters = 24;
@@ -113,17 +114,18 @@ internal static class Protocol
         return true;
     }
 
-    internal static byte[] EncodeIdentity(PacketType type, uint sequence, string playerName)
+    internal static byte[] EncodeIdentity(PacketType type, uint sequence, uint buildId, string playerName)
     {
         if (type != PacketType.Hello && type != PacketType.HelloAck)
             throw new ArgumentOutOfRangeException(nameof(type));
 
         var name = NormalizePlayerName(playerName);
         var encodedName = StrictUtf8.GetBytes(name);
-        var packet = new byte[HeaderSize + 1 + encodedName.Length];
+        var packet = new byte[HeaderSize + 5 + encodedName.Length];
         Encode(type, sequence).CopyTo(packet, 0);
-        packet[HeaderSize] = (byte)encodedName.Length;
-        encodedName.CopyTo(packet, HeaderSize + 1);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), buildId);
+        packet[HeaderSize + 4] = (byte)encodedName.Length;
+        encodedName.CopyTo(packet, HeaderSize + 5);
         return packet;
     }
 
@@ -131,23 +133,46 @@ internal static class Protocol
         ReadOnlySpan<byte> packet,
         PacketType expectedType,
         out uint sequence,
+        out uint buildId,
         out string playerName)
     {
         sequence = 0;
+        buildId = 0;
         playerName = string.Empty;
         if (!TryDecode(packet, out var type, out sequence) || type != expectedType ||
-            packet.Length < HeaderSize + 1 || packet.Length != HeaderSize + 1 + packet[HeaderSize])
+            packet.Length < HeaderSize + 5 ||
+            packet.Length != HeaderSize + 5 + packet[HeaderSize + 4])
             return false;
 
         try
         {
-            playerName = NormalizePlayerName(StrictUtf8.GetString(packet.Slice(HeaderSize + 1)));
+            buildId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+            playerName = NormalizePlayerName(StrictUtf8.GetString(packet.Slice(HeaderSize + 5)));
             return true;
         }
         catch (DecoderFallbackException)
         {
             return false;
         }
+    }
+
+    internal static byte[] EncodeSceneState(uint sequence, uint sceneId)
+    {
+        var packet = new byte[HeaderSize + 4];
+        Encode(PacketType.SceneState, sequence).CopyTo(packet, 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
+        return packet;
+    }
+
+    internal static bool TryDecodeSceneState(ReadOnlySpan<byte> packet, out uint sequence, out uint sceneId)
+    {
+        sequence = 0;
+        sceneId = 0;
+        if (packet.Length != HeaderSize + 4 ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.SceneState)
+            return false;
+        sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        return true;
     }
 
     internal static string NormalizePlayerName(string playerName)
@@ -182,13 +207,18 @@ internal static class Protocol
         if (TryDecode(packet, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid magic");
 
-        var identityPacket = EncodeIdentity(PacketType.Hello, 43, "Дайвер");
-        if (!TryDecodeIdentity(identityPacket, PacketType.Hello, out sequence, out var playerName) ||
-            sequence != 43 || playerName != "Дайвер")
+        var identityPacket = EncodeIdentity(PacketType.Hello, 43, 0x12345678, "Дайвер");
+        if (!TryDecodeIdentity(identityPacket, PacketType.Hello, out sequence, out var buildId, out var playerName) ||
+            sequence != 43 || buildId != 0x12345678 || playerName != "Дайвер")
             throw new InvalidOperationException("Identity round-trip failed");
         identityPacket[^1] = 0xff;
-        if (TryDecodeIdentity(identityPacket, PacketType.Hello, out _, out _))
+        if (TryDecodeIdentity(identityPacket, PacketType.Hello, out _, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid UTF-8 identity");
+
+        var scenePacket = EncodeSceneState(44, SceneId("A02_01_01"));
+        if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId) ||
+            sequence != 44 || sceneId != SceneId("A02_01_01"))
+            throw new InvalidOperationException("Scene state round-trip failed");
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,

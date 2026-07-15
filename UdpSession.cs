@@ -25,11 +25,17 @@ internal sealed class UdpSession : IDisposable
     private SessionRole _role;
     private string _localName = "Diver";
     private string _remoteName = "Diver";
+    private uint _buildId;
+    private uint _localSceneId;
+    private uint _remoteSceneId;
+    private uint _lastRejectedBuildId;
     private uint _sequence;
     private float _lastReceive;
     private float _nextSend;
     private bool _connected;
+    private bool _hasRemoteScene;
     private bool _hasSnapshot;
+    private uint _lastSceneSequence;
     private uint _lastSnapshotSequence;
     private PlayerSnapshot _snapshot;
 
@@ -38,6 +44,17 @@ internal sealed class UdpSession : IDisposable
     internal bool Connected => _connected;
     internal string RemoteName => _remoteName;
     internal int LocalPort => ((IPEndPoint)_udp.Client.LocalEndPoint).Port;
+    internal bool SceneMatches(uint sceneId) =>
+        _connected && _hasRemoteScene && _remoteSceneId == sceneId;
+
+    internal void SetLocalScene(uint sceneId)
+    {
+        if (_localSceneId == sceneId)
+            return;
+        _localSceneId = sceneId;
+        if (_connected)
+            SendSceneState();
+    }
 
     internal void SendSnapshot(PlayerSnapshot snapshot)
     {
@@ -54,10 +71,11 @@ internal sealed class UdpSession : IDisposable
         return true;
     }
 
-    internal void Start(SessionRole role, string address, int port, string localName)
+    internal void Start(SessionRole role, string address, int port, string localName, uint buildId)
     {
         _role = role;
         _localName = Protocol.NormalizePlayerName(localName);
+        _buildId = buildId;
         if (role == SessionRole.Offline)
         {
             _log.LogInfo("Network: Offline");
@@ -100,8 +118,7 @@ internal sealed class UdpSession : IDisposable
 
         if (_connected && now - _lastReceive > 5f)
         {
-            _connected = false;
-            _remoteName = "Diver";
+            ResetPeerState();
             _log.LogWarning("Network: peer timed out");
             if (_role == SessionRole.Host)
                 _remote = null;
@@ -114,7 +131,7 @@ internal sealed class UdpSession : IDisposable
         if (_role == SessionRole.Client && !_connected)
             SendIdentity(PacketType.Hello);
         else if (_remote != null)
-            Send(PacketType.Heartbeat);
+            SendSceneState();
     }
 
     private async Task ReceiveLoop()
@@ -144,31 +161,66 @@ internal sealed class UdpSession : IDisposable
         if (_role == SessionRole.Host && _remote == null)
         {
             if (type != PacketType.Hello ||
-                !Protocol.TryDecodeIdentity(received.Buffer, PacketType.Hello, out _, out _remoteName))
+                !Protocol.TryDecodeIdentity(
+                    received.Buffer, PacketType.Hello, out _, out var remoteBuildId, out var remoteName))
                 return;
+            if (remoteBuildId != _buildId)
+            {
+                if (_lastRejectedBuildId != remoteBuildId)
+                    _log.LogWarning($"Network: rejected incompatible build {remoteBuildId:X8}; expected {_buildId:X8}");
+                _lastRejectedBuildId = remoteBuildId;
+                return;
+            }
+            _remoteName = remoteName;
             _remote = received.RemoteEndPoint;
         }
 
         if (_remote == null || !received.RemoteEndPoint.Equals(_remote))
             return;
 
-        _lastReceive = now;
-
         if (type == PacketType.PlayerSnapshot)
         {
-            if (IsNewer(sequence, _lastSnapshotSequence) &&
-                Protocol.TryDecodeSnapshot(received.Buffer, out _, out _snapshot))
+            if (_connected && Protocol.TryDecodeSnapshot(received.Buffer, out _, out var snapshot))
             {
-                _lastSnapshotSequence = sequence;
-                _hasSnapshot = true;
+                _lastReceive = now;
+                if (IsNewer(sequence, _lastSnapshotSequence))
+                {
+                    _lastSnapshotSequence = sequence;
+                    _snapshot = snapshot;
+                    _hasSnapshot = true;
+                }
             }
+            return;
+        }
+
+        if (type == PacketType.SceneState)
+        {
+            if (_connected &&
+                Protocol.TryDecodeSceneState(received.Buffer, out var sceneSequence, out var sceneId))
+            {
+                _lastReceive = now;
+                if (IsNewer(sceneSequence, _lastSceneSequence))
+                {
+                    _lastSceneSequence = sceneSequence;
+                    if (!_hasRemoteScene || _remoteSceneId != sceneId)
+                        _log.LogInfo($"Network: peer scene {sceneId:X8}");
+                    _remoteSceneId = sceneId;
+                    _hasRemoteScene = true;
+                }
+            }
+            return;
+        }
+
+        if (type == PacketType.Heartbeat)
+        {
+            if (_connected)
+                _lastReceive = now;
             return;
         }
 
         if (type == PacketType.Disconnect)
         {
-            _connected = false;
-            _remoteName = "Diver";
+            ResetPeerState();
             _log.LogInfo("Network: peer disconnected");
             if (_role == SessionRole.Host)
                 _remote = null;
@@ -177,20 +229,28 @@ internal sealed class UdpSession : IDisposable
 
         if (_role == SessionRole.Host && type == PacketType.Hello)
         {
-            if (!Protocol.TryDecodeIdentity(received.Buffer, PacketType.Hello, out _, out _remoteName))
+            if (!Protocol.TryDecodeIdentity(
+                    received.Buffer, PacketType.Hello, out _, out var remoteBuildId, out _remoteName) ||
+                remoteBuildId != _buildId)
                 return;
             if (!_connected)
                 _log.LogInfo($"Network: {_remoteName} connected from {_remote}");
             _connected = true;
+            _lastReceive = now;
             SendIdentity(PacketType.HelloAck);
+            SendSceneState();
         }
         else if (_role == SessionRole.Client && type == PacketType.HelloAck)
         {
-            if (!Protocol.TryDecodeIdentity(received.Buffer, PacketType.HelloAck, out _, out _remoteName))
+            if (!Protocol.TryDecodeIdentity(
+                    received.Buffer, PacketType.HelloAck, out _, out var remoteBuildId, out _remoteName) ||
+                remoteBuildId != _buildId)
                 return;
             if (!_connected)
                 _log.LogInfo($"Network: connected to {_remoteName}");
             _connected = true;
+            _lastReceive = now;
+            SendSceneState();
         }
     }
 
@@ -201,8 +261,11 @@ internal sealed class UdpSession : IDisposable
 
     private void SendIdentity(PacketType type)
     {
-        Send(Protocol.EncodeIdentity(type, ++_sequence, _localName));
+        Send(Protocol.EncodeIdentity(type, ++_sequence, _buildId, _localName));
     }
+
+    private void SendSceneState() =>
+        Send(Protocol.EncodeSceneState(++_sequence, _localSceneId));
 
     private void Send(byte[] packet)
     {
@@ -221,6 +284,18 @@ internal sealed class UdpSession : IDisposable
     private static bool IsNewer(uint sequence, uint previous) =>
         unchecked((int)(sequence - previous)) > 0;
 
+    private void ResetPeerState()
+    {
+        _connected = false;
+        _remoteName = "Diver";
+        _remoteSceneId = 0;
+        _hasRemoteScene = false;
+        _lastSceneSequence = 0;
+        _snapshot = default;
+        _hasSnapshot = false;
+        _lastSnapshotSequence = 0;
+    }
+
     public void Dispose()
     {
         if (_connected)
@@ -228,7 +303,6 @@ internal sealed class UdpSession : IDisposable
         _stop.Cancel();
         _udp?.Dispose();
         _udp = null;
-        _connected = false;
-        _remoteName = "Diver";
+        ResetPeerState();
     }
 }

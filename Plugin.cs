@@ -9,7 +9,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.4.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.5.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -76,9 +76,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private void Start()
     {
         var localName = Plugin.ResolvePlayerName(ConfiguredName);
+        var buildId = Protocol.SceneId(
+            $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}");
         _session = new UdpSession(Logger);
-        _session.Start(Role, Address, Port, localName);
-        Logger.LogInfo($"Network identity: {localName}");
+        _session.Start(Role, Address, Port, localName, buildId);
+        Logger.LogInfo($"Network identity: {localName}; build={buildId:X8}");
     }
 
     private void Update()
@@ -91,6 +93,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _player = null;
             _playerRenderer = null;
             _remoteAvatar.Clear();
+            _session?.SetLocalScene(_sceneId);
             Logger.LogInfo($"Scene: {_scene}");
         }
 
@@ -98,14 +101,15 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
-            if (_player != null && snapshot.SceneId == _sceneId)
+            if (_player != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
                 _remoteAvatar.Apply(snapshot, _player, _session.RemoteName);
             else
                 _remoteAvatar.Clear();
         }
         _remoteAvatar.Update(Time.deltaTime);
 
-        if (_session?.Connected == true && _player != null && Time.realtimeSinceStartup >= _nextSnapshot)
+        if (_session != null && _session.SceneMatches(_sceneId) &&
+            _player != null && Time.realtimeSinceStartup >= _nextSnapshot)
         {
             var position = _player.transform.position;
             var controller = _player.Controller2D;
@@ -137,7 +141,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 flipped));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
-        else if (_session?.Connected != true)
+        else if (_session == null || !_session.SceneMatches(_sceneId))
         {
             _remoteAvatar.Clear();
         }
