@@ -15,14 +15,14 @@ internal static class TitleOnlineMenu
     private const int Online = 100;
     private const int Host = 101;
     private const int Join = 102;
-    private const int EditName = 103;
-    private const int EditAddress = 104;
-    private const int EditPort = 105;
     private const int Back = 106;
     private const int Ready = 107;
     private const int Start = 108;
     private const string OnlineObjectName = "DaveTheDiverMP_Online";
     private const float NativePanelTimeout = 2f;
+    private const float RowStartY = -32f;
+    private const float RowStepY = 68f;
+    private const float RowHeight = 56f;
 
     private enum OnlineText
     {
@@ -74,8 +74,10 @@ internal static class TitleOnlineMenu
     private static readonly List<TitleMenuButton> TitleButtons = new();
     private static readonly List<TitleMenuButton> RoomButtons = new();
     private static readonly List<TitleMenuButton> RoomLabels = new();
+    private static readonly List<GameObject> RoomFields = new();
     private static readonly Dictionary<int, TitleMenuButton> ActionButtons = new();
     private static readonly Dictionary<GameObject, bool> NativeContentStates = new();
+    private static readonly Dictionary<Behaviour, bool> NativeControlStates = new();
     private static TitleManager _manager;
     private static TitleMenuButton _template;
     private static SettingAppPanel _nativePanel;
@@ -83,11 +85,7 @@ internal static class TitleOnlineMenu
     private static bool _titleFallback;
     private static Text _panelTitle;
     private static string _nativeTitle = string.Empty;
-    private static TitleMenuButton _editingButton;
-    private static Action<string> _editingApply;
-    private static string _editingValue = string.Empty;
-    private static int _editingLimit;
-    private static OnlineText _editingLabel;
+    private static Vector2 _nativeContentSize;
     private static bool _visible;
     private static bool _dirty;
     private static bool _clientReady;
@@ -194,15 +192,6 @@ internal static class TitleOnlineMenu
                 _lastStateRevision = 0;
                 _clientWasConnected = false;
                 break;
-            case EditName:
-                Edit(_name, 24, EditName, OnlineText.Name, value => _name = value);
-                return true;
-            case EditAddress:
-                Edit(_address, 45, EditAddress, OnlineText.HostIp, value => _address = value);
-                return true;
-            case EditPort:
-                Edit(_port, 5, EditPort, OnlineText.Port, value => _port = value);
-                return true;
             case Ready:
                 _clientReady = !_clientReady;
                 _readyRevision = NextRevision(_readyRevision);
@@ -215,7 +204,6 @@ internal static class TitleOnlineMenu
                 manager.OnContinueGame();
                 return true;
             case Back:
-                FinishEdit(false, string.Empty);
                 probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
                 Close();
                 return true;
@@ -242,16 +230,9 @@ internal static class TitleOnlineMenu
 
         if (UnityEngine.Input.GetKeyDown(KeyCode.Escape))
         {
-            if (_editingButton != null)
-                FinishEdit(false, string.Empty);
-            else
-            {
-                Close();
-                return;
-            }
+            Close();
+            return;
         }
-        if (_editingButton != null)
-            CaptureEditInput();
 
         var session = probe._session;
         if (ProbeBehaviour.Role == SessionRole.Host && session != null)
@@ -336,7 +317,7 @@ internal static class TitleOnlineMenu
             _lastLanguage = language;
             MarkDirty();
         }
-        if (_dirty && _editingButton == null)
+        if (_dirty)
             Rebuild(probe, session);
     }
 
@@ -449,15 +430,25 @@ internal static class TitleOnlineMenu
         _nativePanel = panel;
         _roomContent = panel.scrollContent;
         NativeContentStates.Clear();
+        NativeControlStates.Clear();
+        _nativeContentSize = _roomContent.sizeDelta;
         for (var index = 0; index < _roomContent.childCount; index++)
         {
             var content = _roomContent.GetChild(index).gameObject;
             NativeContentStates[content] = content.activeSelf;
             content.SetActive(false);
         }
+        DisableNativeControl(panel);
+        foreach (var layout in _roomContent.GetComponents<LayoutGroup>())
+            DisableNativeControl(layout);
+        foreach (var fitter in _roomContent.GetComponents<ContentSizeFitter>())
+            DisableNativeControl(fitter);
         _roomContent.gameObject.SetActive(true);
+        _roomContent.sizeDelta = new Vector2(_roomContent.sizeDelta.x, 460f);
         _panelTitle = panel.text;
         _nativeTitle = _panelTitle?.text ?? string.Empty;
+        if (_panelTitle != null)
+            _panelTitle.text = Text(OnlineText.Online, CurrentLanguage());
         _titleFallback = false;
     }
 
@@ -484,7 +475,6 @@ internal static class TitleOnlineMenu
 
     private static void Close()
     {
-        FinishEdit(false, string.Empty);
         DestroyRoom();
         RestoreNativePanel();
         _roomContent = null;
@@ -543,6 +533,13 @@ internal static class TitleOnlineMenu
             }
             if (_nativePanel.text != null)
                 _nativePanel.text.text = _nativeTitle;
+            if (_roomContent != null)
+                _roomContent.sizeDelta = _nativeContentSize;
+            foreach (var state in NativeControlStates)
+            {
+                if (state.Key != null)
+                    state.Key.enabled = state.Value;
+            }
             if (_nativePanel.gameObject.activeInHierarchy)
                 _nativePanel.Close();
         }
@@ -553,7 +550,16 @@ internal static class TitleOnlineMenu
                 panel.Close();
         }
         NativeContentStates.Clear();
+        NativeControlStates.Clear();
         _nativePanel = null;
+    }
+
+    private static void DisableNativeControl(Behaviour control)
+    {
+        if (control == null || NativeControlStates.ContainsKey(control))
+            return;
+        NativeControlStates[control] = control.enabled;
+        control.enabled = false;
     }
 
     private static void Rebuild(ProbeBehaviour probe, UdpSession session)
@@ -570,9 +576,9 @@ internal static class TitleOnlineMenu
         {
             AddAction(language => Text(OnlineText.CreateLobby, language), Host);
             AddAction(language => Text(OnlineText.Join, language), Join);
-            AddAction(language => Value(OnlineText.Name, DisplayName(), language), EditName);
-            AddAction(language => Value(OnlineText.HostIp, _address, language), EditAddress);
-            AddAction(language => Value(OnlineText.Port, _port, language), EditPort);
+            AddInput(OnlineText.Name, _name, 24, InputField.ContentType.Standard, value => _name = value);
+            AddInput(OnlineText.HostIp, _address, 45, InputField.ContentType.Standard, value => _address = value);
+            AddInput(OnlineText.Port, _port, 5, InputField.ContentType.IntegerNumber, value => _port = value);
             AddAction(language => Text(OnlineText.Back, language), Back);
         }
         else if (ProbeBehaviour.Role == SessionRole.Host)
@@ -633,9 +639,114 @@ internal static class TitleOnlineMenu
             pointer.enabled = false;
     }
 
+    private static void AddInput(
+        OnlineText label,
+        string value,
+        int limit,
+        InputField.ContentType contentType,
+        Action<string> apply)
+    {
+        var row = CreateRow();
+        if (row == null)
+            return;
+        var button = row.GetComponent<TitleMenuButton>();
+        var labelText = button?.nameText?.text?.textUGUI;
+        if (button == null || labelText == null)
+        {
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
+
+        button.enabled = false;
+        foreach (var pointer in row.GetComponentsInChildren<PointerEventComponent>(true))
+            pointer.enabled = false;
+
+        button.nameText.SetOverride((Func<string, string>)(_ => Text(label, CurrentLanguage())), true);
+        labelText.text = Text(label, CurrentLanguage());
+        labelText.alignment = TextAnchor.MiddleLeft;
+        var labelRect = labelText.rectTransform;
+        labelRect.anchorMin = new Vector2(0.06f, 0f);
+        labelRect.anchorMax = new Vector2(0.4f, 1f);
+        labelRect.offsetMin = Vector2.zero;
+        labelRect.offsetMax = Vector2.zero;
+
+        Image inputTemplate = null;
+        foreach (var candidate in row.GetComponentsInChildren<Image>(true))
+        {
+            if (candidate != null)
+            {
+                inputTemplate = candidate;
+                break;
+            }
+        }
+        if (inputTemplate == null)
+        {
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
+
+        var fieldObject = UnityEngine.Object.Instantiate(inputTemplate.gameObject, row.transform);
+        fieldObject.name = "DaveTheDiverMP_Input";
+        fieldObject.transform.SetParent(row.transform, false);
+        var fieldRect = fieldObject.GetComponent<RectTransform>();
+        fieldRect.anchorMin = new Vector2(0.42f, 0.16f);
+        fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
+        fieldRect.offsetMin = Vector2.zero;
+        fieldRect.offsetMax = Vector2.zero;
+        foreach (var text in fieldObject.GetComponentsInChildren<Text>(true))
+            text.enabled = false;
+        foreach (var pointer in fieldObject.GetComponentsInChildren<PointerEventComponent>(true))
+            pointer.enabled = false;
+        var inputButton = fieldObject.GetComponent<TitleMenuButton>();
+        if (inputButton != null)
+            inputButton.enabled = false;
+        var image = fieldObject.GetComponent<Image>();
+        image.raycastTarget = true;
+        image.color = new Color(0.02f, 0.12f, 0.18f, 0.75f);
+
+        var valueObject = UnityEngine.Object.Instantiate(labelText.gameObject, fieldObject.transform);
+        valueObject.name = "Text";
+        var valueText = valueObject.GetComponent<Text>();
+        valueText.alignment = TextAnchor.MiddleLeft;
+        valueText.raycastTarget = false;
+        var valueRect = valueText.rectTransform;
+        valueRect.anchorMin = new Vector2(0.06f, 0f);
+        valueRect.anchorMax = new Vector2(0.94f, 1f);
+        valueRect.offsetMin = Vector2.zero;
+        valueRect.offsetMax = Vector2.zero;
+
+        var input = fieldObject.AddComponent<InputField>();
+        input.targetGraphic = image;
+        input.textComponent = valueText;
+        input.characterLimit = limit;
+        input.contentType = contentType;
+        input.lineType = InputField.LineType.SingleLine;
+        input.text = value ?? string.Empty;
+        input.onValueChanged.AddListener((UnityEngine.Events.UnityAction<string>)(changed => apply(changed)));
+        BindInputPointer(fieldObject.AddComponent<PointerEventComponent>(), input);
+        RoomFields.Add(row);
+    }
+
     private static TitleMenuButton Create(Func<Languages, string> text, int action)
     {
-        var index = RoomButtons.Count + RoomLabels.Count;
+        var clone = CreateRow();
+        if (clone == null)
+            return null;
+        var button = clone.GetComponent<TitleMenuButton>();
+        if (button == null)
+        {
+            UnityEngine.Object.Destroy(clone);
+            return null;
+        }
+        button.buttonName = (ButtonName)action;
+        SetLocalizedText(button, text);
+        button.SetFocus(false);
+        return button;
+    }
+
+    private static GameObject CreateRow()
+    {
+        var index = RoomButtons.Count + RoomLabels.Count + RoomFields.Count;
         if (index >= TitleButtons.Count)
             return null;
         var source = TitleButtons[index];
@@ -650,24 +761,14 @@ internal static class TitleOnlineMenu
             rect.anchorMin = new Vector2(0.08f, 1f);
             rect.anchorMax = new Vector2(0.92f, 1f);
             rect.pivot = new Vector2(0.5f, 1f);
-            rect.anchoredPosition = new Vector2(0f, -44f - index * 68f);
-            rect.sizeDelta = new Vector2(0f, 56f);
+            rect.anchoredPosition = new Vector2(0f, RowStartY - index * RowStepY);
+            rect.sizeDelta = new Vector2(0f, RowHeight);
         }
-        var button = clone.GetComponent<TitleMenuButton>();
-        if (button == null)
-        {
-            UnityEngine.Object.Destroy(clone);
-            return null;
-        }
-        button.buttonName = (ButtonName)action;
-        SetLocalizedText(button, text);
-        button.SetFocus(false);
-        return button;
+        return clone;
     }
 
     private static void DestroyRoom()
     {
-        FinishEdit(false, string.Empty);
         foreach (var button in RoomButtons)
         {
             if (button != null)
@@ -678,85 +779,15 @@ internal static class TitleOnlineMenu
             if (label != null)
                 UnityEngine.Object.Destroy(label.gameObject);
         }
+        foreach (var field in RoomFields)
+        {
+            if (field != null)
+                UnityEngine.Object.Destroy(field);
+        }
         RoomButtons.Clear();
         RoomLabels.Clear();
+        RoomFields.Clear();
         ActionButtons.Clear();
-    }
-
-    private static void Edit(
-        string value,
-        int limit,
-        int action,
-        OnlineText label,
-        Action<string> apply)
-    {
-        if (!ActionButtons.TryGetValue(action, out var button) || button == null || button.nameText == null ||
-            button.nameText.text == null || button.nameText.text.textUGUI == null)
-        {
-            _message = "Name field is unavailable";
-            MarkDirty();
-            return;
-        }
-
-        FinishEdit(false, string.Empty);
-        _editingButton = button;
-        _editingApply = apply;
-        _editingValue = value ?? string.Empty;
-        _editingLimit = limit;
-        _editingLabel = label;
-        UpdateEditText();
-    }
-
-    private static void FinishEdit(bool accept, string value)
-    {
-        var button = _editingButton;
-        var apply = _editingApply;
-        _editingButton = null;
-        _editingApply = null;
-        _editingValue = string.Empty;
-        _editingLimit = 0;
-        if (button == null)
-            return;
-        if (accept && !string.IsNullOrWhiteSpace(value))
-            apply?.Invoke(value.Trim());
-        MarkDirty();
-    }
-
-    private static void CaptureEditInput()
-    {
-        if (UnityEngine.Input.GetKeyDown(KeyCode.Return) ||
-            UnityEngine.Input.GetKeyDown(KeyCode.KeypadEnter))
-        {
-            FinishEdit(true, _editingValue);
-            return;
-        }
-
-        var changed = false;
-        foreach (var character in UnityEngine.Input.inputString)
-        {
-            if (character == '\b')
-            {
-                if (_editingValue.Length > 0)
-                {
-                    _editingValue = _editingValue[..^1];
-                    changed = true;
-                }
-            }
-            else if (!char.IsControl(character) && _editingValue.Length < _editingLimit)
-            {
-                _editingValue += character;
-                changed = true;
-            }
-        }
-        if (changed)
-            UpdateEditText();
-    }
-
-    private static void UpdateEditText()
-    {
-        if (_editingButton?.nameText?.text?.textUGUI != null)
-            _editingButton.nameText.text.textUGUI.text =
-                $"{Text(_editingLabel, CurrentLanguage())}: {_editingValue}|";
     }
 
     private static void SetLocalizedText(TitleMenuButton button, Func<Languages, string> text)
@@ -800,6 +831,15 @@ internal static class TitleOnlineMenu
             pointer.onClick = new UnityEngine.Events.UnityEvent();
             pointer.onClick.AddListener((UnityEngine.Events.UnityAction)button.Invoke);
         }
+    }
+
+    private static void BindInputPointer(PointerEventComponent pointer, InputField input)
+    {
+        if (pointer == null || input == null)
+            return;
+        pointer.enabled = true;
+        pointer.onClick = new UnityEngine.Events.UnityEvent();
+        pointer.onClick.AddListener((UnityEngine.Events.UnityAction)input.ActivateInputField);
     }
 
     private static void MarkDirty() => _dirty = true;
