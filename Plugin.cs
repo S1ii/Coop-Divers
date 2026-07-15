@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.7.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.8.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -118,7 +118,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session?.Update(Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime);
-        _pickupReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
+        _pickupReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
@@ -226,5 +227,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role == SessionRole.Host)
             _pickupReplicator?.OnHostDestroyed(_session, _sceneId, item);
+    }
+
+    internal bool OnPickupInteract(PickupInstanceItem item)
+    {
+        if (Role != SessionRole.Client)
+            return true;
+        _pickupReplicator?.RequestPickup(_session, _sceneId, item);
+        return false;
     }
 }

@@ -13,7 +13,8 @@ internal enum PacketType : byte
     PlayerSnapshot = 5,
     SceneState = 6,
     FishSnapshot = 7,
-    PickupRemoved = 8
+    PickupRemoved = 8,
+    PickupRequest = 9
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -46,7 +47,7 @@ internal readonly record struct PickupRemoved(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 7;
+    private const byte Version = 8;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
     private const int FishSnapshotSize = HeaderSize + 25;
@@ -262,6 +263,30 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodePickupRequest(uint sequence, PickupRemoved request)
+    {
+        var packet = EncodePickupRemoved(sequence, request);
+        packet[5] = (byte)PacketType.PickupRequest;
+        return packet;
+    }
+
+    internal static bool TryDecodePickupRequest(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out PickupRemoved request)
+    {
+        sequence = 0;
+        request = default;
+        if (packet.Length != PickupRemovedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.PickupRequest)
+            return false;
+        request = new PickupRemoved(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)));
+        return true;
+    }
+
     internal static string NormalizePlayerName(string playerName)
     {
         var normalized = (playerName ?? string.Empty).Trim();
@@ -322,6 +347,10 @@ internal static class Protocol
         if (!TryDecodePickupRemoved(pickupPacket, out sequence, out var actualPickup) ||
             sequence != 46 || actualPickup != expectedPickup)
             throw new InvalidOperationException("Pickup removal round-trip failed");
+        var pickupRequest = EncodePickupRequest(47, expectedPickup);
+        if (!TryDecodePickupRequest(pickupRequest, out sequence, out actualPickup) ||
+            sequence != 47 || actualPickup != expectedPickup)
+            throw new InvalidOperationException("Pickup request round-trip failed");
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,

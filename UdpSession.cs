@@ -21,6 +21,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<UdpReceiveResult> _incoming = new();
     private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
+    private readonly ConcurrentQueue<PickupRemoved> _pickupRequests = new();
     private readonly CancellationTokenSource _stop = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -37,9 +38,11 @@ internal sealed class UdpSession : IDisposable
     private bool _connected;
     private bool _hasRemoteScene;
     private bool _hasSnapshot;
+    private bool _hasRemotePlayerState;
     private uint _lastSceneSequence;
     private uint _lastFishSequence;
     private uint _lastPickupSequence;
+    private uint _lastPickupRequestSequence;
     private uint _lastSnapshotSequence;
     private PlayerSnapshot _snapshot;
 
@@ -84,6 +87,15 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakePickupRemoved(out PickupRemoved removed) =>
         _pickupRemovals.TryDequeue(out removed);
 
+    internal void SendPickupRequest(PickupRemoved request)
+    {
+        if (_role == SessionRole.Client && SceneMatches(request.SceneId))
+            Send(Protocol.EncodePickupRequest(++_sequence, request));
+    }
+
+    internal bool TryTakePickupRequest(out PickupRemoved request) =>
+        _pickupRequests.TryDequeue(out request);
+
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
         snapshot = _snapshot;
@@ -91,6 +103,12 @@ internal sealed class UdpSession : IDisposable
             return false;
         _hasSnapshot = false;
         return true;
+    }
+
+    internal bool TryGetRemotePlayerSnapshot(out PlayerSnapshot snapshot)
+    {
+        snapshot = _snapshot;
+        return _connected && _hasRemotePlayerState;
     }
 
     internal void Start(SessionRole role, string address, int port, string localName, uint buildId)
@@ -210,6 +228,7 @@ internal sealed class UdpSession : IDisposable
                     _lastSnapshotSequence = sequence;
                     _snapshot = snapshot;
                     _hasSnapshot = true;
+                    _hasRemotePlayerState = true;
                 }
             }
             return;
@@ -258,6 +277,21 @@ internal sealed class UdpSession : IDisposable
                 {
                     _lastPickupSequence = sequence;
                     _pickupRemovals.Enqueue(removed);
+                }
+            }
+            return;
+        }
+
+        if (type == PacketType.PickupRequest)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodePickupRequest(received.Buffer, out _, out var request))
+            {
+                _lastReceive = now;
+                if (IsNewer(sequence, _lastPickupRequestSequence))
+                {
+                    _lastPickupRequestSequence = sequence;
+                    _pickupRequests.Enqueue(request);
                 }
             }
             return;
@@ -345,14 +379,19 @@ internal sealed class UdpSession : IDisposable
         _lastSceneSequence = 0;
         _lastFishSequence = 0;
         _lastPickupSequence = 0;
+        _lastPickupRequestSequence = 0;
         while (_fishSnapshots.TryDequeue(out _))
         {
         }
         while (_pickupRemovals.TryDequeue(out _))
         {
         }
+        while (_pickupRequests.TryDequeue(out _))
+        {
+        }
         _snapshot = default;
         _hasSnapshot = false;
+        _hasRemotePlayerState = false;
         _lastSnapshotSequence = 0;
     }
 

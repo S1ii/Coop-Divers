@@ -16,11 +16,19 @@ internal sealed class PickupReplicator
 
     internal PickupReplicator(ManualLogSource log) => _log = log;
 
-    internal void Update(SessionRole role, UdpSession session, uint sceneId, float now)
+    internal void Update(
+        SessionRole role,
+        UdpSession session,
+        uint sceneId,
+        float now,
+        PlayerCharacter hostPlayer)
     {
-        if (role != SessionRole.Client || !session.SceneMatches(sceneId))
+        if (role == SessionRole.Offline || !session.SceneMatches(sceneId))
         {
             while (session.TryTakePickupRemoved(out _))
+            {
+            }
+            while (session.TryTakePickupRequest(out _))
             {
             }
             _items.Clear();
@@ -31,6 +39,20 @@ internal sealed class PickupReplicator
         if (now >= _nextScan)
             Refresh(sceneId, now);
 
+        if (role == SessionRole.Host)
+        {
+            while (session.TryTakePickupRemoved(out _))
+            {
+            }
+            while (session.TryTakePickupRequest(out var request))
+                ApplyHostRequest(session, sceneId, now, hostPlayer, request);
+            return;
+        }
+
+        while (session.TryTakePickupRequest(out _))
+        {
+        }
+
         while (session.TryTakePickupRemoved(out var removed))
         {
             if (removed.SceneId != sceneId)
@@ -40,12 +62,21 @@ internal sealed class PickupReplicator
         }
     }
 
+    internal void RequestPickup(UdpSession session, uint sceneId, PickupInstanceItem item)
+    {
+        if (item == null)
+            return;
+        session.SendPickupRequest(new PickupRemoved(
+            sceneId, WorldId(sceneId, item), item.GetItemID()));
+    }
+
     internal void OnHostDestroyed(UdpSession session, uint sceneId, PickupInstanceItem item)
     {
         if (item == null)
             return;
-        session.SendPickupRemoved(new PickupRemoved(
-            sceneId, WorldId(sceneId, item), item.GetItemID()));
+        var worldId = WorldId(sceneId, item);
+        _items.Remove(worldId);
+        session.SendPickupRemoved(new PickupRemoved(sceneId, worldId, item.GetItemID()));
     }
 
     internal void Clear()
@@ -102,6 +133,39 @@ internal sealed class PickupReplicator
         return true;
     }
 
+    private void ApplyHostRequest(
+        UdpSession session,
+        uint sceneId,
+        float now,
+        PlayerCharacter hostPlayer,
+        PickupRemoved request)
+    {
+        if (request.SceneId != sceneId || hostPlayer == null ||
+            !session.TryGetRemotePlayerSnapshot(out var remotePlayer) ||
+            remotePlayer.SceneId != sceneId)
+            return;
+
+        if (!_items.TryGetValue(request.WorldId, out var item))
+        {
+            Refresh(sceneId, now);
+            _items.TryGetValue(request.WorldId, out item);
+        }
+        if (item == null || item.GetItemID() != request.ItemId)
+            return;
+
+        var itemPosition = item.transform.position;
+        var dx = itemPosition.x - remotePlayer.X;
+        var dy = itemPosition.y - remotePlayer.Y;
+        if (dx * dx + dy * dy > 16f)
+        {
+            _log.LogWarning($"Network pickup rejected: {request.WorldId:X8} is out of range");
+            return;
+        }
+
+        _items.Remove(request.WorldId);
+        item.SuccessInteract(hostPlayer);
+    }
+
     private static uint WorldId(uint sceneId, PickupInstanceItem item)
     {
         var hash = Mix(Mix(2166136261u, unchecked((int)sceneId)), item.GetItemID());
@@ -135,4 +199,11 @@ internal static class PickupDestroyPatch
 {
     private static void Prefix(PickupInstanceItem __instance) =>
         ProbeBehaviour.Instance?.OnPickupDestroyed(__instance);
+}
+
+[HarmonyPatch(typeof(PickupInstanceItem), nameof(PickupInstanceItem.SuccessInteract))]
+internal static class PickupInteractPatch
+{
+    private static bool Prefix(PickupInstanceItem __instance) =>
+        ProbeBehaviour.Instance?.OnPickupInteract(__instance) ?? true;
 }
