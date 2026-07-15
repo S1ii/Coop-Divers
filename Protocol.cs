@@ -14,7 +14,8 @@ internal enum PacketType : byte
     SceneState = 6,
     FishSnapshot = 7,
     PickupRemoved = 8,
-    PickupRequest = 9
+    PickupRequest = 9,
+    SceneTransition = 10
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -44,10 +45,15 @@ internal readonly record struct PickupRemoved(
     uint WorldId,
     int ItemId);
 
+internal readonly record struct SceneTransitionCommand(
+    string SceneName,
+    int TransitionType,
+    ushort Options);
+
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 8;
+    private const byte Version = 9;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
     private const int FishSnapshotSize = HeaderSize + 25;
@@ -287,6 +293,52 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodeSceneTransition(uint sequence, SceneTransitionCommand command)
+    {
+        var sceneName = command.SceneName ?? string.Empty;
+        var encodedName = StrictUtf8.GetBytes(sceneName);
+        if (encodedName.Length is < 1 or > 128 || command.Options > 0x1ff)
+            throw new ArgumentOutOfRangeException(nameof(command));
+        var packet = new byte[HeaderSize + 7 + encodedName.Length];
+        Encode(PacketType.SceneTransition, sequence).CopyTo(packet, 0);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), command.TransitionType);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 4), command.Options);
+        packet[HeaderSize + 6] = (byte)encodedName.Length;
+        encodedName.CopyTo(packet, HeaderSize + 7);
+        return packet;
+    }
+
+    internal static bool TryDecodeSceneTransition(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out SceneTransitionCommand command)
+    {
+        sequence = 0;
+        command = default;
+        if (!TryDecode(packet, out var type, out sequence) || type != PacketType.SceneTransition ||
+            packet.Length < HeaderSize + 8 || packet[HeaderSize + 6] is < 1 or > 128 ||
+            packet.Length != HeaderSize + 7 + packet[HeaderSize + 6])
+            return false;
+        var options = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 4));
+        if (options > 0x1ff)
+            return false;
+        try
+        {
+            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 7));
+            if (string.IsNullOrWhiteSpace(sceneName))
+                return false;
+            command = new SceneTransitionCommand(
+                sceneName,
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize)),
+                options);
+            return true;
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+    }
+
     internal static string NormalizePlayerName(string playerName)
     {
         var normalized = (playerName ?? string.Empty).Trim();
@@ -351,6 +403,12 @@ internal static class Protocol
         if (!TryDecodePickupRequest(pickupRequest, out sequence, out actualPickup) ||
             sequence != 47 || actualPickup != expectedPickup)
             throw new InvalidOperationException("Pickup request round-trip failed");
+
+        var expectedTransition = new SceneTransitionCommand("A02_02_01", 3, 0x155);
+        var transitionPacket = EncodeSceneTransition(48, expectedTransition);
+        if (!TryDecodeSceneTransition(transitionPacket, out sequence, out var actualTransition) ||
+            sequence != 48 || actualTransition != expectedTransition)
+            throw new InvalidOperationException("Scene transition round-trip failed");
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,

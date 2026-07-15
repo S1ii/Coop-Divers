@@ -22,6 +22,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRequests = new();
+    private readonly ConcurrentQueue<SceneTransitionCommand> _sceneTransitions = new();
     private readonly CancellationTokenSource _stop = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -43,6 +44,7 @@ internal sealed class UdpSession : IDisposable
     private uint _lastFishSequence;
     private uint _lastPickupSequence;
     private uint _lastPickupRequestSequence;
+    private uint _lastSceneTransitionSequence;
     private uint _lastSnapshotSequence;
     private PlayerSnapshot _snapshot;
 
@@ -95,6 +97,15 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakePickupRequest(out PickupRemoved request) =>
         _pickupRequests.TryDequeue(out request);
+
+    internal void SendSceneTransition(SceneTransitionCommand command)
+    {
+        if (_role == SessionRole.Host && _connected)
+            Send(Protocol.EncodeSceneTransition(++_sequence, command));
+    }
+
+    internal bool TryTakeSceneTransition(out SceneTransitionCommand command) =>
+        _sceneTransitions.TryDequeue(out command);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -297,6 +308,21 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.SceneTransition)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeSceneTransition(received.Buffer, out _, out var command))
+            {
+                _lastReceive = now;
+                if (IsNewer(sequence, _lastSceneTransitionSequence))
+                {
+                    _lastSceneTransitionSequence = sequence;
+                    _sceneTransitions.Enqueue(command);
+                }
+            }
+            return;
+        }
+
         if (type == PacketType.Heartbeat)
         {
             if (_connected)
@@ -380,6 +406,7 @@ internal sealed class UdpSession : IDisposable
         _lastFishSequence = 0;
         _lastPickupSequence = 0;
         _lastPickupRequestSequence = 0;
+        _lastSceneTransitionSequence = 0;
         while (_fishSnapshots.TryDequeue(out _))
         {
         }
@@ -387,6 +414,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_pickupRequests.TryDequeue(out _))
+        {
+        }
+        while (_sceneTransitions.TryDequeue(out _))
         {
         }
         _snapshot = default;

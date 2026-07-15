@@ -10,7 +10,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.8.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.9.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -80,6 +80,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private UdpSession _session;
     private FishReplicator _fishReplicator;
     private PickupReplicator _pickupReplicator;
+    private SceneReplicator _sceneReplicator;
     private readonly RemoteAvatar _remoteAvatar = new();
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
@@ -95,6 +96,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session = new UdpSession(Logger);
         _fishReplicator = new FishReplicator(Logger);
         _pickupReplicator = new PickupReplicator(Logger);
+        _sceneReplicator = new SceneReplicator(Logger);
         _session.Start(Role, Address, Port, localName, buildId);
         Logger.LogInfo($"Network identity: {localName}; build={buildId:X8}");
     }
@@ -116,6 +118,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
 
         _session?.Update(Time.realtimeSinceStartup);
+        _sceneReplicator?.Update(Role, _session);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime);
         _pickupReplicator?.Update(
@@ -220,6 +223,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session?.Dispose();
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
+        _sceneReplicator?.Clear();
         _remoteAvatar.Dispose();
     }
 
@@ -235,5 +239,35 @@ public sealed class ProbeBehaviour : MonoBehaviour
             return true;
         _pickupReplicator?.RequestPickup(_session, _sceneId, item);
         return false;
+    }
+
+    internal void OnSceneTransition(
+        string sceneName,
+        SceneTransitionType transitionType,
+        bool throughEmptyScene,
+        bool initLoading,
+        bool useStartTransition,
+        bool useFinishTransition,
+        bool unloadActiveScene,
+        bool ignoreSameSceneCheck,
+        bool isRetry,
+        bool skipEmptySceneOptionIsUnloadAssets,
+        bool firstFindSceneManagerInActiveScene)
+    {
+        if (Role != SessionRole.Host)
+            return;
+        _sceneReplicator?.OnHostTransition(
+            _session,
+            sceneName,
+            transitionType,
+            throughEmptyScene,
+            initLoading,
+            useStartTransition,
+            useFinishTransition,
+            unloadActiveScene,
+            ignoreSameSceneCheck,
+            isRetry,
+            skipEmptySceneOptionIsUnloadAssets,
+            firstFindSceneManagerInActiveScene);
     }
 }
