@@ -88,6 +88,7 @@ internal static class TitleOnlineMenu
     private static string _nativeHeaderTitle = string.Empty;
     private static TMP_Text _nativeCloseLabel;
     private static string _nativeCloseTitle = string.Empty;
+    private static Text _nativeInputTemplate;
     private static Vector2 _nativeContentSize;
     private static bool _visible;
     private static bool _dirty;
@@ -453,6 +454,7 @@ internal static class TitleOnlineMenu
             HideNativeObject(scroll.horizontalScrollbar?.gameObject);
             HideNativeObject(scroll.verticalScrollbar?.gameObject);
         }
+        _nativeInputTemplate = panel.text;
         HideNativeObject(panel.text?.gameObject);
         _roomContent.gameObject.SetActive(true);
         _roomContent.sizeDelta = new Vector2(_roomContent.sizeDelta.x, 460f);
@@ -497,6 +499,7 @@ internal static class TitleOnlineMenu
         _nativeHeaderTitle = string.Empty;
         _nativeCloseLabel = null;
         _nativeCloseTitle = string.Empty;
+        _nativeInputTemplate = null;
         _titleFallback = false;
 
         if (_manager != null)
@@ -585,6 +588,11 @@ internal static class TitleOnlineMenu
 
     private static TMP_Text FindPanelHeader(SettingAppPanel panel)
     {
+        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
+        {
+            if (text != null && IsSettingsTitle(text.text))
+                return text;
+        }
         TMP_Text header = null;
         var highest = float.MinValue;
         foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
@@ -602,6 +610,11 @@ internal static class TitleOnlineMenu
 
     private static TMP_Text FindPanelCloseLabel(SettingAppPanel panel)
     {
+        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
+        {
+            if (text != null && IsCloseTitle(text.text))
+                return text;
+        }
         TMP_Text label = null;
         var lowest = float.MaxValue;
         foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
@@ -617,6 +630,15 @@ internal static class TitleOnlineMenu
         }
         return label;
     }
+
+    private static bool IsSettingsTitle(string text) => text is
+        "설정" or "Settings" or "設定" or "设置" or "Paramètres" or
+        "Impostazioni" or "Einstellungen" or "Configuración" or
+        "Configurações" or "Настройки";
+
+    private static bool IsCloseTitle(string text) => text is
+        "닫기" or "Close" or "閉じる" or "关闭" or "關閉" or "Fermer" or
+        "Chiudi" or "Schließen" or "Cerrar" or "Fechar" or "Закрыть";
 
     private static void SetPanelTitle()
     {
@@ -653,9 +675,9 @@ internal static class TitleOnlineMenu
 
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
-            AddInput(OnlineText.Name, _name, 24, TMP_InputField.ContentType.Standard, value => _name = value);
-            AddInput(OnlineText.HostIp, _address, 45, TMP_InputField.ContentType.Standard, value => _address = value);
-            AddInput(OnlineText.Port, _port, 5, TMP_InputField.ContentType.IntegerNumber, value => _port = value);
+            AddInput(OnlineText.Name, _name, 24, InputField.ContentType.Standard, value => _name = value);
+            AddInput(OnlineText.HostIp, _address, 45, InputField.ContentType.Standard, value => _address = value);
+            AddInput(OnlineText.Port, _port, 5, InputField.ContentType.IntegerNumber, value => _port = value);
             AddAction(language => Text(OnlineText.CreateLobby, language), Host);
             AddAction(language => Text(OnlineText.Join, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
@@ -722,7 +744,7 @@ internal static class TitleOnlineMenu
         OnlineText label,
         string value,
         int limit,
-        TMP_InputField.ContentType contentType,
+        InputField.ContentType contentType,
         Action<string> apply)
     {
         var row = CreateRow();
@@ -749,7 +771,12 @@ internal static class TitleOnlineMenu
         labelRect.offsetMin = Vector2.zero;
         labelRect.offsetMax = Vector2.zero;
 
-        var fieldObject = UnityEngine.Object.Instantiate(labelText.gameObject, row.transform);
+        if (_nativeInputTemplate == null)
+        {
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
+        var fieldObject = UnityEngine.Object.Instantiate(_nativeInputTemplate.gameObject, row.transform);
         fieldObject.name = "DaveTheDiverMP_Input";
         fieldObject.transform.SetParent(row.transform, false);
         var fieldRect = fieldObject.GetComponent<RectTransform>();
@@ -757,17 +784,37 @@ internal static class TitleOnlineMenu
         fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
         fieldRect.offsetMin = Vector2.zero;
         fieldRect.offsetMax = Vector2.zero;
-        var valueText = fieldObject.GetComponent<TextMeshProUGUI>();
+        var valueText = fieldObject.GetComponent<Text>();
+        if (valueText == null)
+        {
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
         valueText.text = value ?? string.Empty;
-        valueText.alignment = TextAlignmentOptions.MidlineLeft;
+        valueText.alignment = TextAnchor.MiddleLeft;
         valueText.raycastTarget = true;
 
-        var input = fieldObject.AddComponent<TMP_InputField>();
+        InputField input;
+        try
+        {
+            input = fieldObject.AddComponent<InputField>();
+        }
+        catch (Exception exception)
+        {
+            ProbeBehaviour.Logger?.LogError($"Online input creation failed: {exception.Message}");
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
+        if (input == null)
+        {
+            UnityEngine.Object.Destroy(row);
+            return;
+        }
         input.targetGraphic = valueText;
         input.textComponent = valueText;
         input.characterLimit = limit;
         input.contentType = contentType;
-        input.lineType = TMP_InputField.LineType.SingleLine;
+        input.lineType = InputField.LineType.SingleLine;
         input.text = value ?? string.Empty;
         input.onValueChanged.AddListener((UnityEngine.Events.UnityAction<string>)(changed => apply(changed)));
         BindInputPointer(fieldObject.AddComponent<PointerEventComponent>(), input);
@@ -880,7 +927,7 @@ internal static class TitleOnlineMenu
         }
     }
 
-    private static void BindInputPointer(PointerEventComponent pointer, TMP_InputField input)
+    private static void BindInputPointer(PointerEventComponent pointer, InputField input)
     {
         if (pointer == null || input == null)
             return;
