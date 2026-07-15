@@ -8,8 +8,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
+    name: Build and publish release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,9 +22,27 @@ jobs:
         shell: pwsh
         env:
           REFERENCE_REPOSITORY: ${{ vars.REFERENCE_REPOSITORY }}
+          REFERENCE_REPOSITORY_TOKEN: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY)) {
             throw 'Repository variable REFERENCE_REPOSITORY is required for releases.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_TOKEN)) {
+            throw 'Repository secret REFERENCE_REPOSITORY_TOKEN is required for releases.'
+          }
+      - name: Check version
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          [xml]$project = Get-Content .\DaveTheDiverMP.csproj
+          $projectVersion = [string]$project.Project.PropertyGroup.Version
+          $releaseVersion = $env:REF_NAME.TrimStart('v')
+          if ($releaseVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Release version must use major.minor.patch: $releaseVersion"
+          }
+          if ($projectVersion -ne $releaseVersion) {
+            throw "Project version $projectVersion does not match release version $releaseVersion."
           }
       - uses: actions/setup-dotnet@v4
         with:
@@ -30,9 +53,12 @@ jobs:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
           token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
           path: game-references
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore .\DaveTheDiverMP.csproj
       - name: Build
         shell: pwsh
-        run: dotnet build .\DaveTheDiverMP.csproj -c Release -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
+        run: dotnet build .\DaveTheDiverMP.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
       - name: Package
         shell: pwsh
         env:
@@ -46,4 +72,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $archive = Get-ChildItem .\artifacts\*.zip | Select-Object -First 1
-          gh release create $env:GITHUB_REF_NAME $archive.FullName --generate-notes
+          $checksum = Get-ChildItem .\artifacts\*.sha256 | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME $archive.FullName $checksum.FullName --verify-tag --generate-notes

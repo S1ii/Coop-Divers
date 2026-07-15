@@ -4,11 +4,14 @@ $root = Split-Path -Parent $PSScriptRoot
 $internalMarker = 'pony' + 'tail'
 $vendorMarker = 'ish' + 'ka'
 $required = @(
-    'src\DaveTheDiverMP\Bootstrap',
-    'src\DaveTheDiverMP\Networking',
-    'src\DaveTheDiverMP\Lobby',
-    'src\DaveTheDiverMP\Gameplay',
-    'src\DaveTheDiverMP\Replication'
+    'src\Bootstrap',
+    'src\Networking',
+    'src\Lobby',
+    'src\Gameplay',
+    'src\Replication',
+    '.github\workflows\ci.yml',
+    '.github\workflows\release.yml',
+    'build\package.ps1'
 )
 
 foreach ($path in $required) {
@@ -19,17 +22,29 @@ foreach ($path in $required) {
 
 $tracked = git -C $root ls-files
 $forbiddenTracked = $tracked | Where-Object {
-    $_ -match '(^|/)(bin|obj)(/|$)' -or
+    $_ -match '(^|/)(bin|obj|artifacts|coverage|references|game|DAVE THE DIVER)(/|$)' -or
+    $_ -match '\.(7z|dll|exe|log|nupkg|pdb|rar|tmp|zip)$' -or
     $_ -match "(?i)$internalMarker|$vendorMarker"
 }
 if ($forbiddenTracked) {
     throw "Forbidden tracked paths or markers found:`n$($forbiddenTracked -join "`n")"
 }
 
-$source = Get-ChildItem -Path (Join-Path $root 'src') -Recurse -File -Include *.cs,*.md
-$markers = $source | Select-String -Pattern "(?i)$internalMarker|$vendorMarker"
+$largeFiles = foreach ($path in $tracked) {
+    $file = Join-Path $root $path
+    if ((Test-Path $file) -and ((Get-Item $file).Length -gt 1MB)) {
+        $path
+    }
+}
+if ($largeFiles) {
+    throw "Tracked files over 1MB are not expected in this repository:`n$($largeFiles -join "`n")"
+}
+
+$textExtensions = '\.(cs|csproj|md|ps1|sln|txt|yml|yaml|json|gitignore)$'
+$textFiles = $tracked | Where-Object { $_ -match $textExtensions } | ForEach-Object { Join-Path $root $_ }
+$markers = $textFiles | Select-String -Pattern "(?i)$internalMarker|$vendorMarker"
 if ($markers) {
-    throw "Forbidden source markers found:`n$($markers -join "`n")"
+    throw "Forbidden markers found:`n$($markers -join "`n")"
 }
 
 Write-Host 'Repository hygiene checks passed.'

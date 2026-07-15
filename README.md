@@ -2,34 +2,49 @@
 
 Co-op multiplayer mod for Dave the Diver using BepInEx IL2CPP.
 
-## Local build
+## Layout
 
-The game installation is kept outside this repository. By default the project
-looks for it at `..\DAVE THE DIVER`.
-
-```powershell
-dotnet build -c Release -p:DeployPlugin=false
+```text
+src/Bootstrap    plugin entry point and Unity update loop
+src/Networking   UDP transport and packet protocol
+src/Lobby        title-screen online room UI
+src/Gameplay     dive/session flow and remote player state
+src/Replication  host/client world replication
+build/           local verification and packaging scripts
 ```
 
-To use another installation, pass `-p:GameInstallPath=...`. To deploy the
-built DLL into `BepInEx\plugins\DaveTheDiverMP`, pass
-`-p:DeployPlugin=true`.
+## Local Build
 
-The public repository contains source code and packaging scripts only. Game
-files, generated output, and reference assemblies must stay out of Git.
+The game installation stays outside the repository. By default the project
+uses `..\DAVE THE DIVER`.
 
-For the optional full GitHub Actions build, configure the repository variable
-`REFERENCE_REPOSITORY` and the secret `REFERENCE_REPOSITORY_TOKEN`. The
-private repository must expose the expected `BepInEx\core` and
-`BepInEx\interop` folders at its root.
+```powershell
+.\build\verify-repo.ps1
+dotnet build .\DaveTheDiverMP.csproj -c Release -p:DeployPlugin=false
+.\build\package.ps1 -Configuration Release
+```
 
-## Release
+Use `-p:GameInstallPath=...` for another installation. Use
+`-p:DeployPlugin=true` only when you want the build to copy the DLL into the
+game's `BepInEx\plugins\DaveTheDiverMP` folder.
 
-Create a version tag such as `v0.13.0`. GitHub Actions packages the plugin as
-a BepInEx ZIP and attaches it to a GitHub Release when the private reference
-repository is configured for the repository.
+## CI/CD
+
+GitHub Actions runs repository hygiene on every push and pull request. Full
+build/package jobs require a private reference repository because game and
+BepInEx DLLs are not committed.
+
+Required GitHub settings:
+
+- Repository variable `REFERENCE_REPOSITORY`: private repo containing
+  `BepInEx/core` and `BepInEx/interop` at its root.
+- Repository secret `REFERENCE_REPOSITORY_TOKEN`: token with read access to
+  that repository.
+
+Push a tag such as `v0.13.0` to create a GitHub Release with the BepInEx ZIP
+and SHA256 checksum. The same ZIP is the Nexus Mods upload artifact.
 
 ## License
 
-Source code is distributed under the MIT license. The game and its assets are
-not part of this repository.
+MIT. The game, game assets, BepInEx, and generated interop assemblies are not
+part of this repository.

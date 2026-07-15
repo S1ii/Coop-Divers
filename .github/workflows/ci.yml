@@ -3,12 +3,18 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   hygiene:
+    name: Repository hygiene
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,11 +23,20 @@ jobs:
         run: .\build\verify-repo.ps1
 
   build:
+    name: Build and package
     if: ${{ vars.REFERENCE_REPOSITORY != '' }}
     needs: hygiene
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check reference configuration
+        shell: pwsh
+        env:
+          REFERENCE_REPOSITORY_TOKEN: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_TOKEN)) {
+            throw 'Repository secret REFERENCE_REPOSITORY_TOKEN is required when REFERENCE_REPOSITORY is set.'
+          }
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 6.0.x
@@ -31,9 +46,12 @@ jobs:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
           token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
           path: game-references
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore .\DaveTheDiverMP.csproj
       - name: Build
         shell: pwsh
-        run: dotnet build .\DaveTheDiverMP.csproj -c Release -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
+        run: dotnet build .\DaveTheDiverMP.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
       - name: Package
         shell: pwsh
         run: .\build\package.ps1 -Configuration Release
@@ -41,4 +59,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: DaveTheDiverMP
-          path: artifacts/*.zip
+          path: |
+            artifacts/*.zip
+            artifacts/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  reference-configuration:
+    name: Reference configuration
+    if: ${{ vars.REFERENCE_REPOSITORY == '' }}
+    needs: hygiene
+    runs-on: windows-latest
+    steps:
+      - name: Explain skipped build
+        shell: pwsh
+        run: |
+          Write-Host 'Build/package skipped: set repository variable REFERENCE_REPOSITORY and secret REFERENCE_REPOSITORY_TOKEN to enable CI builds.'

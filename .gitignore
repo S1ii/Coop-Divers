@@ -9,3 +9,8 @@ artifacts/
 coverage/
 references/
 game/
+DAVE THE DIVER/
+*.zip
+*.7z
+*.rar
+*.nupkg

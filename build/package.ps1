@@ -12,19 +12,31 @@ if (-not (Test-Path $dll)) {
     throw "Build output is missing: $dll"
 }
 
+$OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-$stage = Join-Path ([IO.Path]::GetTempPath()) "DaveTheDiverMP-package-$PID"
-New-Item -ItemType Directory -Force -Path (Join-Path $stage 'BepInEx\plugins\DaveTheDiverMP') | Out-Null
+$stage = Join-Path ([IO.Path]::GetTempPath()) "DaveTheDiverMP-package-$PID-$([Guid]::NewGuid().ToString('N'))"
+$pluginDir = Join-Path $stage 'BepInEx\plugins\DaveTheDiverMP'
+New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
 
 try {
-    Copy-Item $dll (Join-Path $stage 'BepInEx\plugins\DaveTheDiverMP\DaveTheDiverMP.dll')
+    Copy-Item $dll (Join-Path $pluginDir 'DaveTheDiverMP.dll')
+    Copy-Item (Join-Path $root 'LICENSE') (Join-Path $pluginDir 'LICENSE.txt')
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        [xml]$project = Get-Content (Join-Path $root 'DaveTheDiverMP.csproj')
+        $Version = [string]$project.Project.PropertyGroup.Version
+    }
+    $Version = $Version.Trim().TrimStart('v')
     if ([string]::IsNullOrWhiteSpace($Version)) {
         $Version = [Reflection.AssemblyName]::GetAssemblyName($dll).Version.ToString()
     }
     $archive = Join-Path $OutputDirectory "DaveTheDiverMP-$Version.zip"
     if (Test-Path $archive) { Remove-Item -LiteralPath $archive -Force }
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive
+    $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $archive
+    $checksum = "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $archive)"
+    Set-Content -LiteralPath "$archive.sha256" -Value $checksum -Encoding ASCII
     Write-Host "Created $archive"
+    Write-Host "Created $archive.sha256"
 }
 finally {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
