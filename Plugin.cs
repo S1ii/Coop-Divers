@@ -43,7 +43,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private bool _playerPresent;
     private float _nextScan;
     private float _nextPositionLog;
+    private float _nextSnapshot;
+    private uint _sceneId;
+    private PlayerCharacter _player;
     private UdpSession _session;
+    private readonly RemoteAvatar _remoteAvatar = new();
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
     {
@@ -57,19 +61,43 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void Update()
     {
+        var scene = SceneManager.GetActiveScene().name;
+        if (scene != _scene)
+        {
+            _scene = scene;
+            _sceneId = Protocol.SceneId(scene);
+            _player = null;
+            _remoteAvatar.Clear();
+            Logger.LogInfo($"Scene: {_scene}");
+        }
+
         _session?.Update(Time.realtimeSinceStartup);
+
+        while (_session != null && _session.TryTakeSnapshot(out var snapshot))
+        {
+            if (_player != null && snapshot.SceneId == _sceneId)
+                _remoteAvatar.Apply(snapshot, _player);
+            else
+                _remoteAvatar.Clear();
+        }
+        _remoteAvatar.Update(Time.deltaTime);
+
+        if (_session?.Connected == true && _player != null && Time.realtimeSinceStartup >= _nextSnapshot)
+        {
+            var position = _player.transform.position;
+            var flipped = _player.Controller2D != null && _player.Controller2D.IsFliped();
+            _session.SendSnapshot(new PlayerSnapshot(_sceneId, position.x, position.y, position.z, flipped));
+            _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
+        }
+        else if (_session?.Connected != true)
+        {
+            _remoteAvatar.Clear();
+        }
 
         if (Time.realtimeSinceStartup < _nextScan)
             return;
 
         _nextScan = Time.realtimeSinceStartup + 1f;
-
-        var scene = SceneManager.GetActiveScene().name;
-        if (scene != _scene)
-        {
-            _scene = scene;
-            Logger.LogInfo($"Scene: {_scene}");
-        }
 
         var player = UnityEngine.Object.FindFirstObjectByType<PlayerCharacter>();
         if (player == null)
@@ -77,8 +105,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
             if (_playerPresent)
                 Logger.LogInfo("PlayerCharacter left the scene");
             _playerPresent = false;
+            _player = null;
             return;
         }
+
+        _player = player;
 
         if (!_playerPresent || Time.realtimeSinceStartup >= _nextPositionLog)
         {
@@ -93,5 +124,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private void OnDestroy()
     {
         _session?.Dispose();
+        _remoteAvatar.Dispose();
     }
 }

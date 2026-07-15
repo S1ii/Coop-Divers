@@ -27,11 +27,29 @@ internal sealed class UdpSession : IDisposable
     private float _lastReceive;
     private float _nextSend;
     private bool _connected;
+    private bool _hasSnapshot;
+    private uint _lastSnapshotSequence;
+    private PlayerSnapshot _snapshot;
 
     internal UdpSession(ManualLogSource log) => _log = log;
 
     internal bool Connected => _connected;
     internal int LocalPort => ((IPEndPoint)_udp.Client.LocalEndPoint).Port;
+
+    internal void SendSnapshot(PlayerSnapshot snapshot)
+    {
+        if (_connected)
+            Send(Protocol.EncodeSnapshot(++_sequence, snapshot));
+    }
+
+    internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
+    {
+        snapshot = _snapshot;
+        if (!_hasSnapshot)
+            return false;
+        _hasSnapshot = false;
+        return true;
+    }
 
     internal void Start(SessionRole role, string address, int port)
     {
@@ -115,7 +133,7 @@ internal sealed class UdpSession : IDisposable
 
     private void Handle(UdpReceiveResult received, float now)
     {
-        if (!Protocol.TryDecode(received.Buffer, out var type, out _))
+        if (!Protocol.TryDecode(received.Buffer, out var type, out var sequence))
             return;
 
         if (_role == SessionRole.Host && _remote == null && type == PacketType.Hello)
@@ -125,6 +143,17 @@ internal sealed class UdpSession : IDisposable
             return;
 
         _lastReceive = now;
+
+        if (type == PacketType.PlayerSnapshot)
+        {
+            if (IsNewer(sequence, _lastSnapshotSequence) &&
+                Protocol.TryDecodeSnapshot(received.Buffer, out _, out _snapshot))
+            {
+                _lastSnapshotSequence = sequence;
+                _hasSnapshot = true;
+            }
+            return;
+        }
 
         if (type == PacketType.Disconnect)
         {
@@ -152,12 +181,15 @@ internal sealed class UdpSession : IDisposable
 
     private void Send(PacketType type)
     {
+        Send(Protocol.Encode(type, ++_sequence));
+    }
+
+    private void Send(byte[] packet)
+    {
         if (_udp == null || _remote == null)
             return;
-
         try
         {
-            var packet = Protocol.Encode(type, ++_sequence);
             _udp.Send(packet, packet.Length, _remote);
         }
         catch (Exception exception)
@@ -165,6 +197,9 @@ internal sealed class UdpSession : IDisposable
             _log.LogWarning($"Network send failed: {exception.Message}");
         }
     }
+
+    private static bool IsNewer(uint sequence, uint previous) =>
+        unchecked((int)(sequence - previous)) > 0;
 
     public void Dispose()
     {
