@@ -101,7 +101,7 @@ internal sealed class RemoteAvatar : IDisposable
             _renderer.sortingLayerID = sourceRenderer.sortingLayerID;
             _renderer.sortingOrder = sourceRenderer.sortingOrder + 1;
             _gameObject.transform.localScale = sourceRenderer.transform.lossyScale;
-            _nameOffset = Mathf.Max(0.7f, _renderer.bounds.extents.magnitude + 0.3f);
+            _nameOffset = Mathf.Max(0.35f, _renderer.bounds.extents.magnitude + 0.1f);
 
             var sourceTexture = sourceRenderer.sprite.texture;
             foreach (var sprite in Resources.FindObjectsOfTypeAll<Sprite>())
@@ -120,7 +120,7 @@ internal sealed class RemoteAvatar : IDisposable
         _nameText.anchor = TextAnchor.MiddleCenter;
         _nameText.alignment = TextAlignment.Center;
         _nameText.fontSize = 64;
-        _nameText.characterSize = 0.08f;
+        _nameText.characterSize = 0.025f;
         _nameText.color = Color.white;
         var font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
         if (font != null)
