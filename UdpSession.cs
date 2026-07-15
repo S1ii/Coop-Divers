@@ -23,6 +23,8 @@ internal sealed class UdpSession : IDisposable
     private UdpClient _udp;
     private IPEndPoint _remote;
     private SessionRole _role;
+    private string _localName = "Diver";
+    private string _remoteName = "Diver";
     private uint _sequence;
     private float _lastReceive;
     private float _nextSend;
@@ -34,6 +36,7 @@ internal sealed class UdpSession : IDisposable
     internal UdpSession(ManualLogSource log) => _log = log;
 
     internal bool Connected => _connected;
+    internal string RemoteName => _remoteName;
     internal int LocalPort => ((IPEndPoint)_udp.Client.LocalEndPoint).Port;
 
     internal void SendSnapshot(PlayerSnapshot snapshot)
@@ -51,9 +54,10 @@ internal sealed class UdpSession : IDisposable
         return true;
     }
 
-    internal void Start(SessionRole role, string address, int port)
+    internal void Start(SessionRole role, string address, int port, string localName)
     {
         _role = role;
+        _localName = Protocol.NormalizePlayerName(localName);
         if (role == SessionRole.Offline)
         {
             _log.LogInfo("Network: Offline");
@@ -97,6 +101,7 @@ internal sealed class UdpSession : IDisposable
         if (_connected && now - _lastReceive > 5f)
         {
             _connected = false;
+            _remoteName = "Diver";
             _log.LogWarning("Network: peer timed out");
             if (_role == SessionRole.Host)
                 _remote = null;
@@ -107,7 +112,7 @@ internal sealed class UdpSession : IDisposable
 
         _nextSend = now + 1f;
         if (_role == SessionRole.Client && !_connected)
-            Send(PacketType.Hello);
+            SendIdentity(PacketType.Hello);
         else if (_remote != null)
             Send(PacketType.Heartbeat);
     }
@@ -136,8 +141,13 @@ internal sealed class UdpSession : IDisposable
         if (!Protocol.TryDecode(received.Buffer, out var type, out var sequence))
             return;
 
-        if (_role == SessionRole.Host && _remote == null && type == PacketType.Hello)
+        if (_role == SessionRole.Host && _remote == null)
+        {
+            if (type != PacketType.Hello ||
+                !Protocol.TryDecodeIdentity(received.Buffer, PacketType.Hello, out _, out _remoteName))
+                return;
             _remote = received.RemoteEndPoint;
+        }
 
         if (_remote == null || !received.RemoteEndPoint.Equals(_remote))
             return;
@@ -158,6 +168,7 @@ internal sealed class UdpSession : IDisposable
         if (type == PacketType.Disconnect)
         {
             _connected = false;
+            _remoteName = "Diver";
             _log.LogInfo("Network: peer disconnected");
             if (_role == SessionRole.Host)
                 _remote = null;
@@ -166,15 +177,19 @@ internal sealed class UdpSession : IDisposable
 
         if (_role == SessionRole.Host && type == PacketType.Hello)
         {
+            if (!Protocol.TryDecodeIdentity(received.Buffer, PacketType.Hello, out _, out _remoteName))
+                return;
             if (!_connected)
-                _log.LogInfo($"Network: client connected from {_remote}");
+                _log.LogInfo($"Network: {_remoteName} connected from {_remote}");
             _connected = true;
-            Send(PacketType.HelloAck);
+            SendIdentity(PacketType.HelloAck);
         }
         else if (_role == SessionRole.Client && type == PacketType.HelloAck)
         {
+            if (!Protocol.TryDecodeIdentity(received.Buffer, PacketType.HelloAck, out _, out _remoteName))
+                return;
             if (!_connected)
-                _log.LogInfo("Network: connected to host");
+                _log.LogInfo($"Network: connected to {_remoteName}");
             _connected = true;
         }
     }
@@ -182,6 +197,11 @@ internal sealed class UdpSession : IDisposable
     private void Send(PacketType type)
     {
         Send(Protocol.Encode(type, ++_sequence));
+    }
+
+    private void SendIdentity(PacketType type)
+    {
+        Send(Protocol.EncodeIdentity(type, ++_sequence, _localName));
     }
 
     private void Send(byte[] packet)
@@ -209,5 +229,6 @@ internal sealed class UdpSession : IDisposable
         _udp?.Dispose();
         _udp = null;
         _connected = false;
+        _remoteName = "Diver";
     }
 }

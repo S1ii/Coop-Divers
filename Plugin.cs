@@ -9,7 +9,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.1.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.2.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -22,13 +22,31 @@ public sealed class Plugin : BasePlugin
             "Host IPv4 address used by clients");
         var port = Config.Bind("Network", "Port", 27777,
             new ConfigDescription("UDP listen port", new AcceptableValueRange<int>(1024, 65535)));
+        var playerName = Config.Bind("Network", "PlayerName", string.Empty,
+            "Name shown above your diver; blank uses the Steam name");
 
         ProbeBehaviour.Logger = Log;
         ProbeBehaviour.Role = role.Value;
         ProbeBehaviour.Address = address.Value;
         ProbeBehaviour.Port = port.Value;
+        ProbeBehaviour.ConfiguredName = playerName.Value;
         Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
         AddComponent<ProbeBehaviour>();
+    }
+
+    internal static string ResolvePlayerName(string configuredName)
+    {
+        if (!string.IsNullOrWhiteSpace(configuredName))
+            return Protocol.NormalizePlayerName(configuredName);
+
+        try
+        {
+            return Protocol.NormalizePlayerName(SteamFriends.GetPersonaName());
+        }
+        catch
+        {
+            return "Diver";
+        }
     }
 }
 
@@ -38,6 +56,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal static SessionRole Role { get; set; }
     internal static string Address { get; set; } = string.Empty;
     internal static int Port { get; set; }
+    internal static string ConfiguredName { get; set; } = string.Empty;
 
     private string _scene = string.Empty;
     private bool _playerPresent;
@@ -55,8 +74,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void Start()
     {
+        var localName = Plugin.ResolvePlayerName(ConfiguredName);
         _session = new UdpSession(Logger);
-        _session.Start(Role, Address, Port);
+        _session.Start(Role, Address, Port, localName);
+        Logger.LogInfo($"Network identity: {localName}");
     }
 
     private void Update()
@@ -76,7 +97,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
             if (_player != null && snapshot.SceneId == _sceneId)
-                _remoteAvatar.Apply(snapshot, _player);
+                _remoteAvatar.Apply(snapshot, _player, _session.RemoteName);
             else
                 _remoteAvatar.Clear();
         }
@@ -85,8 +106,19 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (_session?.Connected == true && _player != null && Time.realtimeSinceStartup >= _nextSnapshot)
         {
             var position = _player.transform.position;
-            var flipped = _player.Controller2D != null && _player.Controller2D.IsFliped();
-            _session.SendSnapshot(new PlayerSnapshot(_sceneId, position.x, position.y, position.z, flipped));
+            var controller = _player.Controller2D;
+            var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
+            var rotation = controller != null ? controller.GetRotation() : _player.transform.eulerAngles.z;
+            var flipped = controller != null && controller.IsFliped();
+            _session.SendSnapshot(new PlayerSnapshot(
+                _sceneId,
+                position.x,
+                position.y,
+                position.z,
+                rotation,
+                velocity.x,
+                velocity.y,
+                flipped));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
         else if (_session?.Connected != true)
@@ -114,7 +146,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (!_playerPresent || Time.realtimeSinceStartup >= _nextPositionLog)
         {
             var position = player.transform.position;
-            Logger.LogInfo($"PlayerCharacter: ({position.x:F2}, {position.y:F2}, {position.z:F2})");
+            var controller = player.Controller2D;
+            var rotation = controller != null ? controller.GetRotation() : player.transform.eulerAngles.z;
+            var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
+            Logger.LogInfo(
+                $"PlayerCharacter: ({position.x:F2}, {position.y:F2}, {position.z:F2}); " +
+                $"rotation={rotation:F1}; velocity=({velocity.x:F2}, {velocity.y:F2})");
             _nextPositionLog = Time.realtimeSinceStartup + 5f;
         }
 
