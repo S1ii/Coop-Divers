@@ -11,77 +11,6 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.11.0")]
-public sealed class Plugin : BasePlugin
-{
-    private static ConfigEntry<SessionRole> _roleConfig;
-    private static ConfigEntry<string> _addressConfig;
-    private static ConfigEntry<int> _portConfig;
-    private static ConfigEntry<string> _playerNameConfig;
-    private static ConfigFile _config;
-
-    public override void Load()
-    {
-        Protocol.SelfTest();
-        LobbyInput.SelfTest();
-
-        _config = Config;
-        _roleConfig = Config.Bind("Network", "Role", SessionRole.Offline,
-            "Offline, Host, or Client");
-        _addressConfig = Config.Bind("Network", "Address", "127.0.0.1",
-            "Host IPv4 address used by clients");
-        _portConfig = Config.Bind("Network", "Port", 27777,
-            new ConfigDescription("UDP listen port", new AcceptableValueRange<int>(1024, 65535)));
-        _playerNameConfig = Config.Bind("Network", "PlayerName", string.Empty,
-            "Name shown above your diver; blank uses the Steam name");
-
-        ProbeBehaviour.Logger = Log;
-        ProbeBehaviour.Role = _roleConfig.Value;
-        ProbeBehaviour.Address = _addressConfig.Value;
-        ProbeBehaviour.Port = _portConfig.Value;
-        ProbeBehaviour.ConfiguredName = _playerNameConfig.Value;
-        try
-        {
-            Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, "dev.davethedivermp");
-            Log.LogInfo("Gameplay patches active");
-        }
-        catch (Exception exception)
-        {
-            Log.LogError($"Gameplay patches failed: {exception.Message}");
-        }
-        Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
-        AddComponent<ProbeBehaviour>();
-    }
-
-    internal static string ResolvePlayerName(string configuredName)
-    {
-        if (!string.IsNullOrWhiteSpace(configuredName))
-            return Protocol.NormalizePlayerName(configuredName);
-
-        try
-        {
-            return Protocol.NormalizePlayerName(SteamFriends.GetPersonaName());
-        }
-        catch
-        {
-            return "Diver";
-        }
-    }
-
-    internal static void SaveNetworkSettings(
-        SessionRole role,
-        string address,
-        int port,
-        string playerName)
-    {
-        _roleConfig.Value = role;
-        _addressConfig.Value = address;
-        _portConfig.Value = port;
-        _playerNameConfig.Value = playerName;
-        _config.Save();
-    }
-}
-
 public sealed class ProbeBehaviour : MonoBehaviour
 {
     internal static ProbeBehaviour Instance { get; private set; }
@@ -96,15 +25,26 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private float _nextScan;
     private float _nextPositionLog;
     private float _nextSnapshot;
+    private float _nextVisual;
     private uint _sceneId;
     private uint _buildId;
     private string _localName = "Diver";
     private PlayerCharacter _player;
     private SpriteRenderer _playerRenderer;
-    private UdpSession _session;
+    private LobbyPlayer _lobbyPlayer;
+    private SpriteRenderer _lobbyRenderer;
+    private SushiBarPlayerHanlder _sushiPlayer;
+    private SpriteRenderer _sushiRenderer;
+    internal UdpSession _session;
     private FishReplicator _fishReplicator;
     private PickupReplicator _pickupReplicator;
     private SceneReplicator _sceneReplicator;
+    private IngredientsReplicator _ingredientsReplicator;
+    private BoatDecoReplicator _boatDecoReplicator;
+    private DiveCoordinator _diveCoordinator;
+    private TravelCoordinator _travelCoordinator;
+    private ProjectileVisualReplicator _projectileVisualReplicator;
+    private RemoteCatchLedger _remoteCatchLedger;
     private readonly RemoteAvatar _remoteAvatar = new();
     private bool _showLobby;
     private bool _cursorWasVisible;
@@ -125,15 +65,22 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private void Start()
     {
         Instance = this;
+        Application.runInBackground = true;
         _buildId = Protocol.SceneId(
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}");
-        _fishReplicator = new FishReplicator(Logger);
-        _pickupReplicator = new PickupReplicator(Logger);
+        _remoteCatchLedger = new RemoteCatchLedger(Logger);
+        _fishReplicator = new FishReplicator(Logger, _remoteCatchLedger);
+        _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
+        _ingredientsReplicator = new IngredientsReplicator(Logger);
+        _boatDecoReplicator = new BoatDecoReplicator(Logger);
+        _diveCoordinator = new DiveCoordinator(Logger);
+        _travelCoordinator = new TravelCoordinator(Logger);
+        _projectileVisualReplicator = new ProjectileVisualReplicator();
         _lobbyAddress = Address;
         _lobbyPort = Port.ToString();
         _lobbyName = ConfiguredName;
-        if (!SwitchSession(Role, Address, Port, ConfiguredName, false, out _lobbyError))
+        if (!SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _lobbyError))
             SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _);
     }
 
@@ -167,21 +114,46 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var scene = SceneManager.GetActiveScene().name;
         if (scene != _scene)
         {
+            var wasDiveScene = IsDiveSceneName(_scene);
             if (_showLobby)
-                SetLobbyVisible(false);
+                SetLobbyVisible(false, false);
             _scene = scene;
             _sceneId = Protocol.SceneId(scene);
+            if (!wasDiveScene && IsDiveSceneName(scene))
+                _remoteCatchLedger?.BeginDive(_session, Time.realtimeSinceStartup);
             _player = null;
             _playerRenderer = null;
+            _lobbyPlayer = null;
+            _lobbyRenderer = null;
+            _sushiPlayer = null;
+            _sushiRenderer = null;
             _remoteAvatar.Clear();
             _fishReplicator?.Clear();
             _pickupReplicator?.Clear();
+            _boatDecoReplicator?.Clear();
+            _diveCoordinator?.Reset();
+            _travelCoordinator?.Reset();
+            _projectileVisualReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
+            if (Role == SessionRole.Host)
+                _sceneReplicator?.OnHostObservedScene(_session, _scene);
             Logger.LogInfo($"Scene: {_scene}");
         }
 
         _session?.Update(Time.realtimeSinceStartup);
+        if (Role == SessionRole.Client && _session != null && _session.TryTakePeerLoss(out var peerLoss))
+        {
+            ReturnToOnlineRoom(peerLoss);
+            return;
+        }
+        TitleOnlineMenu.Tick(this);
+        _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
+        _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+        _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
+        _diveCoordinator?.Update(Role, _session, Time.realtimeSinceStartup, _player);
+        _travelCoordinator?.Update(Role, _session);
+        _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime, _player);
         _pickupReplicator?.Update(
@@ -189,32 +161,45 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
-            if (_player != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
-                _remoteAvatar.Apply(snapshot, _player, _session.RemoteName);
+            var renderer = _playerRenderer ?? _lobbyRenderer ?? _sushiRenderer;
+            if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
+                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName);
             else
                 _remoteAvatar.Clear();
+        }
+        while (_session != null && _session.TryTakePlayerVisualState(out var visualState))
+        {
+            if (_session.SceneMatches(_sceneId) && visualState.SceneId == _sceneId)
+                _remoteAvatar.ApplyVisual(visualState, _session.RemoteName);
         }
         _remoteAvatar.Update(Time.unscaledDeltaTime);
 
         if (_session != null && _session.SceneMatches(_sceneId) &&
-            _player != null && Time.realtimeSinceStartup >= _nextSnapshot)
+            (_player != null || _lobbyPlayer != null || _sushiPlayer != null) &&
+            Time.realtimeSinceStartup >= _nextSnapshot)
         {
-            var position = _player.transform.position;
-            var controller = _player.Controller2D;
-            _playerRenderer ??= RemoteAvatar.FindPrimaryRenderer(_player);
+            var transform = _player != null
+                ? _player.transform
+                : _lobbyPlayer != null ? _lobbyPlayer.transform : _sushiPlayer.transform;
+            var controller = _player != null ? _player.Controller2D : null;
+            var renderer = _player != null
+                ? _playerRenderer ??= RemoteAvatar.FindPrimaryRenderer(_player)
+                : _lobbyPlayer != null
+                    ? _lobbyRenderer ??= _lobbyPlayer.m_Renderer ?? RemoteAvatar.FindPrimaryRenderer(_lobbyPlayer)
+                    : _sushiRenderer ??= RemoteAvatar.FindPrimaryRenderer(_sushiPlayer);
+            var position = transform.position;
             var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
-            var rotation = _playerRenderer != null
-                ? _playerRenderer.transform.eulerAngles.z
-                : controller != null ? controller.GetRotation() : _player.transform.eulerAngles.z;
-            var flipped = _playerRenderer != null
-                ? _playerRenderer.flipX
+            var rotation = renderer != null
+                ? renderer.transform.eulerAngles.z
+                : controller != null ? controller.GetRotation() : transform.eulerAngles.z;
+            var flipped = renderer != null
+                ? renderer.flipX
                 : controller != null && controller.IsFliped();
-            var spriteId = _playerRenderer != null && _playerRenderer.sprite != null
-                ? Protocol.SceneId(_playerRenderer.sprite.name)
+            var spriteId = renderer != null && renderer.sprite != null
+                ? Protocol.SceneId(renderer.sprite.name)
                 : 0u;
-            var visualScale = _playerRenderer != null
-                ? _playerRenderer.transform.lossyScale
-                : _player.transform.lossyScale;
+            var visualScale = renderer != null ? renderer.transform.lossyScale : transform.lossyScale;
+            flipped ^= visualScale.x < 0f;
             _session.SendSnapshot(new PlayerSnapshot(
                 _sceneId,
                 position.x,
@@ -224,14 +209,22 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 velocity.x,
                 velocity.y,
                 spriteId,
-                visualScale.x,
-                visualScale.y,
+                Mathf.Abs(visualScale.x),
+                Mathf.Abs(visualScale.y),
                 flipped));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
         else if (_session == null || !_session.SceneMatches(_sceneId))
         {
             _remoteAvatar.Clear();
+        }
+
+        var visualPlayer = (Component)_player ?? _sushiPlayer;
+        if (_session != null && visualPlayer != null && _session.SceneMatches(_sceneId) &&
+            Time.realtimeSinceStartup >= _nextVisual)
+        {
+            _session.SendPlayerVisualState(RemoteAvatar.CaptureVisualState(_sceneId, visualPlayer));
+            _nextVisual = Time.realtimeSinceStartup + 0.1f;
         }
 
         if (Time.realtimeSinceStartup < _nextScan)
@@ -242,14 +235,44 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var player = UnityEngine.Object.FindFirstObjectByType<PlayerCharacter>();
         if (player == null)
         {
-            if (_playerPresent)
-                Logger.LogInfo("PlayerCharacter left the scene");
-            _playerPresent = false;
             _player = null;
             _playerRenderer = null;
+            var lobbyPlayer = UnityEngine.Object.FindFirstObjectByType<LobbyPlayer>();
+            if (lobbyPlayer != null)
+            {
+                if (_lobbyPlayer != lobbyPlayer)
+                    _lobbyRenderer = lobbyPlayer.m_Renderer ?? RemoteAvatar.FindPrimaryRenderer(lobbyPlayer);
+                _lobbyPlayer = lobbyPlayer;
+                _sushiPlayer = null;
+                _sushiRenderer = null;
+                _playerPresent = true;
+                return;
+            }
+            var sushiPlayer = UnityEngine.Object.FindFirstObjectByType<SushiBarPlayerHanlder>();
+            if (sushiPlayer != null)
+            {
+                if (_sushiPlayer != sushiPlayer)
+                    _sushiRenderer = RemoteAvatar.FindPrimaryRenderer(sushiPlayer);
+                _sushiPlayer = sushiPlayer;
+                _lobbyPlayer = null;
+                _lobbyRenderer = null;
+                _playerPresent = true;
+                return;
+            }
+            if (_playerPresent)
+                Logger.LogInfo("Player character left the scene");
+            _playerPresent = false;
+            _lobbyPlayer = null;
+            _lobbyRenderer = null;
+            _sushiPlayer = null;
+            _sushiRenderer = null;
             return;
         }
 
+        _lobbyPlayer = null;
+        _lobbyRenderer = null;
+        _sushiPlayer = null;
+        _sushiRenderer = null;
         if (_player != player)
             _playerRenderer = RemoteAvatar.FindPrimaryRenderer(player);
         _player = player;
@@ -279,6 +302,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _playerPresent = true;
     }
 
+    private void LateUpdate() => _travelCoordinator?.LateUpdate();
+
     private void OnDestroy()
     {
         if (_showLobby)
@@ -291,6 +316,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
+        _ingredientsReplicator?.Clear();
+        _boatDecoReplicator?.Clear();
+        _projectileVisualReplicator?.Clear();
+        _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
     }
 
@@ -303,8 +332,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
         GUI.Box(new Rect(0f, 0f, _lobbyRect.width, _lobbyRect.height), "Dave the Diver Multiplayer");
         GUI.Label(new Rect(16f, 30f, 388f, 24f),
             $"Status: {LobbyInput.Status(Role, running, connected, peer)}");
-        if (Role == SessionRole.Host)
-            GUI.Label(new Rect(16f, 54f, 388f, 24f), $"LAN address: {_lanAddress}");
+        var ingredients = _ingredientsReplicator?.Status ?? "shared catch: unavailable";
+        var remoteCatch = _remoteCatchLedger?.Status ?? "remote carry: unavailable";
+        GUI.Label(new Rect(16f, 54f, 388f, 24f), Role == SessionRole.Host
+            ? $"LAN: {_lanAddress} | {ingredients} | {remoteCatch}"
+            : ingredients);
 
         GUI.Label(new Rect(16f, 84f, 70f, 24f), "Name");
         _lobbyName = GUI.TextField(new Rect(90f, 84f, 314f, 24f), _lobbyName ?? string.Empty, 24);
@@ -380,7 +412,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             }
 
             previous?.Dispose();
-            ClearReplicationState();
+            ClearReplicationState(SessionRole.Offline);
             _session = new UdpSession(Logger);
             _session.Start(SessionRole.Offline, address, port, localName, _buildId);
             _localName = localName;
@@ -395,7 +427,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
         if (!disposedPrevious)
             previous?.Dispose();
-        ClearReplicationState();
+        ClearReplicationState(role);
         _session = replacement;
         _localName = localName;
         Role = role;
@@ -407,6 +439,23 @@ public sealed class ProbeBehaviour : MonoBehaviour
         SaveSelectedSettings(Role, Address, Port, ConfiguredName, persist, ref error);
         Logger.LogInfo($"Network identity: {_localName}; build={_buildId:X8}; role={Role}");
         return true;
+    }
+
+    internal string TitlePlayerName => _localName;
+    internal string TitleLanAddress => LobbyInput.FindLanAddress();
+
+    internal bool SwitchTitleSession(
+        SessionRole role,
+        string address,
+        string portText,
+        string playerName,
+        out string error)
+    {
+        if (role == SessionRole.Offline)
+            return SwitchSession(SessionRole.Offline, address, Port, playerName, true, out error);
+        if (!LobbyInput.TryValidate(role, address, portText, out var normalized, out var port, out error))
+            return false;
+        return SwitchSession(role, normalized, port, playerName, true, out error);
     }
 
     private static void SaveSelectedSettings(
@@ -430,15 +479,19 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
     }
 
-    private void ClearReplicationState()
+    private void ClearReplicationState(SessionRole nextRole)
     {
+        if (Role != nextRole && (Role == SessionRole.Host || nextRole == SessionRole.Host))
+            _remoteCatchLedger?.Clear("network authority changed");
         _remoteAvatar.Clear();
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
+        _ingredientsReplicator?.Clear();
+        _boatDecoReplicator?.Clear();
     }
 
-    private void SetLobbyVisible(bool visible)
+    private void SetLobbyVisible(bool visible, bool restoreCursor = true)
     {
         if (_showLobby == visible)
             return;
@@ -455,10 +508,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
         else
         {
             ReleaseLobbyInputLock();
-            if (Cursor.visible)
-                Cursor.visible = _cursorWasVisible;
-            if (Cursor.lockState == CursorLockMode.None)
-                Cursor.lockState = _cursorWasLocked;
+            if (restoreCursor)
+            {
+                if (Cursor.visible)
+                    Cursor.visible = _cursorWasVisible;
+                if (Cursor.lockState == CursorLockMode.None)
+                    Cursor.lockState = _cursorWasLocked;
+            }
         }
     }
 
@@ -504,6 +560,92 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _pickupReplicator?.OnHostDestroyed(_session, _sceneId, item);
     }
 
+    internal void RegisterProjectile(Component projectile) =>
+        _projectileVisualReplicator?.Register(projectile);
+
+    internal void ReportBoatDecoChange(int id) =>
+        _boatDecoReplicator?.OnLocalChange(Role, _session, id);
+
+    internal bool RequestSushiBarTravel(Common.Contents.MoveSceneElement element) =>
+        _travelCoordinator?.Request(
+            Role, _session, TravelTarget.SushiBar, element.OnClick, element) ?? true;
+
+    internal bool RequestSushiBarReturn(SushiBarExitPanel panel) =>
+        _travelCoordinator?.Request(
+            Role, _session, TravelTarget.Lobby, panel.OnExecute) ?? true;
+
+    internal bool AllowSceneTransition(string sceneName)
+    {
+        var allowed = _sceneReplicator?.AllowTransition(Role) ?? true;
+        if (!allowed)
+            Logger.LogInfo($"Network: client scene transition blocked: {sceneName}");
+        return allowed;
+    }
+
+    private void ReturnToOnlineRoom(string reason)
+    {
+        Logger.LogWarning($"Network: {reason}; returning client to the Online room");
+        var address = Address;
+        var port = Port;
+        var name = ConfiguredName;
+        SwitchSession(SessionRole.Offline, address, port, name, false, out _);
+        TitleOnlineMenu.RequestHostDisconnect();
+        if (_scene == "DR_Title")
+            return;
+        var loader = UnityEngine.Object.FindFirstObjectByType<SceneLoader>();
+        if (loader != null)
+            loader.ChangeSceneAsync("DR_Title", SceneTransitionType.FadeOutIn);
+    }
+
+    internal void OnIngredientsChanged()
+    {
+        if (Role == SessionRole.Host)
+            _ingredientsReplicator?.MarkDirty();
+    }
+
+    internal bool TryCaptureRemoteLoot(
+        int itemId,
+        int count,
+        int bonusGrade,
+        LootBox.AutoLiftedType liftType,
+        Il2CppSystem.Collections.Generic.List<string> getTimes,
+        bool updateMission) =>
+        Role == SessionRole.Host &&
+        (_remoteCatchLedger?.TryIntercept(
+            itemId, count, bonusGrade, liftType, getTimes, updateMission) ?? false);
+
+    internal void PrepareRemoteCatchResult()
+    {
+        if (Role == SessionRole.Host)
+            _remoteCatchLedger?.PrepareResult(_session, false);
+    }
+
+    internal void PrepareDiveExitResult()
+    {
+        if (Role == SessionRole.Host)
+            _remoteCatchLedger?.PrepareResult(_session, true);
+    }
+
+    internal void ReportClientLoot(
+        int itemId,
+        int count,
+        int bonusGrade,
+        LootBox.AutoLiftedType liftType,
+        bool updateMission)
+    {
+        if (Role == SessionRole.Client && IsDiveScene())
+            _remoteCatchLedger?.ReportClientLoot(
+                _session, itemId, count, bonusGrade, liftType, updateMission);
+    }
+
+    internal void ClearRemoteCatch(string reason) => _remoteCatchLedger?.Clear(reason);
+
+    internal void ClearCompletedRemoteCatch()
+    {
+        if (Role == SessionRole.Host)
+            _remoteCatchLedger?.ClearCompleted();
+    }
+
     internal bool OnPickupInteract(PickupInstanceItem item)
     {
         if (Role != SessionRole.Client)
@@ -525,6 +667,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
         return !(_fishReplicator?.RequestDamage(
             _session, _sceneId, fish, damage, element, attackType) ?? false);
     }
+
+    internal bool AllowFishAllocatorSpawn() => true;
+
+    internal bool AllowFishSimulation(FishAISystem fish) =>
+        Role != SessionRole.Client || !(_fishReplicator?.IsClientProxy(fish) ?? false);
 
     internal bool AllowFishPickup(FishInteractionBody body)
     {
@@ -553,6 +700,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role != SessionRole.Host)
             return;
+        if (IsDiveScene() && sceneName.StartsWith("DR_Lobby", StringComparison.Ordinal))
+            PrepareDiveExitResult();
         _sceneReplicator?.OnHostTransition(
             _session,
             sceneName,
@@ -567,4 +716,49 @@ public sealed class ProbeBehaviour : MonoBehaviour
             skipEmptySceneOptionIsUnloadAssets,
             firstFindSceneManagerInActiveScene);
     }
+
+    internal bool RequestDive(LobbyStartGamePanelUI panel, StartParameter startParameter) =>
+        _diveCoordinator?.RequestDive(Role, _session, panel, startParameter) ?? true;
+
+    internal void ObserveDivePanel(LobbyStartGamePanelUI panel) =>
+        _diveCoordinator?.ObserveDivePanel(panel);
+
+    internal bool RequestDiveExit(Common.SceneExitTrigger trigger)
+    {
+        if (!IsDiveScene())
+            return true;
+        return _diveCoordinator?.RequestExit(
+            Role, _session, Time.realtimeSinceStartup, _player, trigger) ?? true;
+    }
+
+    internal bool RequestDiveLobbyExit(
+        InGameManager manager,
+        SceneTransitionColorType color,
+        bool playerDead)
+    {
+        if (!IsDiveScene())
+            return true;
+        return _diveCoordinator?.RequestLobbyExit(
+            Role, _session, Time.realtimeSinceStartup, _player,
+            manager, color, playerDead) ?? true;
+    }
+
+    internal void ReportDiveLife(bool dead)
+    {
+        if (IsDiveScene())
+            _diveCoordinator?.ReportLocalLife(Role, _session, dead);
+    }
+
+    internal bool RequestDiveDeathReturn()
+    {
+        if (Role != SessionRole.Client || !IsDiveScene())
+            return true;
+        return _diveCoordinator?.RequestExit(
+            Role, _session, Time.realtimeSinceStartup, _player, null) ?? true;
+    }
+
+    private bool IsDiveScene() => IsDiveSceneName(_scene);
+
+    private static bool IsDiveSceneName(string sceneName) =>
+        !string.IsNullOrEmpty(sceneName) && sceneName.StartsWith("A0", StringComparison.Ordinal);
 }

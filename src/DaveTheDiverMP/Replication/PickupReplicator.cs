@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using BepInEx.Logging;
 using HarmonyLib;
@@ -8,13 +9,18 @@ namespace DaveTheDiverMP;
 internal sealed class PickupReplicator
 {
     private readonly ManualLogSource _log;
+    private readonly RemoteCatchLedger _remoteCatch;
     private readonly Dictionary<uint, PickupInstanceItem> _items = new();
     private readonly Dictionary<uint, PickupRemoved> _pending = new();
     private float _nextScan;
     private int _lastItemCount = -1;
     private int _lastDuplicateCount = -1;
 
-    internal PickupReplicator(ManualLogSource log) => _log = log;
+    internal PickupReplicator(ManualLogSource log, RemoteCatchLedger remoteCatch)
+    {
+        _log = log;
+        _remoteCatch = remoteCatch;
+    }
 
     internal void Update(
         SessionRole role,
@@ -152,6 +158,12 @@ internal sealed class PickupReplicator
         }
         if (item == null || item.GetItemID() != request.ItemId)
             return;
+        if (item.GetType() != typeof(PickupInstanceItem))
+        {
+            _log.LogWarning(
+                $"Network pickup deferred: special item type {item.GetType().Name}");
+            return;
+        }
 
         var itemPosition = item.transform.position;
         var dx = itemPosition.x - remotePlayer.X;
@@ -162,8 +174,47 @@ internal sealed class PickupReplicator
             return;
         }
 
+        var itemId = item.GetItemID();
+        var integrated = DataManager.Instance.GetIntegratedItem(itemId);
+        if (integrated == null)
+        {
+            _log.LogWarning($"Network pickup rejected: unknown item {itemId}");
+            return;
+        }
+        if (integrated.IntegratedType != (int)IntegratedItemType.Loot ||
+            integrated.IsEquipmentType() || item.IsUpgradeKit())
+        {
+            _log.LogWarning($"Network pickup deferred: personal equipment {itemId}");
+            return;
+        }
+
+        var raw = DataManager.Instance.GetItems(itemId);
+        if (raw == null || raw.CategoryType is not (
+                DR.ItemCategoryType.Material or
+                DR.ItemCategoryType.Ingredients or
+                DR.ItemCategoryType.IngredientFish))
+        {
+            _log.LogWarning($"Network pickup rejected: unsupported category for {itemId}");
+            return;
+        }
+        var count = Math.Max(1, item.InstanceData.Count);
+        var sourceId = RemoteCatchLedger.PickupSource(sceneId, request.WorldId);
+        var onStored = item.OnStoredItem;
+        if (!_remoteCatch.CapturePickup(
+                sourceId, itemId, count,
+                () => LootBox.Instance?.Add(
+                    itemId, count, 0, LootBox.AutoLiftedType.None, null, true),
+                out var nativeCompleted))
+        {
+            _log.LogWarning($"Network pickup rejected: remote carry is full for {itemId}");
+            return;
+        }
+        if (item != null)
+            item.DestroyItem();
+        onStored?.Invoke();
+
         _items.Remove(request.WorldId);
-        item.SuccessInteract(hostPlayer);
+        _log.LogInfo($"Network pickup accepted into remote carry: {itemId} x{count}");
     }
 
     private static uint WorldId(uint sceneId, PickupInstanceItem item)
@@ -175,8 +226,6 @@ internal sealed class PickupReplicator
             if (current.parent != null)
                 hash = Mix(hash, current.GetSiblingIndex());
         }
-        // Hierarchy IDs cover deterministic scene pickups; dynamic
-        // host spawns will receive explicit network IDs with spawn replication.
         return hash;
     }
 

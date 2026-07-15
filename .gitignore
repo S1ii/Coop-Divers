@@ -1,2 +1,11 @@
 bin/
 obj/
+.vs/
+*.user
+*.suo
+*.log
+*.tmp
+artifacts/
+coverage/
+references/
+game/

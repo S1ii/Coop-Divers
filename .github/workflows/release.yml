@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release configuration
+        shell: pwsh
+        env:
+          REFERENCE_REPOSITORY: ${{ vars.REFERENCE_REPOSITORY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY)) {
+            throw 'Repository variable REFERENCE_REPOSITORY is required for releases.'
+          }
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+      - name: Fetch private game references
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.REFERENCE_REPOSITORY }}
+          token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+          path: game-references
+      - name: Build
+        shell: pwsh
+        run: dotnet build .\DaveTheDiverMP.csproj -c Release -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
+      - name: Package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          $version = $env:RELEASE_VERSION.TrimStart('v')
+          .\build\package.ps1 -Configuration Release -Version $version
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $archive = Get-ChildItem .\artifacts\*.zip | Select-Object -First 1
+          gh release create $env:GITHUB_REF_NAME $archive.FullName --generate-notes

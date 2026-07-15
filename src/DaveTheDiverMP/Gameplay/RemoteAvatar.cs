@@ -1,0 +1,265 @@
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace DaveTheDiverMP;
+
+internal sealed class RemoteAvatar : IDisposable
+{
+    private sealed class RemoteVisual
+    {
+        internal SpriteRenderer Renderer;
+        internal Vector3 Offset;
+        internal float Rotation;
+    }
+
+    private GameObject _gameObject;
+    private SpriteRenderer _renderer;
+    private readonly List<RemoteVisual> _visualRenderers = new();
+    private GameObject _nameObject;
+    private TextMesh _nameText;
+    private readonly Dictionary<uint, Sprite> _sprites = new();
+    private Vector3 _target;
+    private Vector3 _velocity;
+    private float _targetRotation;
+    private float _timeSinceSnapshot;
+    private float _nameOffset = 2.5f;
+    private bool _initialized;
+    private bool _hasVisualState;
+
+    internal void Apply(PlayerSnapshot snapshot, SpriteRenderer localRenderer, string playerName)
+    {
+        if (_gameObject == null)
+            Create(localRenderer, new Vector3(snapshot.X, snapshot.Y, snapshot.Z), playerName);
+
+        _target = new Vector3(snapshot.X, snapshot.Y, snapshot.Z);
+        _velocity = new Vector3(snapshot.VelocityX, snapshot.VelocityY, 0f);
+        _targetRotation = snapshot.Rotation;
+        _timeSinceSnapshot = 0f;
+        _nameText.text = Protocol.NormalizePlayerName(playerName);
+        if (snapshot.SpriteId != 0 && _sprites.TryGetValue(snapshot.SpriteId, out var sprite))
+            _renderer.sprite = sprite;
+        _renderer.flipX = snapshot.Flipped;
+        _renderer.enabled = !_hasVisualState;
+        _gameObject.transform.localScale = Vector3.one;
+        if (!_hasVisualState)
+            _renderer.transform.localScale = new Vector3(snapshot.ScaleX, snapshot.ScaleY, 1f);
+
+        if (!_initialized || (_gameObject.transform.position - _target).sqrMagnitude > 64f)
+        {
+            _gameObject.transform.position = _target;
+            _gameObject.transform.rotation = Quaternion.Euler(0f, 0f, _targetRotation);
+            _initialized = true;
+        }
+    }
+
+    internal void ApplyVisual(PlayerVisualState state, string playerName)
+    {
+        if (_gameObject == null)
+            return;
+
+        _hasVisualState = true;
+        _renderer.enabled = false;
+        _gameObject.transform.localScale = Vector3.one;
+        _nameText.text = Protocol.NormalizePlayerName(playerName);
+        while (_visualRenderers.Count < state.Sprites.Length)
+            CreateVisualRenderer();
+
+        var highestOrder = _renderer.sortingOrder;
+        for (var index = 0; index < _visualRenderers.Count; index++)
+        {
+            var visual = _visualRenderers[index];
+            var renderer = visual.Renderer;
+            if (index >= state.Sprites.Length)
+            {
+                renderer.gameObject.SetActive(false);
+                continue;
+            }
+
+            var sprite = state.Sprites[index];
+            renderer.gameObject.SetActive(true);
+            renderer.sprite = ResolveSprite(sprite.SpriteId);
+            renderer.flipX = sprite.FlipX;
+            renderer.flipY = sprite.FlipY;
+            renderer.sortingLayerID = sprite.SortingLayerId;
+            renderer.sortingOrder = sprite.SortingOrder;
+            visual.Offset = new Vector3(sprite.OffsetX, sprite.OffsetY, sprite.OffsetZ);
+            visual.Rotation = sprite.Rotation;
+            renderer.transform.position = _gameObject.transform.position + visual.Offset;
+            renderer.transform.rotation = Quaternion.Euler(0f, 0f, visual.Rotation);
+            renderer.transform.localScale = new Vector3(sprite.ScaleX, sprite.ScaleY, 1f);
+            highestOrder = Mathf.Max(highestOrder, sprite.SortingOrder);
+        }
+        var nameRenderer = _nameObject.GetComponent<MeshRenderer>();
+        nameRenderer.sortingOrder = highestOrder + 100;
+    }
+
+    internal void Update(float deltaTime)
+    {
+        if (_gameObject == null)
+            return;
+
+        _timeSinceSnapshot = Mathf.Min(_timeSinceSnapshot + deltaTime, 0.15f);
+        var predictedPosition = _target + _velocity * _timeSinceSnapshot;
+        var positionBlend = 1f - Mathf.Exp(-18f * deltaTime);
+        _gameObject.transform.position = Vector3.Lerp(
+            _gameObject.transform.position,
+            predictedPosition,
+            positionBlend);
+        var rotation = Mathf.LerpAngle(
+            _gameObject.transform.eulerAngles.z,
+            _targetRotation,
+            1f - Mathf.Exp(-22f * deltaTime));
+        _gameObject.transform.rotation = Quaternion.Euler(0f, 0f, rotation);
+
+        foreach (var visual in _visualRenderers)
+        {
+            if (visual.Renderer == null || !visual.Renderer.gameObject.activeSelf)
+                continue;
+            visual.Renderer.transform.position = _gameObject.transform.position + visual.Offset;
+            visual.Renderer.transform.rotation = Quaternion.Euler(0f, 0f, visual.Rotation);
+        }
+
+        _nameObject.transform.position = _gameObject.transform.position + Vector3.up * _nameOffset;
+        _nameObject.transform.rotation = Quaternion.identity;
+    }
+
+    internal void Clear()
+    {
+        if (_gameObject != null)
+            UnityEngine.Object.Destroy(_gameObject);
+        if (_nameObject != null)
+            UnityEngine.Object.Destroy(_nameObject);
+        _gameObject = null;
+        _renderer = null;
+        _nameObject = null;
+        _nameText = null;
+        _sprites.Clear();
+        _visualRenderers.Clear();
+        _initialized = false;
+        _hasVisualState = false;
+    }
+
+    internal static SpriteRenderer FindPrimaryRenderer(Component player)
+    {
+        foreach (var candidate in player.GetComponentsInChildren<SpriteRenderer>(true))
+        {
+            if (candidate != null && candidate.sprite != null)
+                return candidate;
+        }
+        return null;
+    }
+
+    internal static PlayerVisualState CaptureVisualState(uint sceneId, Component player)
+    {
+        var sprites = new List<VisualSprite>();
+        var root = player.transform;
+        var rangeAttack = player.GetComponent<PlayerCharacter>()?.RangeAttackArm;
+        var attackRange = rangeAttack?.attackRangeObject?.transform;
+        var harpoonAim = rangeAttack?.harpoonAimPoint;
+        var gunAim = rangeAttack?.gunAimPoint?.transform;
+        foreach (var renderer in player.GetComponentsInChildren<SpriteRenderer>(true))
+        {
+            if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy ||
+                renderer.sprite == null || IsUnder(renderer.transform, attackRange) ||
+                IsUnder(renderer.transform, harpoonAim) || IsUnder(renderer.transform, gunAim))
+                continue;
+            var scale = renderer.transform.lossyScale;
+            sprites.Add(new VisualSprite(
+                Protocol.SceneId(renderer.sprite.name),
+                renderer.transform.position.x - root.position.x,
+                renderer.transform.position.y - root.position.y,
+                renderer.transform.position.z - root.position.z,
+                renderer.transform.eulerAngles.z,
+                Mathf.Abs(scale.x), Mathf.Abs(scale.y),
+                renderer.sortingLayerID, renderer.sortingOrder,
+                renderer.flipX ^ scale.x < 0f,
+                renderer.flipY ^ scale.y < 0f));
+            if (sprites.Count == Protocol.MaxVisualSprites)
+                break;
+        }
+        return new PlayerVisualState(sceneId, sprites.ToArray());
+    }
+
+    private static bool IsUnder(Transform candidate, Transform root) =>
+        root != null && (candidate == root || candidate.IsChildOf(root));
+
+    private void Create(SpriteRenderer sourceRenderer, Vector3 position, string playerName)
+    {
+        _gameObject = new GameObject("DTMP Remote Diver");
+        _gameObject.transform.position = position;
+        var baseVisual = new GameObject("DTMP Remote Base Visual");
+        baseVisual.transform.SetParent(_gameObject.transform, false);
+        _renderer = baseVisual.AddComponent<SpriteRenderer>();
+        _renderer.color = new Color(0.55f, 0.9f, 1f, 0.85f);
+
+        if (sourceRenderer != null)
+        {
+            _renderer.sprite = sourceRenderer.sprite;
+            _renderer.sortingLayerID = sourceRenderer.sortingLayerID;
+            _renderer.sortingOrder = sourceRenderer.sortingOrder + 1;
+            _renderer.transform.localScale = new Vector3(
+                Mathf.Abs(sourceRenderer.transform.lossyScale.x),
+                Mathf.Abs(sourceRenderer.transform.lossyScale.y), 1f);
+            var sourceRoot = FindPlayerRoot(sourceRenderer);
+            if (sourceRoot != null)
+                _renderer.transform.localPosition =
+                    sourceRenderer.transform.position - sourceRoot.position;
+            _nameOffset = Mathf.Max(2.5f, _renderer.bounds.extents.y + 1.25f);
+        }
+        CacheSprites();
+
+        _nameObject = new GameObject("DTMP Remote Name");
+        _nameText = _nameObject.AddComponent<TextMesh>();
+        _nameText.text = Protocol.NormalizePlayerName(playerName);
+        _nameText.anchor = TextAnchor.MiddleCenter;
+        _nameText.alignment = TextAlignment.Center;
+        _nameText.fontSize = 64;
+        _nameText.characterSize = 0.025f;
+        _nameText.color = Color.white;
+        var font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        if (font != null)
+        {
+            _nameText.font = font;
+            _nameObject.GetComponent<MeshRenderer>().sharedMaterial = font.material;
+        }
+        var nameRenderer = _nameObject.GetComponent<MeshRenderer>();
+        nameRenderer.sortingLayerID = _renderer.sortingLayerID;
+        nameRenderer.sortingOrder = _renderer.sortingOrder + 100;
+        _nameObject.transform.position = position + Vector3.up * _nameOffset;
+    }
+
+    private void CreateVisualRenderer()
+    {
+        var visual = new GameObject("DTMP Remote Visual");
+        visual.transform.SetParent(_gameObject.transform, false);
+        _visualRenderers.Add(new RemoteVisual { Renderer = visual.AddComponent<SpriteRenderer>() });
+    }
+
+    private static Transform FindPlayerRoot(SpriteRenderer renderer)
+    {
+        Component player = renderer.GetComponentInParent<PlayerCharacter>();
+        player ??= renderer.GetComponentInParent<LobbyPlayer>();
+        player ??= renderer.GetComponentInParent<SushiBarPlayerHanlder>();
+        return player != null ? player.transform : renderer.transform.parent;
+    }
+
+    private Sprite ResolveSprite(uint id)
+    {
+        if (_sprites.TryGetValue(id, out var sprite))
+            return sprite;
+        CacheSprites();
+        return _sprites.TryGetValue(id, out sprite) ? sprite : null;
+    }
+
+    private void CacheSprites()
+    {
+        foreach (var sprite in Resources.FindObjectsOfTypeAll<Sprite>())
+        {
+            if (sprite != null)
+                _sprites.TryAdd(Protocol.SceneId(sprite.name), sprite);
+        }
+    }
+
+    public void Dispose() => Clear();
+}

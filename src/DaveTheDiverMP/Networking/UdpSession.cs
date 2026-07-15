@@ -30,9 +30,28 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishDamageRequest> _fishDamageRequests = new();
     private readonly ConcurrentQueue<FishPickupRequest> _fishPickupRequests = new();
     private readonly ConcurrentQueue<FishRemoved> _fishRemovals = new();
+    private readonly ConcurrentQueue<FishManifest> _fishManifests = new();
+    private readonly ConcurrentQueue<FishManifestState> _fishManifestStates = new();
+    private readonly ConcurrentQueue<PlayerVisualState> _playerVisualStates = new();
+    private readonly ConcurrentQueue<ProjectileVisualState> _projectileVisualStates = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRequests = new();
     private readonly ConcurrentQueue<SceneTransitionCommand> _sceneTransitions = new();
+    private readonly ConcurrentQueue<IngredientsSyncRequest> _ingredientsSyncRequests = new();
+    private readonly ConcurrentQueue<IngredientsSnapshotChunk> _ingredientsSnapshotChunks = new();
+    private readonly ConcurrentQueue<IngredientsDelta> _ingredientsDeltas = new();
+    private readonly ConcurrentQueue<RoomReady> _roomReady = new();
+    private readonly ConcurrentQueue<RoomState> _roomStates = new();
+    private readonly ConcurrentQueue<DiveReady> _diveReady = new();
+    private readonly ConcurrentQueue<DiveState> _diveStates = new();
+    private readonly ConcurrentQueue<DiverLifeState> _diverLifeStates = new();
+    private readonly ConcurrentQueue<DiveExitRequest> _diveExitRequests = new();
+    private readonly ConcurrentQueue<BoatDecoState> _boatDecoStates = new();
+    private readonly ConcurrentQueue<TravelReady> _travelReady = new();
+    private readonly ConcurrentQueue<TravelState> _travelStates = new();
+    private readonly ConcurrentQueue<DiveLootRequest> _diveLootRequests = new();
+    private readonly ConcurrentQueue<DiveResultEntry> _diveResultEntries = new();
+    private readonly ConcurrentQueue<DiveResultState> _diveResultStates = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
     private readonly HashSet<uint> _receivedReliable = new();
@@ -56,9 +75,12 @@ internal sealed class UdpSession : IDisposable
     private bool _hasSnapshot;
     private bool _hasRemotePlayerState;
     private volatile bool _receiveFailed;
+    private string _peerLostReason = string.Empty;
     private uint _lastSceneSequence;
     private uint _lastFishSequence;
     private uint _lastSnapshotSequence;
+    private uint _lastVisualSequence;
+    private uint _lastProjectileVisualSequence;
     private PlayerSnapshot _snapshot;
 
     internal UdpSession(ManualLogSource log) => _log = log;
@@ -68,8 +90,16 @@ internal sealed class UdpSession : IDisposable
     internal string RemoteName => _remoteName;
     internal int LocalPort => ((IPEndPoint)_udp.Client.LocalEndPoint).Port;
     internal int PendingReliableCount => _pendingReliable.Count;
+    internal int ReliableCapacityRemaining => Math.Max(0, 256 - _pendingReliable.Count);
     internal bool SceneMatches(uint sceneId) =>
         _connected && _hasRemoteScene && _remoteSceneId == sceneId;
+
+    internal bool TryTakePeerLoss(out string reason)
+    {
+        reason = _peerLostReason;
+        _peerLostReason = string.Empty;
+        return !string.IsNullOrEmpty(reason);
+    }
 
     internal void SetLocalScene(uint sceneId)
     {
@@ -85,6 +115,24 @@ internal sealed class UdpSession : IDisposable
         if (_connected)
             Send(Protocol.EncodeSnapshot(++_sequence, snapshot));
     }
+
+    internal void SendPlayerVisualState(PlayerVisualState state)
+    {
+        if (_connected && SceneMatches(state.SceneId))
+            Send(Protocol.EncodePlayerVisualState(++_sequence, state));
+    }
+
+    internal bool TryTakePlayerVisualState(out PlayerVisualState state) =>
+        _playerVisualStates.TryDequeue(out state);
+
+    internal void SendProjectileVisualState(ProjectileVisualState state)
+    {
+        if (_connected && SceneMatches(state.SceneId))
+            Send(Protocol.EncodeProjectileVisualState(++_sequence, state));
+    }
+
+    internal bool TryTakeProjectileVisualState(out ProjectileVisualState state) =>
+        _projectileVisualStates.TryDequeue(out state);
 
     internal void SendFishSnapshot(FishSnapshot snapshot)
     {
@@ -122,6 +170,30 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakeFishRemoved(out FishRemoved removed) =>
         _fishRemovals.TryDequeue(out removed);
 
+    internal bool SendFishManifest(FishManifest manifest)
+    {
+        if (_role != SessionRole.Host || !SceneMatches(manifest.SceneId) ||
+            ReliableCapacityRemaining == 0)
+            return false;
+        SendReliable(Protocol.EncodeFishManifest(++_sequence, manifest));
+        return true;
+    }
+
+    internal bool TryTakeFishManifest(out FishManifest manifest) =>
+        _fishManifests.TryDequeue(out manifest);
+
+    internal bool SendFishManifestState(FishManifestState state)
+    {
+        if (_role != SessionRole.Host || !SceneMatches(state.SceneId) ||
+            ReliableCapacityRemaining == 0)
+            return false;
+        SendReliable(Protocol.EncodeFishManifestState(++_sequence, state));
+        return true;
+    }
+
+    internal bool TryTakeFishManifestState(out FishManifestState state) =>
+        _fishManifestStates.TryDequeue(out state);
+
     internal void SendPickupRemoved(PickupRemoved removed)
     {
         if (_role == SessionRole.Host && SceneMatches(removed.SceneId))
@@ -148,6 +220,137 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeSceneTransition(out SceneTransitionCommand command) =>
         _sceneTransitions.TryDequeue(out command);
+
+    internal void SendIngredientsSyncRequest(IngredientsSyncRequest request)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeIngredientsSyncRequest(++_sequence, request));
+    }
+
+    internal bool TryTakeIngredientsSyncRequest(out IngredientsSyncRequest request) =>
+        _ingredientsSyncRequests.TryDequeue(out request);
+
+    internal void SendIngredientsSnapshotChunk(IngredientsSnapshotChunk chunk)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeIngredientsSnapshotChunk(++_sequence, chunk));
+    }
+
+    internal bool TryTakeIngredientsSnapshotChunk(out IngredientsSnapshotChunk chunk) =>
+        _ingredientsSnapshotChunks.TryDequeue(out chunk);
+
+    internal void SendIngredientsDelta(IngredientsDelta delta)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeIngredientsDelta(++_sequence, delta));
+    }
+
+    internal bool TryTakeIngredientsDelta(out IngredientsDelta delta) =>
+        _ingredientsDeltas.TryDequeue(out delta);
+
+    internal void SendRoomReady(RoomReady ready)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeRoomReady(++_sequence, ready));
+    }
+
+    internal bool TryTakeRoomReady(out RoomReady ready) => _roomReady.TryDequeue(out ready);
+
+    internal void SendRoomState(RoomState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeRoomState(++_sequence, state));
+    }
+
+    internal bool TryTakeRoomState(out RoomState state) => _roomStates.TryDequeue(out state);
+
+    internal void SendDiveReady(DiveReady ready)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeDiveReady(++_sequence, ready));
+    }
+
+    internal bool TryTakeDiveReady(out DiveReady ready) => _diveReady.TryDequeue(out ready);
+
+    internal void SendDiveState(DiveState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeDiveState(++_sequence, state));
+    }
+
+    internal bool TryTakeDiveState(out DiveState state) => _diveStates.TryDequeue(out state);
+
+    internal void SendDiverLifeState(DiverLifeState state)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeDiverLifeState(++_sequence, state));
+    }
+
+    internal bool TryTakeDiverLifeState(out DiverLifeState state) =>
+        _diverLifeStates.TryDequeue(out state);
+
+    internal void SendDiveExitRequest(DiveExitRequest request)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeDiveExitRequest(++_sequence, request));
+    }
+
+    internal bool TryTakeDiveExitRequest(out DiveExitRequest request) =>
+        _diveExitRequests.TryDequeue(out request);
+
+    internal void SendBoatDecoState(BoatDecoState state)
+    {
+        if ((_role is SessionRole.Host or SessionRole.Client) && _connected)
+            SendReliable(Protocol.EncodeBoatDecoState(++_sequence, state));
+    }
+
+    internal bool TryTakeBoatDecoState(out BoatDecoState state) =>
+        _boatDecoStates.TryDequeue(out state);
+
+    internal void SendTravelReady(TravelReady ready)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeTravelReady(++_sequence, ready));
+    }
+
+    internal bool TryTakeTravelReady(out TravelReady ready) =>
+        _travelReady.TryDequeue(out ready);
+
+    internal void SendTravelState(TravelState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeTravelState(++_sequence, state));
+    }
+
+    internal bool TryTakeTravelState(out TravelState state) =>
+        _travelStates.TryDequeue(out state);
+
+    internal void SendDiveLootRequest(DiveLootRequest request)
+    {
+        if (_role == SessionRole.Client && _connected)
+            SendReliable(Protocol.EncodeDiveLootRequest(++_sequence, request));
+    }
+
+    internal bool TryTakeDiveLootRequest(out DiveLootRequest request) =>
+        _diveLootRequests.TryDequeue(out request);
+
+    internal void SendDiveResultEntry(DiveResultEntry entry)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeDiveResultEntry(++_sequence, entry));
+    }
+
+    internal bool TryTakeDiveResultEntry(out DiveResultEntry entry) =>
+        _diveResultEntries.TryDequeue(out entry);
+
+    internal void SendDiveResultState(DiveResultState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeDiveResultState(++_sequence, state));
+    }
+
+    internal bool TryTakeDiveResultState(out DiveResultState state) =>
+        _diveResultStates.TryDequeue(out state);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -217,6 +420,7 @@ internal sealed class UdpSession : IDisposable
         _now = now;
         if (_receiveFailed)
         {
+            SignalPeerLoss("connection failed");
             _udp?.Dispose();
             _udp = null;
             _receiveFailed = false;
@@ -234,6 +438,7 @@ internal sealed class UdpSession : IDisposable
 
         if (_connected && now - _lastReceive > 5f)
         {
+            SignalPeerLoss("host timed out");
             ResetPeerState();
             _log.LogWarning("Network: peer timed out");
             if (_role == SessionRole.Host)
@@ -255,7 +460,17 @@ internal sealed class UdpSession : IDisposable
         try
         {
             while (!_stop.IsCancellationRequested)
-                _incoming.Enqueue(await _udp.ReceiveAsync(_stop.Token));
+            {
+                try
+                {
+                    _incoming.Enqueue(await _udp.ReceiveAsync(_stop.Token));
+                }
+                catch (SocketException exception) when (
+                    exception.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionRefused)
+                {
+                    // UDP can surface an ICMP "port unreachable" while the peer is starting.
+                }
+            }
         }
         catch (OperationCanceledException)
         {
@@ -319,6 +534,30 @@ internal sealed class UdpSession : IDisposable
                     _hasRemotePlayerState = true;
                     _lastSnapshotReceive = now;
                 }
+            }
+            return;
+        }
+
+        if (type == PacketType.PlayerVisualState)
+        {
+            if (_connected && Protocol.TryDecodePlayerVisualState(received.Buffer, out _, out var state) &&
+                IsNewer(sequence, _lastVisualSequence))
+            {
+                _lastVisualSequence = sequence;
+                _lastReceive = now;
+                _playerVisualStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.ProjectileVisualState)
+        {
+            if (_connected && Protocol.TryDecodeProjectileVisualState(received.Buffer, out _, out var state) &&
+                IsNewer(sequence, _lastProjectileVisualSequence))
+            {
+                _lastProjectileVisualSequence = sequence;
+                _lastReceive = now;
+                _projectileVisualStates.Enqueue(state);
             }
             return;
         }
@@ -396,6 +635,30 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.FishManifest)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeFishManifest(received.Buffer, out _, out var manifest))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _fishManifests.Enqueue(manifest);
+            }
+            return;
+        }
+
+        if (type == PacketType.FishManifestState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeFishManifestState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _fishManifestStates.Enqueue(state);
+            }
+            return;
+        }
+
         if (type == PacketType.PickupRemoved)
         {
             if (_connected && _role == SessionRole.Client &&
@@ -438,6 +701,186 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.IngredientsSyncRequest)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeIngredientsSyncRequest(received.Buffer, out _, out var request))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _ingredientsSyncRequests.Enqueue(request);
+            }
+            return;
+        }
+
+        if (type == PacketType.IngredientsSnapshotChunk)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeIngredientsSnapshotChunk(received.Buffer, out _, out var chunk))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _ingredientsSnapshotChunks.Enqueue(chunk);
+            }
+            return;
+        }
+
+        if (type == PacketType.IngredientsDelta)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeIngredientsDelta(received.Buffer, out _, out var delta))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _ingredientsDeltas.Enqueue(delta);
+            }
+            return;
+        }
+
+        if (type == PacketType.RoomReady)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeRoomReady(received.Buffer, out _, out var ready))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _roomReady.Enqueue(ready);
+            }
+            return;
+        }
+
+        if (type == PacketType.RoomState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeRoomState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _roomStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveReady)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiveReady(received.Buffer, out _, out var ready))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveReady.Enqueue(ready);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiveState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiverLifeState)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiverLifeState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diverLifeStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveExitRequest)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiveExitRequest(received.Buffer, out _, out var request))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveExitRequests.Enqueue(request);
+            }
+            return;
+        }
+
+        if (type == PacketType.BoatDecoState)
+        {
+            if (_connected && (_role is SessionRole.Host or SessionRole.Client) &&
+                Protocol.TryDecodeBoatDecoState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (state.Id >= 0 && AcceptReliable(sequence))
+                    _boatDecoStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.TravelReady)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeTravelReady(received.Buffer, out _, out var ready))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _travelReady.Enqueue(ready);
+            }
+            return;
+        }
+
+        if (type == PacketType.TravelState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeTravelState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _travelStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveLootRequest)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiveLootRequest(received.Buffer, out _, out var request))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveLootRequests.Enqueue(request);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveResultEntry)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiveResultEntry(received.Buffer, out _, out var entry))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveResultEntries.Enqueue(entry);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiveResultState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiveResultState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _diveResultStates.Enqueue(state);
+            }
+            return;
+        }
+
         if (type == PacketType.Heartbeat)
         {
             if (_connected)
@@ -447,6 +890,7 @@ internal sealed class UdpSession : IDisposable
 
         if (type == PacketType.Disconnect)
         {
+            SignalPeerLoss("host disconnected");
             ResetPeerState();
             _log.LogInfo("Network: peer disconnected");
             if (_role == SessionRole.Host)
@@ -550,6 +994,12 @@ internal sealed class UdpSession : IDisposable
     private static bool IsNewer(uint sequence, uint previous) =>
         unchecked((int)(sequence - previous)) > 0;
 
+    private void SignalPeerLoss(string reason)
+    {
+        if (_role == SessionRole.Client && _connected && string.IsNullOrEmpty(_peerLostReason))
+            _peerLostReason = reason;
+    }
+
     private void ResetPeerState()
     {
         _connected = false;
@@ -561,6 +1011,12 @@ internal sealed class UdpSession : IDisposable
         while (_fishSnapshots.TryDequeue(out _))
         {
         }
+        while (_playerVisualStates.TryDequeue(out _))
+        {
+        }
+        while (_projectileVisualStates.TryDequeue(out _))
+        {
+        }
         while (_fishDamageRequests.TryDequeue(out _))
         {
         }
@@ -568,6 +1024,12 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_fishRemovals.TryDequeue(out _))
+        {
+        }
+        while (_fishManifests.TryDequeue(out _))
+        {
+        }
+        while (_fishManifestStates.TryDequeue(out _))
         {
         }
         while (_pickupRemovals.TryDequeue(out _))
@@ -579,14 +1041,61 @@ internal sealed class UdpSession : IDisposable
         while (_sceneTransitions.TryDequeue(out _))
         {
         }
+        while (_ingredientsSyncRequests.TryDequeue(out _))
+        {
+        }
+        while (_ingredientsSnapshotChunks.TryDequeue(out _))
+        {
+        }
+        while (_ingredientsDeltas.TryDequeue(out _))
+        {
+        }
         _snapshot = default;
         _lastSnapshotReceive = 0f;
         _hasSnapshot = false;
         _hasRemotePlayerState = false;
         _lastSnapshotSequence = 0;
+        _lastVisualSequence = 0;
+        _lastProjectileVisualSequence = 0;
         _pendingReliable.Clear();
         _receivedReliable.Clear();
         _receivedReliableOrder.Clear();
+        while (_roomReady.TryDequeue(out _))
+        {
+        }
+        while (_roomStates.TryDequeue(out _))
+        {
+        }
+        while (_diveReady.TryDequeue(out _))
+        {
+        }
+        while (_diveStates.TryDequeue(out _))
+        {
+        }
+        while (_diverLifeStates.TryDequeue(out _))
+        {
+        }
+        while (_diveExitRequests.TryDequeue(out _))
+        {
+        }
+        while (_travelReady.TryDequeue(out _))
+        {
+        }
+        while (_travelStates.TryDequeue(out _))
+        {
+        }
+        while (_boatDecoStates.TryDequeue(out _))
+        {
+        }
+        while (_diveLootRequests.TryDequeue(out _))
+        {
+        }
+        while (_diveResultEntries.TryDequeue(out _))
+        {
+        }
+        while (_diveResultStates.TryDequeue(out _))
+        {
+        }
     }
 
     public void Dispose()

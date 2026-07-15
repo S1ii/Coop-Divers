@@ -7,8 +7,10 @@ namespace DaveTheDiverMP;
 
 internal sealed class SceneReplicator
 {
+    private const ushort NativeDefaults = 1 << 15;
     private readonly ManualLogSource _log;
     private SceneTransitionCommand? _pending;
+    private bool _applyingHostTransition;
 
     internal SceneReplicator(ManualLogSource log) => _log = log;
 
@@ -40,6 +42,14 @@ internal sealed class SceneReplicator
             sceneName, (int)transitionType, options));
     }
 
+    internal void OnHostObservedScene(UdpSession session, string sceneName)
+    {
+        if (session == null || string.IsNullOrWhiteSpace(sceneName) || sceneName == "Empty")
+            return;
+        session.SendSceneTransition(new SceneTransitionCommand(
+            sceneName, (int)SceneTransitionType.FadeOutIn, NativeDefaults));
+    }
+
     internal void Update(SessionRole role, UdpSession session)
     {
         if (role != SessionRole.Client || !session.Connected)
@@ -69,23 +79,43 @@ internal sealed class SceneReplicator
 
         _pending = null;
         _log.LogInfo($"Network: following host to scene {pending.SceneName}");
-        loader.ChangeSceneAsync(
-            pending.SceneName,
-            (SceneTransitionType)pending.TransitionType,
-            Get(pending.Options, 0),
-            Get(pending.Options, 1),
-            Get(pending.Options, 2),
-            Get(pending.Options, 3),
-            Get(pending.Options, 4),
-            null,
-            null,
-            Get(pending.Options, 5),
-            Get(pending.Options, 6),
-            Get(pending.Options, 7),
-            Get(pending.Options, 8));
+        _applyingHostTransition = true;
+        try
+        {
+            if ((pending.Options & NativeDefaults) != 0)
+            {
+                loader.ChangeSceneAsync(pending.SceneName, (SceneTransitionType)pending.TransitionType);
+                return;
+            }
+            loader.ChangeSceneAsync(
+                pending.SceneName,
+                (SceneTransitionType)pending.TransitionType,
+                Get(pending.Options, 0),
+                Get(pending.Options, 1),
+                Get(pending.Options, 2),
+                Get(pending.Options, 3),
+                Get(pending.Options, 4),
+                null,
+                null,
+                Get(pending.Options, 5),
+                Get(pending.Options, 6),
+                Get(pending.Options, 7),
+                Get(pending.Options, 8));
+        }
+        finally
+        {
+            _applyingHostTransition = false;
+        }
     }
 
-    internal void Clear() => _pending = null;
+    internal bool AllowTransition(SessionRole role) =>
+        role != SessionRole.Client || _applyingHostTransition;
+
+    internal void Clear()
+    {
+        _pending = null;
+        _applyingHostTransition = false;
+    }
 
     private static void Set(ref ushort options, int bit, bool enabled)
     {
@@ -100,7 +130,7 @@ internal sealed class SceneReplicator
 [HarmonyPatch(typeof(SceneLoader), nameof(SceneLoader.ChangeSceneAsync))]
 internal static class SceneTransitionPatch
 {
-    private static void Prefix(
+    private static bool Prefix(
         string sceneName,
         SceneTransitionType sceneTranstionType,
         bool throughEmptyScene,
@@ -111,8 +141,12 @@ internal static class SceneTransitionPatch
         bool ignoreSameSceneCheck,
         bool isRetry,
         bool skipEmptySceneOption_isUnloadAssets,
-        bool firstFindSceneManagerInActiveScene) =>
-        ProbeBehaviour.Instance?.OnSceneTransition(
+        bool firstFindSceneManagerInActiveScene)
+    {
+        var behaviour = ProbeBehaviour.Instance;
+        if (behaviour != null && !behaviour.AllowSceneTransition(sceneName))
+            return false;
+        behaviour?.OnSceneTransition(
             sceneName,
             sceneTranstionType,
             throughEmptyScene,
@@ -124,4 +158,6 @@ internal static class SceneTransitionPatch
             isRetry,
             skipEmptySceneOption_isUnloadAssets,
             firstFindSceneManagerInActiveScene);
+        return true;
+    }
 }
