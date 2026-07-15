@@ -25,6 +25,7 @@ internal sealed class DiveCoordinator
     private bool _allowNativeExit;
     private bool _hostDead;
     private bool _clientDead;
+    private bool _clientSpectating;
     private uint _lifeRevision = 1;
     private uint _remoteLifeRevision;
     private uint _exitRevision = 1;
@@ -90,7 +91,12 @@ internal sealed class DiveCoordinator
         return false;
     }
 
-    internal void Update(SessionRole role, UdpSession session, float now, PlayerCharacter player)
+    internal void Update(
+        SessionRole role,
+        UdpSession session,
+        float now,
+        PlayerCharacter player,
+        Transform remoteAvatar)
     {
         if (session == null || !session.Connected)
         {
@@ -153,7 +159,10 @@ internal sealed class DiveCoordinator
             while (session.TryTakeDiveExitRequest(out _))
             {
             }
-            EnsureClientExitPrompt(player);
+            if (_clientDead)
+                UpdateClientSpectator(remoteAvatar);
+            else
+                EnsureClientExitPrompt(player);
         }
         RefreshPrompt(session);
     }
@@ -170,6 +179,7 @@ internal sealed class DiveCoordinator
         (_hostReady, _clientReady, _starting, _allowNativeStart, _allowNativeExit) =
             (false, false, false, false, false);
         (_hostDead, _clientDead) = (false, false);
+        _clientSpectating = false;
         (_hostExitReady, _clientExitReady) = (false, false);
         (_lifeRevision, _remoteLifeRevision, _exitRevision, _remoteExitRevision) = (1, 0, 1, 0);
         _panel = null;
@@ -207,7 +217,14 @@ internal sealed class DiveCoordinator
         PlayerCharacter player,
         SceneExitTrigger trigger)
     {
-        if (_allowNativeExit || session == null || !session.Connected || player == null)
+        if (_allowNativeExit || session == null || !session.Connected)
+            return true;
+        if (role == SessionRole.Client && _clientDead)
+        {
+            _log.LogInfo("Dive: dead client remains in spectator mode");
+            return false;
+        }
+        if (player == null)
             return true;
         if (role == SessionRole.Client)
         {
@@ -234,7 +251,14 @@ internal sealed class DiveCoordinator
         SceneTransitionColorType color,
         bool playerDead)
     {
-        if (_allowNativeExit || session == null || !session.Connected || manager == null)
+        if (_allowNativeExit || session == null || !session.Connected)
+            return true;
+        if (role == SessionRole.Client && _clientDead)
+        {
+            _log.LogInfo("Dive: dead client blocked native lobby return");
+            return false;
+        }
+        if (manager == null)
             return true;
         if (role == SessionRole.Client)
         {
@@ -269,6 +293,8 @@ internal sealed class DiveCoordinator
             return;
 
         _clientDead = dead;
+        if (!dead)
+            _clientSpectating = false;
         _lifeRevision = NextRevision(_lifeRevision);
         session.SendDiverLifeState(new DiverLifeState(_lifeRevision, dead));
         _log.LogInfo(dead ? "Dive: client reported death" : "Dive: client reported revive");
@@ -372,6 +398,20 @@ internal sealed class DiveCoordinator
             return;
         _clientExitPromptShown = true;
         _log.LogInfo("Dive: client reached the native return-to-lobby boundary");
+    }
+
+    internal bool IsClientSpectating => _clientDead;
+
+    private void UpdateClientSpectator(Transform remoteAvatar)
+    {
+        if (_clientSpectating || remoteAvatar == null)
+            return;
+        var camera = CameraManager.Instance;
+        if (camera == null)
+            return;
+        camera.ChangeTarget(remoteAvatar);
+        _clientSpectating = true;
+        _log.LogInfo("Dive: client camera follows host after death");
     }
 
     private static SceneExitTrigger FindLoadedExitTrigger()

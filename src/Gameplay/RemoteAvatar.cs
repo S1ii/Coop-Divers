@@ -27,6 +27,8 @@ internal sealed class RemoteAvatar : IDisposable
     private bool _initialized;
     private bool _hasVisualState;
 
+    internal Transform Transform => _gameObject?.transform;
+
     internal void Apply(PlayerSnapshot snapshot, SpriteRenderer localRenderer, string playerName)
     {
         if (_gameObject == null)

@@ -39,6 +39,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private FishReplicator _fishReplicator;
     private PickupReplicator _pickupReplicator;
     private SceneReplicator _sceneReplicator;
+    private MissionProgressReplicator _missionProgressReplicator;
     private IngredientsReplicator _ingredientsReplicator;
     private BoatDecoReplicator _boatDecoReplicator;
     private DiveCoordinator _diveCoordinator;
@@ -72,6 +73,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator = new FishReplicator(Logger, _remoteCatchLedger);
         _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
+        _missionProgressReplicator = new MissionProgressReplicator(Logger);
         _ingredientsReplicator = new IngredientsReplicator(Logger);
         _boatDecoReplicator = new BoatDecoReplicator(Logger);
         _diveCoordinator = new DiveCoordinator(Logger);
@@ -148,10 +150,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
+        _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
-        _diveCoordinator?.Update(Role, _session, Time.realtimeSinceStartup, _player);
+        _diveCoordinator?.Update(
+            Role, _session, Time.realtimeSinceStartup, _player, _remoteAvatar.Transform);
         _travelCoordinator?.Update(Role, _session);
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
@@ -316,6 +320,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
+        _missionProgressReplicator?.Clear();
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
@@ -576,10 +581,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool AllowSceneTransition(string sceneName)
     {
-        var allowed = _sceneReplicator?.AllowTransition(Role) ?? true;
-        if (!allowed)
-            Logger.LogInfo($"Network: client scene transition blocked: {sceneName}");
-        return allowed;
+        if (_sceneReplicator?.AllowTransition(Role) ?? true)
+            return true;
+        if (_travelCoordinator?.AllowClientSceneTransition() ?? false)
+            return true;
+        Logger.LogInfo($"Network: client scene transition blocked: {sceneName}");
+        return false;
     }
 
     private void ReturnToOnlineRoom(string reason)
@@ -748,6 +755,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (IsDiveScene())
             _diveCoordinator?.ReportLocalLife(Role, _session, dead);
     }
+
+    internal bool ShouldSuppressClientDeathPopup() =>
+        Role == SessionRole.Client && IsDiveScene() &&
+        (_diveCoordinator?.IsClientSpectating ?? false);
 
     internal bool RequestDiveDeathReturn()
     {

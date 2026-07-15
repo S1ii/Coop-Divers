@@ -52,6 +52,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<DiveLootRequest> _diveLootRequests = new();
     private readonly ConcurrentQueue<DiveResultEntry> _diveResultEntries = new();
     private readonly ConcurrentQueue<DiveResultState> _diveResultStates = new();
+    private readonly ConcurrentQueue<MissionState> _missionStates = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
     private readonly HashSet<uint> _receivedReliable = new();
@@ -81,6 +82,7 @@ internal sealed class UdpSession : IDisposable
     private uint _lastSnapshotSequence;
     private uint _lastVisualSequence;
     private uint _lastProjectileVisualSequence;
+    private uint _lastMissionSequence;
     private PlayerSnapshot _snapshot;
 
     internal UdpSession(ManualLogSource log) => _log = log;
@@ -351,6 +353,15 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeDiveResultState(out DiveResultState state) =>
         _diveResultStates.TryDequeue(out state);
+
+    internal void SendMissionState(MissionState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            Send(Protocol.EncodeMissionState(++_sequence, state));
+    }
+
+    internal bool TryTakeMissionState(out MissionState state) =>
+        _missionStates.TryDequeue(out state);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -881,6 +892,19 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.MissionState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeMissionState(received.Buffer, out _, out var state) &&
+                IsNewer(sequence, _lastMissionSequence))
+            {
+                _lastMissionSequence = sequence;
+                _lastReceive = now;
+                _missionStates.Enqueue(state);
+            }
+            return;
+        }
+
         if (type == PacketType.Heartbeat)
         {
             if (_connected)
@@ -1057,6 +1081,7 @@ internal sealed class UdpSession : IDisposable
         _lastSnapshotSequence = 0;
         _lastVisualSequence = 0;
         _lastProjectileVisualSequence = 0;
+        _lastMissionSequence = 0;
         _pendingReliable.Clear();
         _receivedReliable.Clear();
         _receivedReliableOrder.Clear();
@@ -1094,6 +1119,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_diveResultStates.TryDequeue(out _))
+        {
+        }
+        while (_missionStates.TryDequeue(out _))
         {
         }
     }

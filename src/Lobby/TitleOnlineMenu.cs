@@ -724,32 +724,21 @@ internal static class TitleOnlineMenu
             TryHandle(manager, (ButtonName)action);
         }));
         var pointers = button.GetComponentsInChildren<PointerEventComponent>(true);
-        PointerEventComponent selected = null;
-        var selectedArea = -1f;
+        var bound = 0;
         foreach (var pointer in pointers)
         {
             if (pointer == null)
                 continue;
-            pointer.onClick = new UnityEngine.Events.UnityEvent();
-            pointer.enabled = false;
             var graphic = pointer.GetComponent<Graphic>();
-            var rect = pointer.GetComponent<RectTransform>();
-            if (graphic == null || !graphic.raycastTarget || rect == null ||
+            if (graphic == null || !graphic.raycastTarget ||
                 !pointer.gameObject.activeInHierarchy)
                 continue;
-            var area = Mathf.Abs(rect.rect.width * rect.rect.height);
-            if (area > selectedArea)
-            {
-                selected = pointer;
-                selectedArea = area;
-            }
+            BindPointer(pointer, button);
+            bound++;
         }
-        selected ??= pointers.Length > 0
-            ? pointers[^1]
-            : button.gameObject.AddComponent<PointerEventComponent>();
-        BindPointer(selected, button);
-        ProbeBehaviour.Logger?.LogDebug(
-            $"Online button {action}: one mouse target {selected.gameObject.name}");
+        if (bound == 0)
+            BindPointer(button.gameObject.AddComponent<PointerEventComponent>(), button);
+        ProbeBehaviour.Logger?.LogDebug($"Online button {action}: mouse targets={bound}");
     }
 
     private static void BindPointer(PointerEventComponent pointer, TitleMenuButton button)

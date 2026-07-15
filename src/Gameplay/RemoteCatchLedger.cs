@@ -678,7 +678,11 @@ internal static class RemoteCatchResultPanelPatch
 [HarmonyPatch(typeof(PlayerDiePopupMenu), nameof(PlayerDiePopupMenu.OnPopup))]
 internal static class RemoteCatchDeathPopupPatch
 {
-    private static void Prefix() => RemoteCatchPatchBridge.PrepareResult();
+    private static bool Prefix()
+    {
+        RemoteCatchPatchBridge.PrepareResult();
+        return !(ProbeBehaviour.Instance?.ShouldSuppressClientDeathPopup() ?? false);
+    }
 }
 
 [HarmonyPatch(typeof(LootBox), nameof(LootBox.Clear))]

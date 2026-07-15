@@ -41,7 +41,8 @@ internal enum PacketType : byte
     TravelState = 32,
     DiveLootRequest = 33,
     DiveResultEntry = 34,
-    DiveResultState = 35
+    DiveResultState = 35,
+    MissionState = 36
 }
 
 internal enum TravelTarget : byte
@@ -176,7 +177,11 @@ internal readonly record struct DiveState(uint Revision, bool HostReady, bool Cl
 internal readonly record struct BoatDecoState(int Id);
 internal readonly record struct DiverLifeState(uint Revision, bool IsDead);
 internal readonly record struct DiveExitRequest(uint Revision);
-internal readonly record struct TravelReady(TravelTarget Target, uint Revision, bool Ready);
+internal readonly record struct TravelReady(
+    TravelTarget Target,
+    uint Revision,
+    bool Ready,
+    bool NativeStarted);
 internal readonly record struct TravelState(
     TravelTarget Target,
     uint Revision,
@@ -197,6 +202,8 @@ internal readonly record struct DiveResultEntry(
     int BonusGrade,
     int LiftType);
 internal readonly record struct DiveResultState(ulong TransferId, ushort Total);
+internal readonly record struct MissionConditionState(int Id, int Count);
+internal readonly record struct MissionState(uint Revision, MissionConditionState[] Conditions);
 internal readonly record struct CampaignSnapshotChunk(
     ulong TransferId,
     uint Revision,
@@ -208,7 +215,7 @@ internal readonly record struct CampaignSnapshotAck(ulong TransferId, uint Revis
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 21;
+    private const byte Version = 22;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -232,11 +239,13 @@ internal static class Protocol
     private const int BoatDecoStatePacketSize = HeaderSize + 4;
     private const int DiverLifeStatePacketSize = HeaderSize + 5;
     private const int DiveExitRequestPacketSize = HeaderSize + 4;
-    private const int TravelReadyPacketSize = HeaderSize + 6;
+    private const int TravelReadyPacketSize = HeaderSize + 7;
     private const int TravelStatePacketSize = HeaderSize + 7;
     private const int DiveLootRequestPacketSize = HeaderSize + 17;
     private const int DiveResultEntryPacketSize = HeaderSize + 28;
     private const int DiveResultStatePacketSize = HeaderSize + 10;
+    private const int MissionStateFixedSize = HeaderSize + 5;
+    private const int MissionConditionStateSize = 8;
     private const int CampaignSnapshotChunkFixedSize = HeaderSize + 18;
     private const int CampaignSnapshotAckSize = HeaderSize + 12;
     internal const int MaxIngredientEntriesPerPacket = 97;
@@ -244,6 +253,7 @@ internal static class Protocol
     internal const int MaxIngredientPlaces = 32;
     internal const int MaxCampaignSnapshotChunks = 2048;
     internal const int MaxCampaignSnapshotPayloadBytes = 1172;
+    internal const int MaxMissionConditions = 32;
     private const int MaxFishAllocatorUidBytes = byte.MaxValue;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
@@ -1027,13 +1037,15 @@ internal static class Protocol
 
     internal static byte[] EncodeTravelReady(uint sequence, TravelReady ready)
     {
-        if (!Enum.IsDefined(typeof(TravelTarget), ready.Target) || ready.Revision == 0)
+        if (!Enum.IsDefined(typeof(TravelTarget), ready.Target) || ready.Revision == 0 ||
+            (!ready.Ready && ready.NativeStarted))
             throw new ArgumentOutOfRangeException(nameof(ready));
         var packet = new byte[TravelReadyPacketSize];
         Encode(PacketType.TravelReady, sequence).CopyTo(packet, 0);
         packet[HeaderSize] = (byte)ready.Target;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 1), ready.Revision);
         packet[HeaderSize + 5] = ready.Ready ? (byte)1 : (byte)0;
+        packet[HeaderSize + 6] = ready.NativeStarted ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -1046,12 +1058,16 @@ internal static class Protocol
         ready = default;
         if (packet.Length != TravelReadyPacketSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.TravelReady ||
-            !Enum.IsDefined(typeof(TravelTarget), packet[HeaderSize]) || packet[HeaderSize + 5] > 1)
+            !Enum.IsDefined(typeof(TravelTarget), packet[HeaderSize]) ||
+            packet[HeaderSize + 5] > 1 || packet[HeaderSize + 6] > 1 ||
+            (packet[HeaderSize + 5] == 0 && packet[HeaderSize + 6] == 1))
             return false;
         var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 1));
         if (revision == 0)
             return false;
-        ready = new TravelReady((TravelTarget)packet[HeaderSize], revision, packet[HeaderSize + 5] == 1);
+        ready = new TravelReady(
+            (TravelTarget)packet[HeaderSize], revision,
+            packet[HeaderSize + 5] == 1, packet[HeaderSize + 6] == 1);
         return true;
     }
 
@@ -1187,6 +1203,56 @@ internal static class Protocol
             BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
             BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 8)));
         return state.TransferId != 0 && state.Total <= 200;
+    }
+
+    internal static byte[] EncodeMissionState(uint sequence, MissionState state)
+    {
+        var conditions = state.Conditions ?? throw new ArgumentNullException(nameof(state));
+        if (state.Revision == 0 || conditions.Length > MaxMissionConditions ||
+            !AreValidMissionConditions(conditions))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[MissionStateFixedSize + conditions.Length * MissionConditionStateSize];
+        Encode(PacketType.MissionState, sequence).CopyTo(packet, 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
+        packet[HeaderSize + 4] = (byte)conditions.Length;
+        for (var index = 0; index < conditions.Length; index++)
+        {
+            var offset = MissionStateFixedSize + index * MissionConditionStateSize;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset), conditions[index].Id);
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(offset + 4), conditions[index].Count);
+        }
+        return packet;
+    }
+
+    internal static bool TryDecodeMissionState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out MissionState state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length < MissionStateFixedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.MissionState)
+            return false;
+        var count = packet[HeaderSize + 4];
+        if (count > MaxMissionConditions ||
+            packet.Length != MissionStateFixedSize + count * MissionConditionStateSize)
+            return false;
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        if (revision == 0)
+            return false;
+        var conditions = new MissionConditionState[count];
+        for (var index = 0; index < count; index++)
+        {
+            var offset = MissionStateFixedSize + index * MissionConditionStateSize;
+            conditions[index] = new MissionConditionState(
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(offset)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(offset + 4)));
+        }
+        if (!AreValidMissionConditions(conditions))
+            return false;
+        state = new MissionState(revision, conditions);
+        return true;
     }
 
     internal static byte[] EncodeCampaignSnapshotChunk(uint sequence, CampaignSnapshotChunk chunk)
@@ -1529,6 +1595,15 @@ internal static class Protocol
         return true;
     }
 
+    private static bool AreValidMissionConditions(MissionConditionState[] conditions)
+    {
+        var ids = new HashSet<int>();
+        foreach (var condition in conditions)
+            if (condition.Id <= 0 || condition.Count < 0 || !ids.Add(condition.Id))
+                return false;
+        return true;
+    }
+
     private static bool IsNewer(uint value, uint previous) =>
         unchecked((int)(value - previous)) > 0;
 
@@ -1684,11 +1759,11 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted a zero dive exit revision");
 
         var travelReadyPacket = EncodeTravelReady(
-            66, new TravelReady(TravelTarget.SushiBar, 5, true));
+            66, new TravelReady(TravelTarget.SushiBar, 5, true, false));
         if (!TryDecodeTravelReady(travelReadyPacket, out sequence, out var travelReady) ||
-            sequence != 66 || travelReady != new TravelReady(TravelTarget.SushiBar, 5, true))
+            sequence != 66 || travelReady != new TravelReady(TravelTarget.SushiBar, 5, true, false))
             throw new InvalidOperationException("Travel ready round-trip failed");
-        travelReadyPacket[HeaderSize + 5] = 2;
+        travelReadyPacket[HeaderSize + 6] = 2;
         if (TryDecodeTravelReady(travelReadyPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid travel readiness");
 
@@ -1717,6 +1792,18 @@ internal static class Protocol
         if (!TryDecodeDiveResultState(resultStatePacket, out sequence, out var resultState) ||
             sequence != 70 || resultState != new DiveResultState(7, 1))
             throw new InvalidOperationException("Dive result state round-trip failed");
+
+        var expectedMissionState = new MissionState(8, new[]
+        {
+            new MissionConditionState(101, 6), new MissionConditionState(102, 7)
+        });
+        var missionStatePacket = EncodeMissionState(71, expectedMissionState);
+        if (!TryDecodeMissionState(missionStatePacket, out sequence, out var missionState) ||
+            sequence != 71 || !SameMissionState(missionState, expectedMissionState))
+            throw new InvalidOperationException("Mission state round-trip failed");
+        BinaryPrimitives.WriteInt32LittleEndian(missionStatePacket.AsSpan(MissionStateFixedSize), 0);
+        if (TryDecodeMissionState(missionStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid mission state");
 
         var ingredientEntries = new[]
         {
@@ -1828,6 +1915,17 @@ internal static class Protocol
     private static bool SameIngredientDelta(IngredientsDelta left, IngredientsDelta right) =>
         left.HostEpoch == right.HostEpoch && left.BaseRevision == right.BaseRevision &&
         left.Revision == right.Revision && SameIngredientEntries(left.Entries, right.Entries);
+
+    private static bool SameMissionState(MissionState left, MissionState right)
+    {
+        if (left.Revision != right.Revision || left.Conditions == null || right.Conditions == null ||
+            left.Conditions.Length != right.Conditions.Length)
+            return false;
+        for (var index = 0; index < left.Conditions.Length; index++)
+            if (left.Conditions[index] != right.Conditions[index])
+                return false;
+        return true;
+    }
 
     private static bool SameIngredientEntries(IngredientCount[] left, IngredientCount[] right)
     {

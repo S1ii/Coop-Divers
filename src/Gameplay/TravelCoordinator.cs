@@ -18,9 +18,12 @@ internal sealed class TravelCoordinator
     private uint _lastStateRevision;
     private bool _hostReady;
     private bool _clientReady;
+    private bool _clientNativeStarted;
     private bool _allowNative;
+    private bool _allowClientTransition;
     private bool _starting;
     private Action _hostAction;
+    private Action _clientAction;
     private MoveSceneElement _sushiElement;
     private string _sushiText;
     private string _sushiOverrideText;
@@ -57,8 +60,9 @@ internal sealed class TravelCoordinator
         else if (role == SessionRole.Client)
         {
             _clientReady = true;
+            _clientAction ??= hostAction;
             _localRevision = NextRevision(_localRevision);
-            session.SendTravelReady(new TravelReady(target, _localRevision, true));
+            session.SendTravelReady(new TravelReady(target, _localRevision, true, false));
         }
         RefreshText();
         _log.LogInfo($"Travel {target}: host={_hostReady}; client={_clientReady}");
@@ -100,6 +104,8 @@ internal sealed class TravelCoordinator
                 }
                 changed |= _clientReady != ready.Ready;
                 _clientReady = ready.Ready;
+                changed |= _clientNativeStarted != ready.NativeStarted;
+                _clientNativeStarted = ready.NativeStarted;
             }
             if (changed)
                 Publish(session);
@@ -116,6 +122,7 @@ internal sealed class TravelCoordinator
                 _hostReady = state.HostReady;
                 _clientReady = state.ClientReady;
             }
+            TryStartClient(session);
         }
         RefreshText();
     }
@@ -130,9 +137,12 @@ internal sealed class TravelCoordinator
         _lastStateRevision = 0;
         _hostReady = false;
         _clientReady = false;
+        _clientNativeStarted = false;
         _allowNative = false;
+        _allowClientTransition = false;
         _starting = false;
         _hostAction = null;
+        _clientAction = null;
         _sushiElement = null;
         _sushiText = null;
         _sushiOverrideText = null;
@@ -149,7 +159,9 @@ internal sealed class TravelCoordinator
         _hostReady = false;
         if (!keepClientReady)
             _clientReady = false;
+        _clientNativeStarted = false;
         _hostAction = null;
+        _clientAction = null;
     }
 
     private void Publish(UdpSession session)
@@ -163,7 +175,7 @@ internal sealed class TravelCoordinator
 
     private void TryStart()
     {
-        if (!_hostReady || !_clientReady || _hostAction == null)
+        if (!_hostReady || !_clientReady || !_clientNativeStarted || _hostAction == null)
             return;
         var action = _hostAction;
         _hostAction = null;
@@ -173,6 +185,42 @@ internal sealed class TravelCoordinator
         {
             _log.LogInfo($"Travel {_target}: both players ready; host starts native transition");
             action();
+        }
+        finally
+        {
+            _allowNative = false;
+        }
+    }
+
+    internal bool AllowClientSceneTransition()
+    {
+        if (!_allowClientTransition)
+            return false;
+        _allowClientTransition = false;
+        return true;
+    }
+
+    private void TryStartClient(UdpSession session)
+    {
+        if (!_hostReady || !_clientReady || _clientNativeStarted)
+            return;
+
+        _clientNativeStarted = true;
+        _starting = true;
+        _localRevision = NextRevision(_localRevision);
+        session.SendTravelReady(new TravelReady(_target!.Value, _localRevision, true, true));
+        if (_clientAction == null)
+        {
+            _log.LogWarning($"Travel {_target}: client has no native transition action; using scene fallback");
+            return;
+        }
+
+        _allowNative = true;
+        _allowClientTransition = true;
+        try
+        {
+            _log.LogInfo($"Travel {_target}: client starts native transition");
+            _clientAction();
         }
         finally
         {
