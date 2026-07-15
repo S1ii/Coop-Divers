@@ -141,7 +141,7 @@ internal sealed class PickupReplicator
         PickupRemoved request)
     {
         if (request.SceneId != sceneId || hostPlayer == null ||
-            !session.TryGetRemotePlayerSnapshot(out var remotePlayer) ||
+            !session.TryGetFreshRemotePlayerSnapshot(now, 0.75f, out var remotePlayer) ||
             remotePlayer.SceneId != sceneId)
             return;
 

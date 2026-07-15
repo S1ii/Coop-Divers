@@ -3,6 +3,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
+using DR.AI;
 using HarmonyLib;
 using Steamworks;
 using UnityEngine;
@@ -10,7 +11,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.9.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.10.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -120,7 +121,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session?.Update(Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
         _fishReplicator?.Update(
-            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime);
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime, _player);
         _pickupReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
 
@@ -238,6 +239,32 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (Role != SessionRole.Client)
             return true;
         _pickupReplicator?.RequestPickup(_session, _sceneId, item);
+        return false;
+    }
+
+    internal bool AllowFishDamage(
+        FishAISystem fish,
+        int damage,
+        EElement element,
+        AttackType attackType)
+    {
+        if (Role != SessionRole.Client || _session == null ||
+            !_session.SceneMatches(_sceneId) ||
+            !FishReplicator.IsPlayerAttack(attackType))
+            return true;
+        return !(_fishReplicator?.RequestDamage(
+            _session, _sceneId, fish, damage, element, attackType) ?? false);
+    }
+
+    internal bool AllowFishPickup(FishInteractionBody body)
+    {
+        if (Role != SessionRole.Client || _session == null ||
+            !_session.SceneMatches(_sceneId) || body == null)
+            return true;
+        var fish = body.GetComponentInParent<FishAISystem>();
+        if (fish == null)
+            return true;
+        _fishReplicator?.RequestPickup(_session, _sceneId, fish);
         return false;
     }
 
