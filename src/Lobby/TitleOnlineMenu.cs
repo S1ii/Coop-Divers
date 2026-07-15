@@ -5,6 +5,7 @@ using Common.UI;
 using DR.Save;
 using DR.Title;
 using HarmonyLib;
+using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -83,8 +84,10 @@ internal static class TitleOnlineMenu
     private static SettingAppPanel _nativePanel;
     private static RectTransform _roomContent;
     private static bool _titleFallback;
-    private static Text _nativeHeader;
+    private static TMP_Text _nativeHeader;
     private static string _nativeHeaderTitle = string.Empty;
+    private static TMP_Text _nativeCloseLabel;
+    private static string _nativeCloseTitle = string.Empty;
     private static Vector2 _nativeContentSize;
     private static bool _visible;
     private static bool _dirty;
@@ -110,6 +113,7 @@ internal static class TitleOnlineMenu
     private static bool _opening;
     private static bool _nativeSettingsRequested;
     private static float _nativePanelDeadline;
+    private static bool _closing;
 
     internal static void RequestHostDisconnect()
     {
@@ -449,10 +453,13 @@ internal static class TitleOnlineMenu
             HideNativeObject(scroll.horizontalScrollbar?.gameObject);
             HideNativeObject(scroll.verticalScrollbar?.gameObject);
         }
+        HideNativeObject(panel.text?.gameObject);
         _roomContent.gameObject.SetActive(true);
         _roomContent.sizeDelta = new Vector2(_roomContent.sizeDelta.x, 460f);
         _nativeHeader = FindPanelHeader(panel);
         _nativeHeaderTitle = _nativeHeader?.text ?? string.Empty;
+        _nativeCloseLabel = FindPanelCloseLabel(panel);
+        _nativeCloseTitle = _nativeCloseLabel?.text ?? string.Empty;
         SetPanelTitle();
         _titleFallback = false;
     }
@@ -480,11 +487,16 @@ internal static class TitleOnlineMenu
 
     private static void Close()
     {
+        if (_closing)
+            return;
+        _closing = true;
         DestroyRoom();
         RestoreNativePanel();
         _roomContent = null;
         _nativeHeader = null;
         _nativeHeaderTitle = string.Empty;
+        _nativeCloseLabel = null;
+        _nativeCloseTitle = string.Empty;
         _titleFallback = false;
 
         if (_manager != null)
@@ -525,6 +537,7 @@ internal static class TitleOnlineMenu
         _opening = false;
         _nativeSettingsRequested = false;
         _nativePanelDeadline = 0f;
+        _closing = false;
     }
 
     private static void RestoreNativePanel()
@@ -538,6 +551,8 @@ internal static class TitleOnlineMenu
             }
             if (_nativeHeader != null)
                 _nativeHeader.text = _nativeHeaderTitle;
+            if (_nativeCloseLabel != null)
+                _nativeCloseLabel.text = _nativeCloseTitle;
             if (_roomContent != null)
                 _roomContent.sizeDelta = _nativeContentSize;
             foreach (var state in NativeControlStates)
@@ -568,11 +583,11 @@ internal static class TitleOnlineMenu
         gameObject.SetActive(false);
     }
 
-    private static Text FindPanelHeader(SettingAppPanel panel)
+    private static TMP_Text FindPanelHeader(SettingAppPanel panel)
     {
-        Text header = null;
+        TMP_Text header = null;
         var highest = float.MinValue;
-        foreach (var text in panel.GetComponentsInChildren<Text>(true))
+        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
         {
             if (text == null || (_roomContent != null && text.transform.IsChildOf(_roomContent)))
                 continue;
@@ -585,10 +600,38 @@ internal static class TitleOnlineMenu
         return header;
     }
 
+    private static TMP_Text FindPanelCloseLabel(SettingAppPanel panel)
+    {
+        TMP_Text label = null;
+        var lowest = float.MaxValue;
+        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
+        {
+            if (text == null || text == _nativeHeader ||
+                (_roomContent != null && text.transform.IsChildOf(_roomContent)))
+                continue;
+            var y = text.rectTransform.position.y;
+            if (y >= lowest)
+                continue;
+            lowest = y;
+            label = text;
+        }
+        return label;
+    }
+
     private static void SetPanelTitle()
     {
         if (_nativeHeader != null)
             _nativeHeader.text = Text(OnlineText.Online, CurrentLanguage());
+        if (_nativeCloseLabel != null)
+            _nativeCloseLabel.text = Text(OnlineText.Back, CurrentLanguage());
+    }
+
+    internal static bool TryCloseNativePanel(SettingAppPanel panel)
+    {
+        if (_closing || !_visible || panel == null || panel != _nativePanel)
+            return false;
+        Close();
+        return true;
     }
 
     private static void DisableNativeControl(Behaviour control)
@@ -610,9 +653,9 @@ internal static class TitleOnlineMenu
 
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
-            AddInput(OnlineText.Name, _name, 24, InputField.ContentType.Standard, value => _name = value);
-            AddInput(OnlineText.HostIp, _address, 45, InputField.ContentType.Standard, value => _address = value);
-            AddInput(OnlineText.Port, _port, 5, InputField.ContentType.IntegerNumber, value => _port = value);
+            AddInput(OnlineText.Name, _name, 24, TMP_InputField.ContentType.Standard, value => _name = value);
+            AddInput(OnlineText.HostIp, _address, 45, TMP_InputField.ContentType.Standard, value => _address = value);
+            AddInput(OnlineText.Port, _port, 5, TMP_InputField.ContentType.IntegerNumber, value => _port = value);
             AddAction(language => Text(OnlineText.CreateLobby, language), Host);
             AddAction(language => Text(OnlineText.Join, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
@@ -679,14 +722,14 @@ internal static class TitleOnlineMenu
         OnlineText label,
         string value,
         int limit,
-        InputField.ContentType contentType,
+        TMP_InputField.ContentType contentType,
         Action<string> apply)
     {
         var row = CreateRow();
         if (row == null)
             return;
         var button = row.GetComponent<TitleMenuButton>();
-        var labelText = button?.nameText?.text?.textUGUI;
+        var labelText = button?.nameText?.text?.textTMProUGUI;
         if (button == null || labelText == null)
         {
             UnityEngine.Object.Destroy(row);
@@ -699,7 +742,7 @@ internal static class TitleOnlineMenu
 
         button.nameText.SetOverride((Func<string, string>)(_ => Text(label, CurrentLanguage())), true);
         labelText.text = Text(label, CurrentLanguage());
-        labelText.alignment = TextAnchor.MiddleLeft;
+        labelText.alignment = TextAlignmentOptions.MidlineLeft;
         var labelRect = labelText.rectTransform;
         labelRect.anchorMin = new Vector2(0.06f, 0f);
         labelRect.anchorMax = new Vector2(0.4f, 1f);
@@ -714,17 +757,17 @@ internal static class TitleOnlineMenu
         fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
         fieldRect.offsetMin = Vector2.zero;
         fieldRect.offsetMax = Vector2.zero;
-        var valueText = fieldObject.GetComponent<Text>();
+        var valueText = fieldObject.GetComponent<TextMeshProUGUI>();
         valueText.text = value ?? string.Empty;
-        valueText.alignment = TextAnchor.MiddleLeft;
+        valueText.alignment = TextAlignmentOptions.MidlineLeft;
         valueText.raycastTarget = true;
 
-        var input = fieldObject.AddComponent<InputField>();
+        var input = fieldObject.AddComponent<TMP_InputField>();
         input.targetGraphic = valueText;
         input.textComponent = valueText;
         input.characterLimit = limit;
         input.contentType = contentType;
-        input.lineType = InputField.LineType.SingleLine;
+        input.lineType = TMP_InputField.LineType.SingleLine;
         input.text = value ?? string.Empty;
         input.onValueChanged.AddListener((UnityEngine.Events.UnityAction<string>)(changed => apply(changed)));
         BindInputPointer(fieldObject.AddComponent<PointerEventComponent>(), input);
@@ -837,7 +880,7 @@ internal static class TitleOnlineMenu
         }
     }
 
-    private static void BindInputPointer(PointerEventComponent pointer, InputField input)
+    private static void BindInputPointer(PointerEventComponent pointer, TMP_InputField input)
     {
         if (pointer == null || input == null)
             return;
@@ -907,6 +950,13 @@ internal static class TitleOnlineButtonInvokePatch
 {
     private static bool Prefix(TitleMenuButton __instance) =>
         !TitleOnlineMenu.TryHandleButton(__instance);
+}
+
+[HarmonyPatch(typeof(SettingAppPanel), nameof(SettingAppPanel.Close))]
+internal static class TitleOnlineSettingsClosePatch
+{
+    private static bool Prefix(SettingAppPanel __instance) =>
+        !TitleOnlineMenu.TryCloseNativePanel(__instance);
 }
 
 [HarmonyPatch(typeof(TitleManager), "OnDestroy")]
