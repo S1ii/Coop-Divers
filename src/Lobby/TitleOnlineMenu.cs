@@ -454,6 +454,15 @@ internal static class TitleOnlineMenu
             HideNativeObject(scroll.horizontalScrollbar?.gameObject);
             HideNativeObject(scroll.verticalScrollbar?.gameObject);
         }
+        foreach (var graphic in panel.GetComponentsInChildren<Graphic>(true))
+        {
+            var name = graphic?.gameObject.name;
+            if (string.IsNullOrEmpty(name) ||
+                (name.IndexOf("scroll", StringComparison.OrdinalIgnoreCase) < 0 &&
+                 name.IndexOf("arrow", StringComparison.OrdinalIgnoreCase) < 0))
+                continue;
+            HideNativeObject(graphic.gameObject);
+        }
         _nativeInputTemplate = panel.text;
         HideNativeObject(panel.text?.gameObject);
         _roomContent.gameObject.SetActive(true);
@@ -564,13 +573,13 @@ internal static class TitleOnlineMenu
                     state.Key.enabled = state.Value;
             }
             if (_nativePanel.gameObject.activeInHierarchy)
-                _nativePanel.Close();
+                _nativePanel.gameObject.SetActive(false);
         }
         else if (_nativeSettingsRequested)
         {
             var panel = FindSettingsPanel(_manager);
             if (panel != null && panel.gameObject.activeInHierarchy)
-                panel.Close();
+                panel.gameObject.SetActive(false);
         }
         NativeContentStates.Clear();
         NativeControlStates.Clear();
@@ -766,10 +775,14 @@ internal static class TitleOnlineMenu
         labelText.text = Text(label, CurrentLanguage());
         labelText.alignment = TextAlignmentOptions.MidlineLeft;
         var labelRect = labelText.rectTransform;
+        DisableLayoutControl(labelText.gameObject);
         labelRect.anchorMin = new Vector2(0.06f, 0f);
         labelRect.anchorMax = new Vector2(0.4f, 1f);
+        labelRect.pivot = new Vector2(0.5f, 0.5f);
         labelRect.offsetMin = Vector2.zero;
         labelRect.offsetMax = Vector2.zero;
+        labelRect.localScale = Vector3.one;
+        labelRect.localRotation = Quaternion.identity;
 
         if (_nativeInputTemplate == null)
         {
@@ -780,10 +793,14 @@ internal static class TitleOnlineMenu
         fieldObject.name = "DaveTheDiverMP_Input";
         fieldObject.transform.SetParent(row.transform, false);
         var fieldRect = fieldObject.GetComponent<RectTransform>();
+        DisableLayoutControl(fieldObject);
         fieldRect.anchorMin = new Vector2(0.42f, 0.16f);
         fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
+        fieldRect.pivot = new Vector2(0.5f, 0.5f);
         fieldRect.offsetMin = Vector2.zero;
         fieldRect.offsetMax = Vector2.zero;
+        fieldRect.localScale = Vector3.one;
+        fieldRect.localRotation = Quaternion.identity;
         var valueText = fieldObject.GetComponent<Text>();
         if (valueText == null)
         {
@@ -934,6 +951,20 @@ internal static class TitleOnlineMenu
         pointer.enabled = true;
         pointer.onClick = new UnityEngine.Events.UnityEvent();
         pointer.onClick.AddListener((UnityEngine.Events.UnityAction)input.ActivateInputField);
+    }
+
+    private static void DisableLayoutControl(GameObject gameObject)
+    {
+        if (gameObject == null)
+            return;
+        foreach (var layout in gameObject.GetComponents<LayoutGroup>())
+            layout.enabled = false;
+        foreach (var fitter in gameObject.GetComponents<ContentSizeFitter>())
+            fitter.enabled = false;
+        foreach (var fitter in gameObject.GetComponents<AspectRatioFitter>())
+            fitter.enabled = false;
+        foreach (var element in gameObject.GetComponents<LayoutElement>())
+            element.enabled = false;
     }
 
     private static void MarkDirty() => _dirty = true;
