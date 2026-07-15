@@ -32,10 +32,10 @@ jobs:
       - name: Check reference configuration
         shell: pwsh
         env:
-          REFERENCE_REPOSITORY_TOKEN: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+          REFERENCE_REPOSITORY_SSH_KEY: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_TOKEN)) {
-            throw 'Repository secret REFERENCE_REPOSITORY_TOKEN is required when REFERENCE_REPOSITORY is set.'
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_SSH_KEY)) {
+            throw 'Repository secret REFERENCE_REPOSITORY_SSH_KEY is required when REFERENCE_REPOSITORY is set.'
           }
       - uses: actions/setup-dotnet@v5
         with:
@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
-          token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
+          ssh-key: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
           path: game-references
       - name: Restore
         shell: pwsh
@@ -74,4 +74,4 @@ jobs:
       - name: Explain skipped build
         shell: pwsh
         run: |
-          Write-Host 'Build/package skipped: set repository variable REFERENCE_REPOSITORY and secret REFERENCE_REPOSITORY_TOKEN to enable CI builds.'
+          Write-Host 'Build/package skipped: set repository variable REFERENCE_REPOSITORY and secret REFERENCE_REPOSITORY_SSH_KEY to enable CI builds.'
