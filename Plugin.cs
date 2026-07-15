@@ -9,7 +9,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.2.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.3.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -65,6 +65,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private float _nextSnapshot;
     private uint _sceneId;
     private PlayerCharacter _player;
+    private SpriteRenderer _playerRenderer;
     private UdpSession _session;
     private readonly RemoteAvatar _remoteAvatar = new();
 
@@ -88,6 +89,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _scene = scene;
             _sceneId = Protocol.SceneId(scene);
             _player = null;
+            _playerRenderer = null;
             _remoteAvatar.Clear();
             Logger.LogInfo($"Scene: {_scene}");
         }
@@ -107,9 +109,17 @@ public sealed class ProbeBehaviour : MonoBehaviour
         {
             var position = _player.transform.position;
             var controller = _player.Controller2D;
+            _playerRenderer ??= RemoteAvatar.FindPrimaryRenderer(_player);
             var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
-            var rotation = controller != null ? controller.GetRotation() : _player.transform.eulerAngles.z;
-            var flipped = controller != null && controller.IsFliped();
+            var rotation = _playerRenderer != null
+                ? _playerRenderer.transform.eulerAngles.z
+                : controller != null ? controller.GetRotation() : _player.transform.eulerAngles.z;
+            var flipped = _playerRenderer != null
+                ? _playerRenderer.flipX
+                : controller != null && controller.IsFliped();
+            var spriteId = _playerRenderer != null && _playerRenderer.sprite != null
+                ? Protocol.SceneId(_playerRenderer.sprite.name)
+                : 0u;
             _session.SendSnapshot(new PlayerSnapshot(
                 _sceneId,
                 position.x,
@@ -118,6 +128,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 rotation,
                 velocity.x,
                 velocity.y,
+                spriteId,
                 flipped));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
@@ -138,9 +149,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 Logger.LogInfo("PlayerCharacter left the scene");
             _playerPresent = false;
             _player = null;
+            _playerRenderer = null;
             return;
         }
 
+        if (_player != player)
+            _playerRenderer = RemoteAvatar.FindPrimaryRenderer(player);
         _player = player;
 
         if (!_playerPresent || Time.realtimeSinceStartup >= _nextPositionLog)
@@ -149,9 +163,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
             var controller = player.Controller2D;
             var rotation = controller != null ? controller.GetRotation() : player.transform.eulerAngles.z;
             var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
+            var visualRotation = _playerRenderer != null
+                ? _playerRenderer.transform.eulerAngles.z
+                : rotation;
+            var spriteName = _playerRenderer != null && _playerRenderer.sprite != null
+                ? _playerRenderer.sprite.name
+                : "none";
             Logger.LogInfo(
                 $"PlayerCharacter: ({position.x:F2}, {position.y:F2}, {position.z:F2}); " +
-                $"rotation={rotation:F1}; velocity=({velocity.x:F2}, {velocity.y:F2})");
+                $"rotation={rotation:F1}/{visualRotation:F1}; velocity=({velocity.x:F2}, {velocity.y:F2}); " +
+                $"sprite={spriteName}");
             _nextPositionLog = Time.realtimeSinceStartup + 5f;
         }
 

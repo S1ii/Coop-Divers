@@ -21,14 +21,15 @@ internal readonly record struct PlayerSnapshot(
     float Rotation,
     float VelocityX,
     float VelocityY,
+    uint SpriteId,
     bool Flipped);
 
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 2;
+    private const byte Version = 3;
     internal const int HeaderSize = 10;
-    private const int SnapshotSize = HeaderSize + 29;
+    private const int SnapshotSize = HeaderSize + 33;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -69,7 +70,8 @@ internal static class Protocol
         WriteSingle(packet.AsSpan(HeaderSize + 16), snapshot.Rotation);
         WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.VelocityX);
         WriteSingle(packet.AsSpan(HeaderSize + 24), snapshot.VelocityY);
-        packet[HeaderSize + 28] = snapshot.Flipped ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 28), snapshot.SpriteId);
+        packet[HeaderSize + 32] = snapshot.Flipped ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -90,12 +92,14 @@ internal static class Protocol
         var velocityY = ReadSingle(packet.Slice(HeaderSize + 24));
         if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
             !float.IsFinite(rotation) || !float.IsFinite(velocityX) || !float.IsFinite(velocityY) ||
-            packet[HeaderSize + 28] > 1)
+            packet[HeaderSize + 32] > 1)
             return false;
 
         snapshot = new PlayerSnapshot(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            x, y, z, rotation, velocityX, velocityY, packet[HeaderSize + 28] == 1);
+            x, y, z, rotation, velocityX, velocityY,
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 28)),
+            packet[HeaderSize + 32] == 1);
         return true;
     }
 
@@ -177,7 +181,8 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted invalid UTF-8 identity");
 
         var expected = new PlayerSnapshot(
-            SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f, true);
+            SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,
+            SceneId("Dave_Swim_0042"), true);
         var snapshotPacket = EncodeSnapshot(43, expected);
         if (!TryDecodeSnapshot(snapshotPacket, out sequence, out var actual) ||
             sequence != 43 || actual != expected)
