@@ -3,6 +3,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
 using HarmonyLib;
+using Il2CppInterop.Runtime.Injection;
 using Steamworks;
 using UnityEngine;
 
@@ -47,6 +48,7 @@ public sealed class Plugin : BasePlugin
             Log.LogError($"Gameplay patches failed: {exception.Message}");
         }
         Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
+        ClassInjector.RegisterTypeInIl2Cpp<ProbeBehaviour>();
         AddComponent<ProbeBehaviour>();
     }
 

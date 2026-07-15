@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Security.Cryptography;
+using Common.DataStructure;
 using Common.UI;
 using DR.Save;
 using DR.Title;
 using HarmonyLib;
-using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
 
@@ -16,14 +16,13 @@ internal static class TitleOnlineMenu
     private const int Online = 100;
     private const int Host = 101;
     private const int Join = 102;
+    private const int EditName = 103;
+    private const int EditHostIp = 104;
+    private const int EditPort = 105;
     private const int Back = 106;
     private const int Ready = 107;
     private const int Start = 108;
     private const string OnlineObjectName = "DaveTheDiverMP_Online";
-    private const float NativePanelTimeout = 2f;
-    private const float RowStartY = -32f;
-    private const float RowStepY = 68f;
-    private const float RowHeight = 56f;
 
     private enum OnlineText
     {
@@ -75,21 +74,10 @@ internal static class TitleOnlineMenu
     private static readonly List<TitleMenuButton> TitleButtons = new();
     private static readonly List<TitleMenuButton> RoomButtons = new();
     private static readonly List<TitleMenuButton> RoomLabels = new();
-    private static readonly List<GameObject> RoomFields = new();
     private static readonly Dictionary<int, TitleMenuButton> ActionButtons = new();
-    private static readonly Dictionary<GameObject, bool> NativeContentStates = new();
-    private static readonly Dictionary<Behaviour, bool> NativeControlStates = new();
     private static TitleManager _manager;
     private static TitleMenuButton _template;
-    private static SettingAppPanel _nativePanel;
     private static RectTransform _roomContent;
-    private static bool _titleFallback;
-    private static TMP_Text _nativeHeader;
-    private static string _nativeHeaderTitle = string.Empty;
-    private static TMP_Text _nativeCloseLabel;
-    private static string _nativeCloseTitle = string.Empty;
-    private static Text _nativeInputTemplate;
-    private static Vector2 _nativeContentSize;
     private static bool _visible;
     private static bool _dirty;
     private static bool _clientReady;
@@ -111,9 +99,12 @@ internal static class TitleOnlineMenu
     private static string _port = "27777";
     private static string _message = string.Empty;
     private static bool _openAfterHostLoss;
-    private static bool _opening;
-    private static bool _nativeSettingsRequested;
-    private static float _nativePanelDeadline;
+    private static bool _keyboardLoading;
+    private static bool _keyboardVisible;
+    private static OnlineText _pendingKeyboardLabel;
+    private static string _pendingKeyboardValue = string.Empty;
+    private static int _pendingKeyboardLimit;
+    private static Action<string> _pendingKeyboardApply;
     private static bool _closing;
 
     internal static void RequestHostDisconnect()
@@ -171,6 +162,19 @@ internal static class TitleOnlineMenu
         if (!_visible || manager != _manager || code is < Host or > Start)
             return false;
 
+        switch (code)
+        {
+            case EditName:
+                OpenKeyboard(OnlineText.Name, _name, 24, value => _name = value);
+                return true;
+            case EditHostIp:
+                OpenKeyboard(OnlineText.HostIp, _address, 45, value => _address = value);
+                return true;
+            case EditPort:
+                OpenKeyboard(OnlineText.Port, _port, 5, value => _port = value);
+                return true;
+        }
+
         var probe = ProbeBehaviour.Instance;
         if (probe == null)
             return true;
@@ -226,14 +230,15 @@ internal static class TitleOnlineMenu
         return manager != null && TryHandle(manager, button.buttonName);
     }
 
+    internal static bool IsKeyboardVisible(TitleManager manager) =>
+        _keyboardVisible && manager == _manager;
+
     internal static void Tick(ProbeBehaviour probe)
     {
-        if (_opening)
-            TryFinishOpen();
         if (!_visible || _manager == null || probe == null)
             return;
 
-        if (UnityEngine.Input.GetKeyDown(KeyCode.Escape))
+        if (!_keyboardVisible && UnityEngine.Input.GetKeyDown(KeyCode.Escape))
         {
             Close();
             return;
@@ -322,7 +327,7 @@ internal static class TitleOnlineMenu
             _lastLanguage = language;
             MarkDirty();
         }
-        if (_dirty)
+        if (_dirty && !_keyboardVisible)
             Rebuild(probe, session);
     }
 
@@ -334,7 +339,7 @@ internal static class TitleOnlineMenu
 
     private static void Open(TitleManager manager)
     {
-        if (manager == null || _visible || _opening)
+        if (manager == null || _visible)
             return;
         _manager = manager;
         _template = null;
@@ -352,40 +357,14 @@ internal static class TitleOnlineMenu
             Close();
             return;
         }
-
-        _opening = true;
-        _nativeSettingsRequested = true;
-        _nativePanelDeadline = Time.realtimeSinceStartup + NativePanelTimeout;
-        try
+        _roomContent = _template.transform.parent?.GetComponent<RectTransform>();
+        if (_roomContent == null)
         {
-            manager.OnClickSetting();
-        }
-        catch (Exception exception)
-        {
-            ProbeBehaviour.Logger?.LogWarning($"Online room: settings open failed: {exception.Message}");
-        }
-        TryFinishOpen();
-    }
-
-    private static void TryFinishOpen()
-    {
-        if (!_opening || _manager == null)
-            return;
-
-        var source = FindSettingsPanel(_manager);
-        if (source != null && source.gameObject.activeInHierarchy && source.scrollContent != null)
-        {
-            UseNativePanel(source);
-            FinishOpen();
-            return;
-        }
-        if (Time.realtimeSinceStartup < _nativePanelDeadline)
-            return;
-        ProbeBehaviour.Logger?.LogWarning("Online room: native settings panel did not open; using title fallback");
-        if (CreateFallbackPanel())
-            FinishOpen();
-        else
+            ProbeBehaviour.Logger?.LogError("Online room: title menu root was not found");
             Close();
+            return;
+        }
+        FinishOpen();
     }
 
     private static void FinishOpen()
@@ -417,11 +396,10 @@ internal static class TitleOnlineMenu
         _lastConnected = false;
         _lastRemoteName = string.Empty;
         _lastLanguage = Languages.Unknown;
-        _opening = false;
         _manager.buttons.Clear();
         MarkDirty();
         Rebuild(probe, probe?._session);
-        ProbeBehaviour.Logger?.LogInfo($"Title online room opened ({(_titleFallback ? "fallback" : "native settings")})");
+        ProbeBehaviour.Logger?.LogInfo("Title online room opened in the native title menu");
     }
 
     private static void OpenAfterHostLoss(TitleManager manager)
@@ -430,86 +408,13 @@ internal static class TitleOnlineMenu
             Open(manager);
     }
 
-    private static void UseNativePanel(SettingAppPanel panel)
-    {
-        _nativePanel = panel;
-        _roomContent = panel.scrollContent;
-        NativeContentStates.Clear();
-        NativeControlStates.Clear();
-        _nativeContentSize = _roomContent.sizeDelta;
-        for (var index = 0; index < _roomContent.childCount; index++)
-        {
-            var content = _roomContent.GetChild(index).gameObject;
-            NativeContentStates[content] = content.activeSelf;
-            content.SetActive(false);
-        }
-        DisableNativeControl(panel);
-        foreach (var layout in _roomContent.GetComponents<LayoutGroup>())
-            DisableNativeControl(layout);
-        foreach (var fitter in _roomContent.GetComponents<ContentSizeFitter>())
-            DisableNativeControl(fitter);
-        foreach (var scroll in panel.GetComponentsInChildren<ScrollRect>(true))
-        {
-            DisableNativeControl(scroll);
-            HideNativeObject(scroll.horizontalScrollbar?.gameObject);
-            HideNativeObject(scroll.verticalScrollbar?.gameObject);
-        }
-        foreach (var graphic in panel.GetComponentsInChildren<Graphic>(true))
-        {
-            var name = graphic?.gameObject.name;
-            if (string.IsNullOrEmpty(name) ||
-                (name.IndexOf("scroll", StringComparison.OrdinalIgnoreCase) < 0 &&
-                 name.IndexOf("arrow", StringComparison.OrdinalIgnoreCase) < 0))
-                continue;
-            HideNativeObject(graphic.gameObject);
-        }
-        _nativeInputTemplate = panel.text;
-        HideNativeObject(panel.text?.gameObject);
-        _roomContent.gameObject.SetActive(true);
-        _roomContent.sizeDelta = new Vector2(_roomContent.sizeDelta.x, 460f);
-        _nativeHeader = FindPanelHeader(panel);
-        _nativeHeaderTitle = _nativeHeader?.text ?? string.Empty;
-        _nativeCloseLabel = FindPanelCloseLabel(panel);
-        _nativeCloseTitle = _nativeCloseLabel?.text ?? string.Empty;
-        SetPanelTitle();
-        _titleFallback = false;
-    }
-
-    private static bool CreateFallbackPanel()
-    {
-        _roomContent = _template?.transform.parent.GetComponent<RectTransform>();
-        _titleFallback = _roomContent != null;
-        return _titleFallback;
-    }
-
-    private static SettingAppPanel FindSettingsPanel(TitleManager manager)
-    {
-        if (manager.settingPopup != null)
-            return manager.settingPopup;
-        var panels = Resources.FindObjectsOfTypeAll<SettingAppPanel>();
-        for (var index = 0; index < panels.Length; index++)
-        {
-            var panel = panels[index];
-            if (panel != null && panel.scrollContent != null)
-                return panel;
-        }
-        return null;
-    }
-
     private static void Close()
     {
         if (_closing)
             return;
         _closing = true;
         DestroyRoom();
-        RestoreNativePanel();
         _roomContent = null;
-        _nativeHeader = null;
-        _nativeHeaderTitle = string.Empty;
-        _nativeCloseLabel = null;
-        _nativeCloseTitle = string.Empty;
-        _nativeInputTemplate = null;
-        _titleFallback = false;
 
         if (_manager != null)
         {
@@ -546,131 +451,8 @@ internal static class TitleOnlineMenu
         _lastConnected = false;
         _lastRemoteName = string.Empty;
         _lastLanguage = Languages.Unknown;
-        _opening = false;
-        _nativeSettingsRequested = false;
-        _nativePanelDeadline = 0f;
+        _keyboardVisible = false;
         _closing = false;
-    }
-
-    private static void RestoreNativePanel()
-    {
-        if (_nativePanel != null)
-        {
-            foreach (var state in NativeContentStates)
-            {
-                if (state.Key != null)
-                    state.Key.SetActive(state.Value);
-            }
-            if (_nativeHeader != null)
-                _nativeHeader.text = _nativeHeaderTitle;
-            if (_nativeCloseLabel != null)
-                _nativeCloseLabel.text = _nativeCloseTitle;
-            if (_roomContent != null)
-                _roomContent.sizeDelta = _nativeContentSize;
-            foreach (var state in NativeControlStates)
-            {
-                if (state.Key != null)
-                    state.Key.enabled = state.Value;
-            }
-            if (_nativePanel.gameObject.activeInHierarchy)
-                _nativePanel.gameObject.SetActive(false);
-        }
-        else if (_nativeSettingsRequested)
-        {
-            var panel = FindSettingsPanel(_manager);
-            if (panel != null && panel.gameObject.activeInHierarchy)
-                panel.gameObject.SetActive(false);
-        }
-        NativeContentStates.Clear();
-        NativeControlStates.Clear();
-        _nativePanel = null;
-    }
-
-    private static void HideNativeObject(GameObject gameObject)
-    {
-        if (gameObject == null)
-            return;
-        if (!NativeContentStates.ContainsKey(gameObject))
-            NativeContentStates.Add(gameObject, gameObject.activeSelf);
-        gameObject.SetActive(false);
-    }
-
-    private static TMP_Text FindPanelHeader(SettingAppPanel panel)
-    {
-        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
-        {
-            if (text != null && IsSettingsTitle(text.text))
-                return text;
-        }
-        TMP_Text header = null;
-        var highest = float.MinValue;
-        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
-        {
-            if (text == null || (_roomContent != null && text.transform.IsChildOf(_roomContent)))
-                continue;
-            var y = text.rectTransform.position.y;
-            if (y <= highest)
-                continue;
-            highest = y;
-            header = text;
-        }
-        return header;
-    }
-
-    private static TMP_Text FindPanelCloseLabel(SettingAppPanel panel)
-    {
-        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
-        {
-            if (text != null && IsCloseTitle(text.text))
-                return text;
-        }
-        TMP_Text label = null;
-        var lowest = float.MaxValue;
-        foreach (var text in panel.GetComponentsInChildren<TMP_Text>(true))
-        {
-            if (text == null || text == _nativeHeader ||
-                (_roomContent != null && text.transform.IsChildOf(_roomContent)))
-                continue;
-            var y = text.rectTransform.position.y;
-            if (y >= lowest)
-                continue;
-            lowest = y;
-            label = text;
-        }
-        return label;
-    }
-
-    private static bool IsSettingsTitle(string text) => text is
-        "설정" or "Settings" or "設定" or "设置" or "Paramètres" or
-        "Impostazioni" or "Einstellungen" or "Configuración" or
-        "Configurações" or "Настройки";
-
-    private static bool IsCloseTitle(string text) => text is
-        "닫기" or "Close" or "閉じる" or "关闭" or "關閉" or "Fermer" or
-        "Chiudi" or "Schließen" or "Cerrar" or "Fechar" or "Закрыть";
-
-    private static void SetPanelTitle()
-    {
-        if (_nativeHeader != null)
-            _nativeHeader.text = Text(OnlineText.Online, CurrentLanguage());
-        if (_nativeCloseLabel != null)
-            _nativeCloseLabel.text = Text(OnlineText.Back, CurrentLanguage());
-    }
-
-    internal static bool TryCloseNativePanel(SettingAppPanel panel)
-    {
-        if (_closing || !_visible || panel == null || panel != _nativePanel)
-            return false;
-        Close();
-        return true;
-    }
-
-    private static void DisableNativeControl(Behaviour control)
-    {
-        if (control == null || NativeControlStates.ContainsKey(control))
-            return;
-        NativeControlStates[control] = control.enabled;
-        control.enabled = false;
     }
 
     private static void Rebuild(ProbeBehaviour probe, UdpSession session)
@@ -680,13 +462,12 @@ internal static class TitleOnlineMenu
         _dirty = false;
         DestroyRoom();
         _manager.buttons.Clear();
-        SetPanelTitle();
 
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
-            AddInput(OnlineText.Name, _name, 24, InputField.ContentType.Standard, value => _name = value);
-            AddInput(OnlineText.HostIp, _address, 45, InputField.ContentType.Standard, value => _address = value);
-            AddInput(OnlineText.Port, _port, 5, InputField.ContentType.IntegerNumber, value => _port = value);
+            AddInput(OnlineText.Name, _name, 24, value => _name = value, EditName);
+            AddInput(OnlineText.HostIp, _address, 45, value => _address = value, EditHostIp);
+            AddInput(OnlineText.Port, _port, 5, value => _port = value, EditPort);
             AddAction(language => Text(OnlineText.CreateLobby, language), Host);
             AddAction(language => Text(OnlineText.Join, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
@@ -744,8 +525,7 @@ internal static class TitleOnlineMenu
             return;
         RoomLabels.Add(label);
         label.enabled = false;
-        var pointer = label.GetComponentInChildren<PointerEventComponent>(true);
-        if (pointer != null)
+        foreach (var pointer in label.GetComponentsInChildren<PointerEventComponent>(true))
             pointer.enabled = false;
     }
 
@@ -753,95 +533,155 @@ internal static class TitleOnlineMenu
         OnlineText label,
         string value,
         int limit,
-        InputField.ContentType contentType,
-        Action<string> apply)
+        Action<string> apply,
+        int action)
     {
-        var row = CreateRow();
-        if (row == null)
-            return;
-        var button = row.GetComponent<TitleMenuButton>();
-        var labelText = button?.nameText?.text?.textTMProUGUI;
-        if (button == null || labelText == null)
+        AddAction(language => Value(label, value ?? string.Empty, language), action);
+    }
+
+    private static void OpenKeyboard(OnlineText label, string value, int limit, Action<string> apply)
+    {
+        var keyboard = FindKeyboard();
+        if (keyboard != null)
         {
-            UnityEngine.Object.Destroy(row);
+            ShowKeyboard(keyboard, label, value, limit, apply);
             return;
         }
 
-        button.enabled = false;
-        foreach (var pointer in row.GetComponentsInChildren<PointerEventComponent>(true))
-            pointer.enabled = false;
-
-        button.nameText.SetOverride((Func<string, string>)(_ => Text(label, CurrentLanguage())), true);
-        labelText.text = Text(label, CurrentLanguage());
-        labelText.alignment = TextAlignmentOptions.MidlineLeft;
-        var labelRect = labelText.rectTransform;
-        DisableLayoutControl(labelText.gameObject);
-        labelRect.anchorMin = new Vector2(0.06f, 0f);
-        labelRect.anchorMax = new Vector2(0.4f, 1f);
-        labelRect.pivot = new Vector2(0.5f, 0.5f);
-        labelRect.offsetMin = Vector2.zero;
-        labelRect.offsetMax = Vector2.zero;
-        labelRect.anchoredPosition = Vector2.zero;
-        labelRect.localScale = Vector3.one;
-        labelRect.localRotation = Quaternion.identity;
-
-        if (_nativeInputTemplate == null)
-        {
-            UnityEngine.Object.Destroy(row);
+        _pendingKeyboardLabel = label;
+        _pendingKeyboardValue = value ?? string.Empty;
+        _pendingKeyboardLimit = limit;
+        _pendingKeyboardApply = apply;
+        if (_keyboardLoading)
             return;
-        }
-        var fieldObject = UnityEngine.Object.Instantiate(_nativeInputTemplate.gameObject, row.transform);
-        fieldObject.name = "DaveTheDiverMP_Input";
-        fieldObject.transform.SetParent(row.transform, false);
-        var fieldRect = fieldObject.GetComponent<RectTransform>();
-        DisableLayoutControl(fieldObject);
-        fieldRect.anchorMin = new Vector2(0.5f, 0.16f);
-        fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
-        fieldRect.pivot = new Vector2(0.5f, 0.5f);
-        fieldRect.offsetMin = Vector2.zero;
-        fieldRect.offsetMax = Vector2.zero;
-        fieldRect.anchoredPosition = Vector2.zero;
-        fieldRect.localScale = Vector3.one;
-        fieldRect.localRotation = Quaternion.identity;
-        var valueText = fieldObject.GetComponent<Text>();
-        if (valueText == null)
-        {
-            UnityEngine.Object.Destroy(row);
-            return;
-        }
-        DisableForeignBehaviours(fieldObject, valueText);
-        valueText.enabled = true;
-        valueText.text = value ?? string.Empty;
-        valueText.alignment = TextAnchor.MiddleLeft;
-        valueText.fontSize = 28;
-        valueText.color = Color.white;
-        valueText.raycastTarget = true;
 
-        InputField input;
+        _keyboardLoading = true;
         try
         {
-            input = fieldObject.AddComponent<InputField>();
+            AddressableAssetsLoader.LoadAssetFromAddress<GameObject>(
+                VirtualKeyboardManager.ResourceName,
+                (Il2CppSystem.Action<GameObject>)(Action<GameObject>)OnKeyboardPrefabLoaded);
         }
         catch (Exception exception)
         {
-            ProbeBehaviour.Logger?.LogError($"Online input creation failed: {exception.Message}");
-            UnityEngine.Object.Destroy(row);
-            return;
+            _keyboardLoading = false;
+            SetKeyboardError(label, exception.Message);
         }
-        if (input == null)
+    }
+
+    private static VirtualKeyboardManager FindKeyboard() =>
+        LocalMonoSingleton<VirtualKeyboardManager>.instance ??
+        UnityEngine.Object.FindFirstObjectByType<VirtualKeyboardManager>();
+
+    private static void OnKeyboardPrefabLoaded(GameObject prefab)
+    {
+        _keyboardLoading = false;
+        var keyboard = FindKeyboard();
+        if (keyboard == null && prefab != null)
         {
-            UnityEngine.Object.Destroy(row);
+            var instance = UnityEngine.Object.Instantiate(prefab);
+            keyboard = instance.GetComponent<VirtualKeyboardManager>() ??
+                instance.GetComponentInChildren<VirtualKeyboardManager>(true);
+            keyboard?.Init();
+        }
+
+        var label = _pendingKeyboardLabel;
+        var value = _pendingKeyboardValue;
+        var limit = _pendingKeyboardLimit;
+        var apply = _pendingKeyboardApply;
+        _pendingKeyboardApply = null;
+        if (keyboard == null || apply == null)
+        {
+            SetKeyboardError(label, "keyboard prefab was not loaded");
             return;
         }
-        input.targetGraphic = valueText;
-        input.textComponent = valueText;
-        input.characterLimit = limit;
-        input.contentType = contentType;
-        input.lineType = InputField.LineType.SingleLine;
-        input.text = value ?? string.Empty;
-        input.onValueChanged.AddListener((UnityEngine.Events.UnityAction<string>)(changed => apply(changed)));
-        BindInputPointer(fieldObject.AddComponent<PointerEventComponent>(), input);
-        RoomFields.Add(row);
+        ShowKeyboard(keyboard, label, value, limit, apply);
+    }
+
+    private static void ShowKeyboard(
+        VirtualKeyboardManager keyboard,
+        OnlineText label,
+        string value,
+        int limit,
+        Action<string> apply)
+    {
+        try
+        {
+            ConfigureKeyboardForTitle(keyboard);
+            _keyboardVisible = true;
+            SetRoomVisible(false);
+            keyboard.ShowKeyboard(
+                (Il2CppSystem.Action<string>)(Action<string>)(result =>
+                {
+                    apply((result ?? string.Empty).Trim());
+                    _message = string.Empty;
+                    FinishKeyboard();
+                }),
+                (Il2CppSystem.Action)(Action)FinishKeyboard,
+                limit,
+                CurrentLanguage());
+
+            var input = keyboard.m_Keyboard?.m_InputField;
+            if (input != null)
+            {
+                input.text = value ?? string.Empty;
+                input.ActivateInputField();
+            }
+        }
+        catch (Exception exception)
+        {
+            FinishKeyboard();
+            SetKeyboardError(label, exception.Message);
+        }
+    }
+
+    private static void ConfigureKeyboardForTitle(VirtualKeyboardManager keyboard)
+    {
+        var canvas = keyboard.GetComponent<Canvas>();
+        if (canvas == null)
+            return;
+
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        canvas.overrideSorting = true;
+        canvas.sortingOrder = short.MaxValue;
+
+        var camera = keyboard.GetComponentInChildren<Camera>(true);
+        if (camera != null)
+            camera.enabled = false;
+    }
+
+    private static void FinishKeyboard()
+    {
+        _keyboardVisible = false;
+        SetRoomVisible(true);
+        MarkDirty();
+    }
+
+    private static void SetRoomVisible(bool visible)
+    {
+        if (_manager?.buttonCanvasGroup != null)
+            _manager.buttonCanvasGroup.alpha = visible ? 1f : 0f;
+        foreach (var button in RoomButtons)
+        {
+            if (button != null)
+            {
+                if (!visible)
+                    button.SetFocus(false);
+                button.gameObject.SetActive(visible);
+            }
+        }
+        foreach (var label in RoomLabels)
+        {
+            if (label != null)
+                label.gameObject.SetActive(visible);
+        }
+    }
+
+    private static void SetKeyboardError(OnlineText label, string reason)
+    {
+        _message = $"{Text(label, CurrentLanguage())}: {reason}";
+        MarkDirty();
+        ProbeBehaviour.Logger?.LogError($"Online room: game virtual keyboard failed: {reason}");
     }
 
     private static TitleMenuButton Create(Func<Languages, string> text, int action)
@@ -863,7 +703,7 @@ internal static class TitleOnlineMenu
 
     private static GameObject CreateRow()
     {
-        var index = RoomButtons.Count + RoomLabels.Count + RoomFields.Count;
+        var index = RoomButtons.Count + RoomLabels.Count;
         if (index >= TitleButtons.Count)
             return null;
         var source = TitleButtons[index];
@@ -872,15 +712,6 @@ internal static class TitleOnlineMenu
         var clone = UnityEngine.Object.Instantiate(source.gameObject, _roomContent);
         clone.SetActive(true);
         clone.name = $"DaveTheDiverMP_Room_{index}";
-        var rect = clone.GetComponent<RectTransform>();
-        if (rect != null && !_titleFallback)
-        {
-            rect.anchorMin = new Vector2(0.08f, 1f);
-            rect.anchorMax = new Vector2(0.92f, 1f);
-            rect.pivot = new Vector2(0.5f, 1f);
-            rect.anchoredPosition = new Vector2(0f, RowStartY - index * RowStepY);
-            rect.sizeDelta = new Vector2(0f, RowHeight);
-        }
         return clone;
     }
 
@@ -896,14 +727,8 @@ internal static class TitleOnlineMenu
             if (label != null)
                 UnityEngine.Object.Destroy(label.gameObject);
         }
-        foreach (var field in RoomFields)
-        {
-            if (field != null)
-                UnityEngine.Object.Destroy(field);
-        }
         RoomButtons.Clear();
         RoomLabels.Clear();
-        RoomFields.Clear();
         ActionButtons.Clear();
     }
 
@@ -947,38 +772,6 @@ internal static class TitleOnlineMenu
             pointer.enabled = true;
             pointer.onClick = new UnityEngine.Events.UnityEvent();
             pointer.onClick.AddListener((UnityEngine.Events.UnityAction)button.Invoke);
-        }
-    }
-
-    private static void BindInputPointer(PointerEventComponent pointer, InputField input)
-    {
-        if (pointer == null || input == null)
-            return;
-        pointer.enabled = true;
-        pointer.onClick = new UnityEngine.Events.UnityEvent();
-        pointer.onClick.AddListener((UnityEngine.Events.UnityAction)input.ActivateInputField);
-    }
-
-    private static void DisableLayoutControl(GameObject gameObject)
-    {
-        if (gameObject == null)
-            return;
-        foreach (var layout in gameObject.GetComponents<LayoutGroup>())
-            layout.enabled = false;
-        foreach (var fitter in gameObject.GetComponents<ContentSizeFitter>())
-            fitter.enabled = false;
-        foreach (var fitter in gameObject.GetComponents<AspectRatioFitter>())
-            fitter.enabled = false;
-        foreach (var element in gameObject.GetComponents<LayoutElement>())
-            element.enabled = false;
-    }
-
-    private static void DisableForeignBehaviours(GameObject gameObject, Behaviour keep)
-    {
-        foreach (var behaviour in gameObject.GetComponents<Behaviour>())
-        {
-            if (behaviour != null && behaviour != keep)
-                behaviour.enabled = false;
         }
     }
 
@@ -1035,7 +828,15 @@ internal static class TitleOnlineEntryPatch
 internal static class TitleOnlineSelectPatch
 {
     private static bool Prefix(TitleManager __instance, ButtonName name) =>
+        !TitleOnlineMenu.IsKeyboardVisible(__instance) &&
         !TitleOnlineMenu.TryHandle(__instance, name);
+}
+
+[HarmonyPatch(typeof(TitleManager), nameof(TitleManager.OnDirectHandler))]
+internal static class TitleOnlineKeyboardInputPatch
+{
+    private static bool Prefix(TitleManager __instance) =>
+        !TitleOnlineMenu.IsKeyboardVisible(__instance);
 }
 
 [HarmonyPatch(typeof(TitleMenuButton), nameof(TitleMenuButton.Invoke))]
@@ -1043,13 +844,6 @@ internal static class TitleOnlineButtonInvokePatch
 {
     private static bool Prefix(TitleMenuButton __instance) =>
         !TitleOnlineMenu.TryHandleButton(__instance);
-}
-
-[HarmonyPatch(typeof(SettingAppPanel), nameof(SettingAppPanel.Close))]
-internal static class TitleOnlineSettingsClosePatch
-{
-    private static bool Prefix(SettingAppPanel __instance) =>
-        !TitleOnlineMenu.TryCloseNativePanel(__instance);
 }
 
 [HarmonyPatch(typeof(TitleManager), "OnDestroy")]

@@ -29,6 +29,7 @@
     <Reference Include="Unity.TextMeshPro" HintPath="$(GameInstallPath)\BepInEx\interop\Unity.TextMeshPro.dll" Private="false" />
     <Reference Include="UnityEngine.UIModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.UIModule.dll" Private="false" />
     <Reference Include="UnityEngine.UI" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.UI.dll" Private="false" />
+    <Reference Include="Unity.ResourceManager" HintPath="$(GameInstallPath)\BepInEx\interop\Unity.ResourceManager.dll" Private="false" />
     <Reference Include="EzCoding" HintPath="$(GameInstallPath)\BepInEx\interop\EzCoding.dll" Private="false" />
     <Reference Include="WeaponSystem" HintPath="$(GameInstallPath)\BepInEx\interop\WeaponSystem.dll" Private="false" />
   </ItemGroup>
