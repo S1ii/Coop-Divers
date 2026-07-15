@@ -12,7 +12,8 @@ internal enum PacketType : byte
     Disconnect = 4,
     PlayerSnapshot = 5,
     SceneState = 6,
-    FishSnapshot = 7
+    FishSnapshot = 7,
+    PickupRemoved = 8
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -37,13 +38,19 @@ internal readonly record struct FishSnapshot(
     float Rotation,
     byte Flags);
 
+internal readonly record struct PickupRemoved(
+    uint SceneId,
+    uint WorldId,
+    int ItemId);
+
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 6;
+    private const byte Version = 7;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
     private const int FishSnapshotSize = HeaderSize + 25;
+    private const int PickupRemovedSize = HeaderSize + 12;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -228,6 +235,33 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodePickupRemoved(uint sequence, PickupRemoved removed)
+    {
+        var packet = new byte[PickupRemovedSize];
+        Encode(PacketType.PickupRemoved, sequence).CopyTo(packet, 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), removed.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.WorldId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), removed.ItemId);
+        return packet;
+    }
+
+    internal static bool TryDecodePickupRemoved(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out PickupRemoved removed)
+    {
+        sequence = 0;
+        removed = default;
+        if (packet.Length != PickupRemovedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.PickupRemoved)
+            return false;
+        removed = new PickupRemoved(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)));
+        return true;
+    }
+
     internal static string NormalizePlayerName(string playerName)
     {
         var normalized = (playerName ?? string.Empty).Trim();
@@ -282,6 +316,12 @@ internal static class Protocol
         fishPacket[HeaderSize + 24] = 8;
         if (TryDecodeFishSnapshot(fishPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish flags");
+
+        var expectedPickup = new PickupRemoved(SceneId("A02_01_01"), 0xCAFEBABE, 1001);
+        var pickupPacket = EncodePickupRemoved(46, expectedPickup);
+        if (!TryDecodePickupRemoved(pickupPacket, out sequence, out var actualPickup) ||
+            sequence != 46 || actualPickup != expectedPickup)
+            throw new InvalidOperationException("Pickup removal round-trip failed");
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,

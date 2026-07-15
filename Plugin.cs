@@ -3,13 +3,14 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
+using HarmonyLib;
 using Steamworks;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.6.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.7.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -30,6 +31,15 @@ public sealed class Plugin : BasePlugin
         ProbeBehaviour.Address = address.Value;
         ProbeBehaviour.Port = port.Value;
         ProbeBehaviour.ConfiguredName = playerName.Value;
+        try
+        {
+            Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, "dev.davethedivermp");
+            Log.LogInfo("Gameplay patches active");
+        }
+        catch (Exception exception)
+        {
+            Log.LogError($"Gameplay patches failed: {exception.Message}");
+        }
         Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
         AddComponent<ProbeBehaviour>();
     }
@@ -52,6 +62,7 @@ public sealed class Plugin : BasePlugin
 
 public sealed class ProbeBehaviour : MonoBehaviour
 {
+    internal static ProbeBehaviour Instance { get; private set; }
     internal static ManualLogSource Logger { get; set; }
     internal static SessionRole Role { get; set; }
     internal static string Address { get; set; } = string.Empty;
@@ -68,6 +79,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private SpriteRenderer _playerRenderer;
     private UdpSession _session;
     private FishReplicator _fishReplicator;
+    private PickupReplicator _pickupReplicator;
     private readonly RemoteAvatar _remoteAvatar = new();
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
@@ -76,11 +88,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void Start()
     {
+        Instance = this;
         var localName = Plugin.ResolvePlayerName(ConfiguredName);
         var buildId = Protocol.SceneId(
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}");
         _session = new UdpSession(Logger);
         _fishReplicator = new FishReplicator(Logger);
+        _pickupReplicator = new PickupReplicator(Logger);
         _session.Start(Role, Address, Port, localName, buildId);
         Logger.LogInfo($"Network identity: {localName}; build={buildId:X8}");
     }
@@ -96,6 +110,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _playerRenderer = null;
             _remoteAvatar.Clear();
             _fishReplicator?.Clear();
+            _pickupReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
             Logger.LogInfo($"Scene: {_scene}");
         }
@@ -103,6 +118,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session?.Update(Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime);
+        _pickupReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
@@ -198,8 +214,17 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void OnDestroy()
     {
+        if (Instance == this)
+            Instance = null;
         _session?.Dispose();
         _fishReplicator?.Clear();
+        _pickupReplicator?.Clear();
         _remoteAvatar.Dispose();
+    }
+
+    internal void OnPickupDestroyed(PickupInstanceItem item)
+    {
+        if (Role == SessionRole.Host)
+            _pickupReplicator?.OnHostDestroyed(_session, _sceneId, item);
     }
 }

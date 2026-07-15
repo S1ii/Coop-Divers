@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Reference Include="0Harmony" HintPath="..\DAVE THE DIVER\BepInEx\core\0Harmony.dll" Private="false" />
     <Reference Include="BepInEx.Core" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Core.dll" Private="false" />
     <Reference Include="BepInEx.Unity.Common" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
     <Reference Include="BepInEx.Unity.IL2CPP" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Unity.IL2CPP.dll" Private="false" />

@@ -20,6 +20,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ManualLogSource _log;
     private readonly ConcurrentQueue<UdpReceiveResult> _incoming = new();
     private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
+    private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
     private readonly CancellationTokenSource _stop = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -38,6 +39,7 @@ internal sealed class UdpSession : IDisposable
     private bool _hasSnapshot;
     private uint _lastSceneSequence;
     private uint _lastFishSequence;
+    private uint _lastPickupSequence;
     private uint _lastSnapshotSequence;
     private PlayerSnapshot _snapshot;
 
@@ -72,6 +74,15 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeFishSnapshot(out FishSnapshot snapshot) =>
         _fishSnapshots.TryDequeue(out snapshot);
+
+    internal void SendPickupRemoved(PickupRemoved removed)
+    {
+        if (_role == SessionRole.Host && SceneMatches(removed.SceneId))
+            Send(Protocol.EncodePickupRemoved(++_sequence, removed));
+    }
+
+    internal bool TryTakePickupRemoved(out PickupRemoved removed) =>
+        _pickupRemovals.TryDequeue(out removed);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -237,6 +248,21 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.PickupRemoved)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodePickupRemoved(received.Buffer, out _, out var removed))
+            {
+                _lastReceive = now;
+                if (IsNewer(sequence, _lastPickupSequence))
+                {
+                    _lastPickupSequence = sequence;
+                    _pickupRemovals.Enqueue(removed);
+                }
+            }
+            return;
+        }
+
         if (type == PacketType.Heartbeat)
         {
             if (_connected)
@@ -318,7 +344,11 @@ internal sealed class UdpSession : IDisposable
         _hasRemoteScene = false;
         _lastSceneSequence = 0;
         _lastFishSequence = 0;
+        _lastPickupSequence = 0;
         while (_fishSnapshots.TryDequeue(out _))
+        {
+        }
+        while (_pickupRemovals.TryDequeue(out _))
         {
         }
         _snapshot = default;
