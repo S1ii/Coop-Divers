@@ -55,6 +55,7 @@ internal sealed class UdpSession : IDisposable
     private bool _hasRemoteScene;
     private bool _hasSnapshot;
     private bool _hasRemotePlayerState;
+    private volatile bool _receiveFailed;
     private uint _lastSceneSequence;
     private uint _lastFishSequence;
     private uint _lastSnapshotSequence;
@@ -63,6 +64,7 @@ internal sealed class UdpSession : IDisposable
     internal UdpSession(ManualLogSource log) => _log = log;
 
     internal bool Connected => _connected;
+    internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
     internal int LocalPort => ((IPEndPoint)_udp.Client.LocalEndPoint).Port;
     internal int PendingReliableCount => _pendingReliable.Count;
@@ -174,6 +176,7 @@ internal sealed class UdpSession : IDisposable
 
     internal void Start(SessionRole role, string address, int port, string localName, uint buildId)
     {
+        _receiveFailed = false;
         _role = role;
         _localName = Protocol.NormalizePlayerName(localName);
         _buildId = buildId;
@@ -212,6 +215,15 @@ internal sealed class UdpSession : IDisposable
     internal void Update(float now)
     {
         _now = now;
+        if (_receiveFailed)
+        {
+            _udp?.Dispose();
+            _udp = null;
+            _receiveFailed = false;
+            ResetPeerState();
+            _log.LogWarning("Network: session stopped after a receive failure");
+            return;
+        }
         if (_udp == null)
             return;
 
@@ -254,6 +266,11 @@ internal sealed class UdpSession : IDisposable
         catch (Exception exception)
         {
             _log.LogError($"Network receive failed: {exception.Message}");
+        }
+        finally
+        {
+            if (!_stop.IsCancellationRequested)
+                _receiveFailed = true;
         }
     }
 
@@ -579,6 +596,7 @@ internal sealed class UdpSession : IDisposable
         _stop.Cancel();
         _udp?.Dispose();
         _udp = null;
+        _receiveFailed = false;
         ResetPeerState();
     }
 }

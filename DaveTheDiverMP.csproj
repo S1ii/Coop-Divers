@@ -15,8 +15,10 @@
     <Reference Include="Il2CppInterop.Runtime" HintPath="..\DAVE THE DIVER\BepInEx\core\Il2CppInterop.Runtime.dll" Private="false" />
     <Reference Include="Assembly-CSharp" HintPath="..\DAVE THE DIVER\BepInEx\interop\Assembly-CSharp.dll" Private="false" />
     <Reference Include="Il2Cppmscorlib" HintPath="..\DAVE THE DIVER\BepInEx\interop\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="InputSystemWrapper" HintPath="..\DAVE THE DIVER\BepInEx\interop\InputSystemWrapper.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="..\DAVE THE DIVER\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.IMGUIModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.IMGUIModule.dll" Private="false" />
     <Reference Include="UnityEngine.TextRenderingModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.TextRenderingModule.dll" Private="false" />
   </ItemGroup>
 
