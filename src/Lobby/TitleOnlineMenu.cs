@@ -781,6 +781,7 @@ internal static class TitleOnlineMenu
         labelRect.pivot = new Vector2(0.5f, 0.5f);
         labelRect.offsetMin = Vector2.zero;
         labelRect.offsetMax = Vector2.zero;
+        labelRect.anchoredPosition = Vector2.zero;
         labelRect.localScale = Vector3.one;
         labelRect.localRotation = Quaternion.identity;
 
@@ -794,11 +795,12 @@ internal static class TitleOnlineMenu
         fieldObject.transform.SetParent(row.transform, false);
         var fieldRect = fieldObject.GetComponent<RectTransform>();
         DisableLayoutControl(fieldObject);
-        fieldRect.anchorMin = new Vector2(0.42f, 0.16f);
+        fieldRect.anchorMin = new Vector2(0.5f, 0.16f);
         fieldRect.anchorMax = new Vector2(0.93f, 0.84f);
         fieldRect.pivot = new Vector2(0.5f, 0.5f);
         fieldRect.offsetMin = Vector2.zero;
         fieldRect.offsetMax = Vector2.zero;
+        fieldRect.anchoredPosition = Vector2.zero;
         fieldRect.localScale = Vector3.one;
         fieldRect.localRotation = Quaternion.identity;
         var valueText = fieldObject.GetComponent<Text>();
@@ -807,8 +809,12 @@ internal static class TitleOnlineMenu
             UnityEngine.Object.Destroy(row);
             return;
         }
+        DisableForeignBehaviours(fieldObject, valueText);
+        valueText.enabled = true;
         valueText.text = value ?? string.Empty;
         valueText.alignment = TextAnchor.MiddleLeft;
+        valueText.fontSize = 28;
+        valueText.color = Color.white;
         valueText.raycastTarget = true;
 
         InputField input;
@@ -965,6 +971,15 @@ internal static class TitleOnlineMenu
             fitter.enabled = false;
         foreach (var element in gameObject.GetComponents<LayoutElement>())
             element.enabled = false;
+    }
+
+    private static void DisableForeignBehaviours(GameObject gameObject, Behaviour keep)
+    {
+        foreach (var behaviour in gameObject.GetComponents<Behaviour>())
+        {
+            if (behaviour != null && behaviour != keep)
+                behaviour.enabled = false;
+        }
     }
 
     private static void MarkDirty() => _dirty = true;
