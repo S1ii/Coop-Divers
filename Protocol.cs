@@ -11,7 +11,8 @@ internal enum PacketType : byte
     Heartbeat = 3,
     Disconnect = 4,
     PlayerSnapshot = 5,
-    SceneState = 6
+    SceneState = 6,
+    FishSnapshot = 7
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -27,12 +28,22 @@ internal readonly record struct PlayerSnapshot(
     float ScaleY,
     bool Flipped);
 
+internal readonly record struct FishSnapshot(
+    uint SceneId,
+    int Id,
+    float X,
+    float Y,
+    float Z,
+    float Rotation,
+    byte Flags);
+
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 5;
+    private const byte Version = 6;
     internal const int HeaderSize = 10;
     private const int SnapshotSize = HeaderSize + 41;
+    private const int FishSnapshotSize = HeaderSize + 25;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
@@ -175,6 +186,48 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodeFishSnapshot(uint sequence, FishSnapshot snapshot)
+    {
+        var packet = new byte[FishSnapshotSize];
+        Encode(PacketType.FishSnapshot, sequence).CopyTo(packet, 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), snapshot.SceneId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), snapshot.Id);
+        WriteSingle(packet.AsSpan(HeaderSize + 8), snapshot.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 12), snapshot.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 16), snapshot.Z);
+        WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.Rotation);
+        packet[HeaderSize + 24] = snapshot.Flags;
+        return packet;
+    }
+
+    internal static bool TryDecodeFishSnapshot(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out FishSnapshot snapshot)
+    {
+        sequence = 0;
+        snapshot = default;
+        if (packet.Length != FishSnapshotSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishSnapshot)
+            return false;
+
+        var x = ReadSingle(packet.Slice(HeaderSize + 8));
+        var y = ReadSingle(packet.Slice(HeaderSize + 12));
+        var z = ReadSingle(packet.Slice(HeaderSize + 16));
+        var rotation = ReadSingle(packet.Slice(HeaderSize + 20));
+        var flags = packet[HeaderSize + 24];
+        if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
+            !float.IsFinite(rotation) || MathF.Abs(x) > 1_000_000f ||
+            MathF.Abs(y) > 1_000_000f || MathF.Abs(z) > 1_000_000f || flags > 7)
+            return false;
+
+        snapshot = new FishSnapshot(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            x, y, z, rotation, flags);
+        return true;
+    }
+
     internal static string NormalizePlayerName(string playerName)
     {
         var normalized = (playerName ?? string.Empty).Trim();
@@ -219,6 +272,16 @@ internal static class Protocol
         if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId) ||
             sequence != 44 || sceneId != SceneId("A02_01_01"))
             throw new InvalidOperationException("Scene state round-trip failed");
+
+        var expectedFish = new FishSnapshot(
+            SceneId("A02_01_01"), 17, 1.25f, -2.5f, -0.1f, 183f, 5);
+        var fishPacket = EncodeFishSnapshot(45, expectedFish);
+        if (!TryDecodeFishSnapshot(fishPacket, out sequence, out var actualFish) ||
+            sequence != 45 || actualFish != expectedFish)
+            throw new InvalidOperationException("Fish snapshot round-trip failed");
+        fishPacket[HeaderSize + 24] = 8;
+        if (TryDecodeFishSnapshot(fishPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish flags");
 
         var expected = new PlayerSnapshot(
             SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,

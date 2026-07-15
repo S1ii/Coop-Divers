@@ -9,7 +9,7 @@ using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.5.0")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.6.0")]
 public sealed class Plugin : BasePlugin
 {
     public override void Load()
@@ -67,6 +67,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private PlayerCharacter _player;
     private SpriteRenderer _playerRenderer;
     private UdpSession _session;
+    private FishReplicator _fishReplicator;
     private readonly RemoteAvatar _remoteAvatar = new();
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
@@ -79,6 +80,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var buildId = Protocol.SceneId(
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}");
         _session = new UdpSession(Logger);
+        _fishReplicator = new FishReplicator(Logger);
         _session.Start(Role, Address, Port, localName, buildId);
         Logger.LogInfo($"Network identity: {localName}; build={buildId:X8}");
     }
@@ -93,11 +95,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _player = null;
             _playerRenderer = null;
             _remoteAvatar.Clear();
+            _fishReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
             Logger.LogInfo($"Scene: {_scene}");
         }
 
         _session?.Update(Time.realtimeSinceStartup);
+        _fishReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.deltaTime);
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
@@ -194,6 +199,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private void OnDestroy()
     {
         _session?.Dispose();
+        _fishReplicator?.Clear();
         _remoteAvatar.Dispose();
     }
 }

@@ -19,6 +19,7 @@ internal sealed class UdpSession : IDisposable
 {
     private readonly ManualLogSource _log;
     private readonly ConcurrentQueue<UdpReceiveResult> _incoming = new();
+    private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
     private readonly CancellationTokenSource _stop = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -36,6 +37,7 @@ internal sealed class UdpSession : IDisposable
     private bool _hasRemoteScene;
     private bool _hasSnapshot;
     private uint _lastSceneSequence;
+    private uint _lastFishSequence;
     private uint _lastSnapshotSequence;
     private PlayerSnapshot _snapshot;
 
@@ -61,6 +63,15 @@ internal sealed class UdpSession : IDisposable
         if (_connected)
             Send(Protocol.EncodeSnapshot(++_sequence, snapshot));
     }
+
+    internal void SendFishSnapshot(FishSnapshot snapshot)
+    {
+        if (_role == SessionRole.Host && SceneMatches(snapshot.SceneId))
+            Send(Protocol.EncodeFishSnapshot(++_sequence, snapshot));
+    }
+
+    internal bool TryTakeFishSnapshot(out FishSnapshot snapshot) =>
+        _fishSnapshots.TryDequeue(out snapshot);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -211,6 +222,21 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.FishSnapshot)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeFishSnapshot(received.Buffer, out _, out var fishSnapshot))
+            {
+                _lastReceive = now;
+                if (IsNewer(sequence, _lastFishSequence))
+                {
+                    _lastFishSequence = sequence;
+                    _fishSnapshots.Enqueue(fishSnapshot);
+                }
+            }
+            return;
+        }
+
         if (type == PacketType.Heartbeat)
         {
             if (_connected)
@@ -291,6 +317,10 @@ internal sealed class UdpSession : IDisposable
         _remoteSceneId = 0;
         _hasRemoteScene = false;
         _lastSceneSequence = 0;
+        _lastFishSequence = 0;
+        while (_fishSnapshots.TryDequeue(out _))
+        {
+        }
         _snapshot = default;
         _hasSnapshot = false;
         _lastSnapshotSequence = 0;
