@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>DaveTheDiverMP</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Core.dll" Private="false" />
+    <Reference Include="BepInEx.Unity.Common" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
+    <Reference Include="BepInEx.Unity.IL2CPP" HintPath="..\DAVE THE DIVER\BepInEx\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <Reference Include="Il2CppInterop.Runtime" HintPath="..\DAVE THE DIVER\BepInEx\core\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="Assembly-CSharp" HintPath="..\DAVE THE DIVER\BepInEx\interop\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="Il2Cppmscorlib" HintPath="..\DAVE THE DIVER\BepInEx\interop\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="Steamworks.NET" HintPath="..\DAVE THE DIVER\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="..\DAVE THE DIVER\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
+  </ItemGroup>
+
+  <Target Name="Deploy" AfterTargets="Build">
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="..\DAVE THE DIVER\BepInEx\plugins\DaveTheDiverMP" />
+  </Target>
+</Project>
