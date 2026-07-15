@@ -17,7 +17,7 @@ jobs:
     name: Repository hygiene
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Verify repository hygiene
         shell: pwsh
         run: .\build\verify-repo.ps1
@@ -28,7 +28,7 @@ jobs:
     needs: hygiene
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check reference configuration
         shell: pwsh
         env:
@@ -37,11 +37,11 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_TOKEN)) {
             throw 'Repository secret REFERENCE_REPOSITORY_TOKEN is required when REFERENCE_REPOSITORY is set.'
           }
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 6.0.x
       - name: Fetch private game references
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
           token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
@@ -56,7 +56,7 @@ jobs:
         shell: pwsh
         run: .\build\package.ps1 -Configuration Release
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DaveTheDiverMP
           path: |

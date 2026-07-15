@@ -17,7 +17,7 @@ jobs:
     name: Build and publish release
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check release configuration
         shell: pwsh
         env:
@@ -44,11 +44,11 @@ jobs:
           if ($projectVersion -ne $releaseVersion) {
             throw "Project version $projectVersion does not match release version $releaseVersion."
           }
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 6.0.x
       - name: Fetch private game references
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
           token: ${{ secrets.REFERENCE_REPOSITORY_TOKEN }}
