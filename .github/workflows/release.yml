@@ -18,6 +18,7 @@ jobs:
     steps:
       - name: Promote GitHub release
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
