@@ -45,15 +45,12 @@ internal sealed class FishReplicator
     private readonly HashSet<int> _pendingClientPickups = new();
     private readonly HashSet<FishAISystem> _hostRemovedFish = new();
     private readonly HashSet<int> _missingAllocatorIds = new();
-    private readonly HashSet<int> _fallbackAllocatorIds = new();
     private readonly Dictionary<uint, HashSet<int>> _clientManifestIds = new();
     private readonly Dictionary<uint, ushort> _clientManifestCounts = new();
     private readonly Dictionary<uint, ushort> _finalizedClientManifestCounts = new();
-    private readonly HashSet<FishAllocator> _stoppedClientAllocators = new();
     private readonly List<FishSnapshot> _snapshotBuffer = new();
     private float _nextHostScan;
     private float _nextSend;
-    private float _nextClientAllocatorScan;
     private bool _manifestStateQueued;
     private int _nextHostId = 1;
     private int _lastHostCount = -1;
@@ -100,9 +97,6 @@ internal sealed class FishReplicator
         {
         }
 
-        if (role == SessionRole.Client)
-            StopClientAllocators(now);
-
         if (role != SessionRole.Client || !session.SceneMatches(sceneId))
         {
             while (session.TryTakeFishSnapshot(out _))
@@ -120,10 +114,12 @@ internal sealed class FishReplicator
             while (session.TryTakeFishManifestState(out _))
             {
             }
-            DestroyClientTargets();
+            ReleaseClientTargets();
             ResetClientManifest();
             return;
         }
+        if (hostPlayer == null)
+            return;
 
         while (session.TryTakeFishManifest(out var manifest))
         {
@@ -238,8 +234,7 @@ internal sealed class FishReplicator
 
     internal void Clear()
     {
-        DestroyClientTargets();
-        ResumeClientAllocators();
+        ReleaseClientTargets();
         _hostFishById.Clear();
         _hostIdsByFish.Clear();
         _hostInfoById.Clear();
@@ -247,7 +242,6 @@ internal sealed class FishReplicator
         ResetClientManifest();
         _nextHostScan = 0f;
         _nextSend = 0f;
-        _nextClientAllocatorScan = 0f;
         _manifestStateQueued = false;
         _nextHostId = 1;
         _lastHostCount = -1;
@@ -547,53 +541,19 @@ internal sealed class FishReplicator
         if (existing != null)
             RemoveClientTarget(manifest.Id, false);
 
-        // Host and client generate equivalent fish, but their hierarchy paths are
-        // not stable. Reuse the client's native fish pool by type and position
-        // before attempting an allocator lookup.
+        // Bind only fish created by the game's allocator. Creating or destroying
+        // allocator entries while its async spawn routine is enumerating the pool
+        // corrupts the native collection and causes a per-frame exception storm.
         var fish = TakeUnboundFish(manifest);
         if (fish == null)
         {
-            var allocator = FindAllocator(manifest);
-            if (allocator == null)
-            {
-                if (_missingAllocatorIds.Add(manifest.Id))
-                    _log.LogWarning(
-                        $"Network fish manifest waiting for native pool: " +
-                        $"id={manifest.Id}; uid={manifest.AllocatorUid}");
-                return;
-            }
-            var prefab = allocator.GetFirstFishPrefab;
-            if (prefab == null)
-            {
-                if (_missingAllocatorIds.Add(manifest.Id))
-                    _log.LogWarning($"Network fish manifest allocator has no prefab: id={manifest.Id}");
-                return;
-            }
-            try
-            {
-                var instance = allocator.DoInstanceFishOrGroup(prefab, null, true);
-                fish = instance != null
-                    ? instance.GetComponent<FishAISystem>() ?? instance.GetComponentInChildren<FishAISystem>(true)
-                    : null;
-            }
-            catch (Exception exception)
-            {
-                _log.LogWarning($"Network fish manifest spawn failed: id={manifest.Id}; {exception.Message}");
-                return;
-            }
+            if (_missingAllocatorIds.Add(manifest.Id))
+                _log.LogDebug($"Network fish manifest waiting for native fish: id={manifest.Id}");
+            return;
         }
         if (fish == null)
             return;
 
-        try
-        {
-            fish.OverwriteFishData(manifest.FishDataTID);
-        }
-        catch (Exception exception)
-        {
-            _log.LogWarning($"Network fish manifest apply failed: id={manifest.Id}; {exception.Message}");
-            return;
-        }
         var target = new Target
         {
             Fish = fish,
@@ -609,7 +569,6 @@ internal sealed class FishReplicator
         ApplyFlags(target);
         _targets[manifest.Id] = target;
         _clientIdsByFish[fish] = manifest.Id;
-        fish.enabled = false;
         _missingAllocatorIds.Remove(manifest.Id);
         if (trackManifest)
             MarkClientManifestEntry(manifest.Revision, manifest.Id);
@@ -653,30 +612,6 @@ internal sealed class FishReplicator
             $"Network fish manifest applied: revision={revision}; fish={expected}; pruned={pruned}");
     }
 
-    private void StopClientAllocators(float now)
-    {
-        if (now < _nextClientAllocatorScan)
-            return;
-        _nextClientAllocatorScan = now + 1f;
-        foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
-                     FindObjectsSortMode.None))
-        {
-            if (allocator == null || !_stoppedClientAllocators.Add(allocator))
-                continue;
-            try
-            {
-                allocator.StopAlloc(false);
-                if (CurrentClientManifestFinalized(out var ids))
-                    PruneAllocator(allocator, ids);
-            }
-            catch (Exception exception)
-            {
-                _stoppedClientAllocators.Remove(allocator);
-                _log.LogWarning($"Network fish allocator stop failed: {exception.Message}");
-            }
-        }
-    }
-
     private int PruneClientFish(HashSet<int> manifestIds)
     {
         var pruned = 0;
@@ -687,69 +622,13 @@ internal sealed class FishReplicator
             RemoveClientTarget(id, true);
             pruned++;
         }
-        foreach (var allocator in new List<FishAllocator>(_stoppedClientAllocators))
-            if (allocator != null)
-                pruned += PruneAllocator(allocator, manifestIds);
         return pruned;
     }
 
-    private int PruneAllocator(FishAllocator allocator, HashSet<int> manifestIds)
+    private void ReleaseClientTargets()
     {
-        var fishToRemove = new List<FishAISystem>();
-        try
-        {
-            var fishs = allocator.GetInstancedFishs;
-            if (fishs == null)
-                return 0;
-            foreach (var fish in fishs)
-                if (fish != null &&
-                    (!_clientIdsByFish.TryGetValue(fish, out var id) || !manifestIds.Contains(id)))
-                    fishToRemove.Add(fish);
-            foreach (var fish in fishToRemove)
-                fish.DestroySelf();
-        }
-        catch (Exception exception)
-        {
-            _log.LogWarning($"Network fish prune failed: {exception.Message}");
-        }
-        return fishToRemove.Count;
-    }
-
-    private bool CurrentClientManifestFinalized(out HashSet<int> ids)
-    {
-        ids = null;
-        return _latestClientManifestRevision != 0 &&
-            _clientManifestIds.TryGetValue(_latestClientManifestRevision, out ids) &&
-            _clientManifestCounts.TryGetValue(_latestClientManifestRevision, out var expected) &&
-            _finalizedClientManifestCounts.TryGetValue(
-                _latestClientManifestRevision, out var finalized) &&
-            finalized == expected && ids.Count >= expected;
-    }
-
-    private void DestroyClientTargets()
-    {
-        foreach (var target in new List<Target>(_targets.Values))
-            if (target.Fish != null)
-                target.Fish.DestroySelf();
         _targets.Clear();
         _clientIdsByFish.Clear();
-    }
-
-    private void ResumeClientAllocators()
-    {
-        foreach (var allocator in new List<FishAllocator>(_stoppedClientAllocators))
-        {
-            try
-            {
-                if (allocator != null && allocator.isActiveAndEnabled)
-                    allocator.Spawn();
-            }
-            catch (Exception exception)
-            {
-                _log.LogWarning($"Network fish allocator resume failed: {exception.Message}");
-            }
-        }
-        _stoppedClientAllocators.Clear();
     }
 
     private void ResetClientManifest()
@@ -757,61 +636,10 @@ internal sealed class FishReplicator
         _removedIds.Clear();
         _pendingClientPickups.Clear();
         _missingAllocatorIds.Clear();
-        _fallbackAllocatorIds.Clear();
         _clientManifestIds.Clear();
         _clientManifestCounts.Clear();
         _finalizedClientManifestCounts.Clear();
         _latestClientManifestRevision = 0;
-    }
-
-    private FishAllocator FindAllocator(FishManifest manifest)
-    {
-        FishAllocator fallback = null;
-        var fallbackScore = float.NegativeInfinity;
-        var expectedKey = CanonicalAllocatorKey(manifest.AllocatorUid);
-        var expectedPosition = new Vector3(manifest.X, manifest.Y, manifest.Z);
-        foreach (var allocator in Resources.FindObjectsOfTypeAll<FishAllocator>())
-        {
-            if (allocator == null || allocator.gameObject == null ||
-                !allocator.gameObject.scene.IsValid())
-                continue;
-            var uid = GetNetworkAllocatorUid(manifest.SceneId, allocator);
-            var score = -Vector3.SqrMagnitude(allocator.transform.position - expectedPosition);
-            if (uid == manifest.AllocatorUid)
-                score += 1_000_000f;
-            else if (CanonicalAllocatorKey(uid) == expectedKey)
-                score += 500_000f;
-            var prefab = allocator.GetFirstFishPrefab;
-            var prefabFish = prefab != null
-                ? prefab.GetComponent<FishAISystem>() ?? prefab.GetComponentInChildren<FishAISystem>(true)
-                : null;
-            if (prefabFish != null && prefabFish.FishDataTID == manifest.FishDataTID)
-                score += 100_000f;
-            if (score > fallbackScore && score > 50_000f)
-            {
-                fallbackScore = score;
-                fallback = allocator;
-            }
-        }
-        if (fallback != null && _fallbackAllocatorIds.Add(manifest.Id))
-            _log.LogInfo(
-                $"Network fish allocator fallback: id={manifest.Id}; key={expectedKey}");
-        return fallback;
-    }
-
-    private static string CanonicalAllocatorKey(string uid)
-    {
-        if (string.IsNullOrEmpty(uid))
-            return string.Empty;
-        if (uid.Length > 9 && uid[^9] == '#')
-            uid = uid.Substring(0, uid.Length - 9);
-        var start = uid.IndexOf("Allocator_", StringComparison.Ordinal);
-        if (start < 0)
-            return uid;
-        var end = uid.LastIndexOf(" (", StringComparison.Ordinal);
-        if (end <= start || !uid.EndsWith(")", StringComparison.Ordinal))
-            end = uid.Length;
-        return uid.Substring(start, end - start);
     }
 
     private FishAISystem TakeUnboundFish(FishManifest manifest)
