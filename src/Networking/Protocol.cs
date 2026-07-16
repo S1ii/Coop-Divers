@@ -236,9 +236,13 @@ internal readonly record struct BossState(
     float X,
     float Y,
     float Z,
+    int AnimationHash,
+    float AnimationTime,
     byte Flags);
 internal readonly record struct ManagerEvent(
     uint Revision,
+    uint SceneId,
+    uint HostTick,
     byte Domain,
     byte Action,
     int Value,
@@ -254,7 +258,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 26;
+    private const byte Version = 27;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -265,8 +269,8 @@ internal static class Protocol
     private const int FishSnapshotEntrySize = 37;
     private const int FishDamageRequestSize = HeaderSize + 20;
     private const int BossDamageRequestSize = HeaderSize + 20;
-    private const int BossStateSize = HeaderSize + 37;
-    private const int ManagerEventSize = HeaderSize + 14;
+    private const int BossStateSize = HeaderSize + 45;
+    private const int ManagerEventSize = HeaderSize + 22;
     private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 8;
     private const int FishRemovedSize = HeaderSize + 8;
@@ -783,7 +787,9 @@ internal static class Protocol
         WriteSingle(packet.AsSpan(HeaderSize + 24), state.X);
         WriteSingle(packet.AsSpan(HeaderSize + 28), state.Y);
         WriteSingle(packet.AsSpan(HeaderSize + 32), state.Z);
-        packet[HeaderSize + 36] = state.Flags;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 36), state.AnimationHash);
+        WriteSingle(packet.AsSpan(HeaderSize + 40), state.AnimationTime);
+        packet[HeaderSize + 44] = state.Flags;
         return packet;
     }
 
@@ -807,7 +813,9 @@ internal static class Protocol
             ReadSingle(packet.Slice(HeaderSize + 24)),
             ReadSingle(packet.Slice(HeaderSize + 28)),
             ReadSingle(packet.Slice(HeaderSize + 32)),
-            packet[HeaderSize + 36]);
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 36)),
+            ReadSingle(packet.Slice(HeaderSize + 40)),
+            packet[HeaderSize + 44]);
         if (!IsValidBossState(state))
         {
             state = default;
@@ -822,6 +830,7 @@ internal static class Protocol
         state.CurrentHp <= state.MaxHp && float.IsFinite(state.X) && float.IsFinite(state.Y) &&
         float.IsFinite(state.Z) && MathF.Abs(state.X) <= 1_000_000f &&
         MathF.Abs(state.Y) <= 1_000_000f && MathF.Abs(state.Z) <= 1_000_000f &&
+        float.IsFinite(state.AnimationTime) && state.AnimationTime is >= 0f and <= 1f &&
         state.Flags <= 1;
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
@@ -831,10 +840,12 @@ internal static class Protocol
         var packet = new byte[ManagerEventSize];
         WriteHeader(packet, PacketType.ManagerEvent, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
-        packet[HeaderSize + 4] = state.Domain;
-        packet[HeaderSize + 5] = state.Action;
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 6), state.Value);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), state.Context);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.HostTick);
+        packet[HeaderSize + 12] = state.Domain;
+        packet[HeaderSize + 13] = state.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), state.Value);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 18), state.Context);
         return packet;
     }
 
@@ -850,11 +861,57 @@ internal static class Protocol
             return false;
         state = new ManagerEvent(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            packet[HeaderSize + 4],
-            packet[HeaderSize + 5],
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 6)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10)));
-        return state.Domain is > 0 and <= 16 && state.Action is > 0 and <= 32;
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            packet[HeaderSize + 12],
+            packet[HeaderSize + 13],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 18)));
+        return IsValidManagerEvent(state);
+    }
+
+    private static bool IsValidManagerEvent(ManagerEvent state)
+    {
+        var pairIsValid = state.Domain switch
+        {
+            1 or 2 => state.Action is 1 or 2 or 3,
+            3 => state.Action is 4 or 5 or 6 or 7,
+            4 or 5 or 6 or 7 or 9 => state.Action == 8,
+            8 => state.Action is 9 or 10 or 11,
+            10 => state.Action == 12,
+            11 => state.Action is >= 13 and <= 20 or >= 28 and <= 30,
+            12 => state.Action is 21 or 22 or 23,
+            13 => state.Action is 24 or 25 or 31,
+            14 => state.Action == 26,
+            15 => state.Action == 27,
+            _ => false
+        };
+        if (!pairIsValid)
+            return false;
+        if (state.Domain is 4 or 5 or 10 && state.Value is not 0 and not 1)
+            return false;
+        if (state.Domain == 12 && state.Action == 22 && state.Value is < -1 or > 8)
+            return false;
+        if (state.Domain == 12 && state.Action == 23 &&
+            state.Value is not (>= 0 and <= 3) and not 100)
+            return false;
+        if (state.Domain == 13)
+        {
+            if (state.Value is 0 or int.MinValue)
+                return false;
+            if (state.Action != 31 && state.Value < 0)
+                return false;
+            if (state.Action == 31 &&
+                BitConverter.Int32BitsToSingle(state.Context) is not (>= 0f and <= 86_400f))
+                return false;
+        }
+        if (state.Domain == 14 && state.Value is not (>= 0 and <= 4) and not 99)
+            return false;
+        if (state.Domain == 15 &&
+            (state.Value is < 0 or > 64 ||
+             BitConverter.Int32BitsToSingle(state.Context) is not (>= 0f and <= 3_600f)))
+            return false;
+        return true;
     }
 
     internal static byte[] EncodeSushiResultState(uint sequence, SushiResultState state)
@@ -2006,7 +2063,8 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted an invalid boss ID");
 
         var expectedBossState = new BossState(
-            fishSceneId, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f, 0);
+            fishSceneId, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f,
+            0x12345678, 0.25f, 0);
         var bossStatePacket = EncodeBossState(46, expectedBossState);
         if (!TryDecodeBossState(bossStatePacket, out sequence, out var actualBossState) ||
             sequence != 46 || actualBossState != expectedBossState)
@@ -2014,15 +2072,30 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 16), 1001);
         if (TryDecodeBossState(bossStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted boss HP above maximum");
+        bossStatePacket = EncodeBossState(46, expectedBossState);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            bossStatePacket.AsSpan(HeaderSize + 40), unchecked((int)0x7fc00000));
+        if (TryDecodeBossState(bossStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid boss animation time");
 
-        var expectedManagerEvent = new ManagerEvent(3, 2, 4, 1, 0x12345678);
+        var expectedManagerEvent = new ManagerEvent(
+            3, fishSceneId, 1234, 3, 4, 1, 0x12345678);
         var managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
         if (!TryDecodeManagerEvent(managerEventPacket, out sequence, out var managerEvent) ||
             sequence != 47 || managerEvent != expectedManagerEvent)
             throw new InvalidOperationException("Manager event round-trip failed");
-        managerEventPacket[HeaderSize + 4] = 0;
+        managerEventPacket[HeaderSize + 12] = 0;
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid manager domain");
+        managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
+        managerEventPacket[HeaderSize + 13] = 32;
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid manager action");
+        managerEventPacket = EncodeManagerEvent(47,
+            new ManagerEvent(3, fishSceneId, 1234, 15, 27, 1,
+                unchecked((int)0x7fc00000)));
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid race time");
 
         var expectedSushiResult = new SushiResultState(5, 1200, 300, 80, 21, 19, 4.5f);
         var sushiResultPacket = EncodeSushiResultState(48, expectedSushiResult);

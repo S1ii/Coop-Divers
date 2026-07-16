@@ -157,7 +157,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
-        _managerEventReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+        _managerEventReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
@@ -708,6 +708,15 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void PublishSushiResult() =>
         _managerEventReplicator?.PublishSushiResult(Role, _session);
+
+    internal void ObserveTimeline(TimelineManager.TPlayState state, int tid, bool success)
+    {
+        if (success)
+            _managerEventReplicator?.ObserveTimeline(Role, _session, state, tid);
+    }
+
+    internal bool AllowTimelineControl() =>
+        _managerEventReplicator?.AllowTimelineControl(Role, _session) ?? true;
 
     private void ReturnToOnlineRoom(string reason)
     {

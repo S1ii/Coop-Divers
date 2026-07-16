@@ -18,6 +18,7 @@ internal sealed class BossReplicator
         internal int OriginalHp;
         internal int OriginalMaxHp;
         internal Vector3 OriginalPosition;
+        internal Animator Animator;
     }
 
     private readonly ManualLogSource _log;
@@ -159,7 +160,8 @@ internal sealed class BossReplicator
                 WasEnabled = boss.enabled,
                 OriginalHp = boss.CurrentBossHP,
                 OriginalMaxHp = boss.bossMaxHP,
-                OriginalPosition = boss.transform.position
+                OriginalPosition = boss.transform.position,
+                Animator = boss.GetComponentInChildren<Animator>(true)
             };
             boss.enabled = false;
             _log.LogInfo($"Network boss bound: {boss.GetType().Name}; id={id:X8}");
@@ -206,9 +208,21 @@ internal sealed class BossReplicator
             var position = boss.transform.position;
             var maxHp = Math.Max(1, boss.bossMaxHP);
             var hp = Math.Clamp(boss.CurrentBossHP, 0, maxHp);
+            var animator = boss.GetComponentInChildren<Animator>(true);
+            var animationHash = 0;
+            var animationTime = 0f;
+            if (animator != null && animator.layerCount > 0)
+            {
+                var animation = animator.IsInTransition(0)
+                    ? animator.GetNextAnimatorStateInfo(0)
+                    : animator.GetCurrentAnimatorStateInfo(0);
+                animationHash = animation.fullPathHash;
+                animationTime = Mathf.Repeat(animation.normalizedTime, 1f);
+            }
             var state = new BossState(
                 sceneId, _tick, pair.Key, Math.Max(0, boss.fishID), hp, maxHp,
                 position.x, position.y, position.z,
+                animationHash, animationTime,
                 hp == 0 || boss.IsDeadBoss() ? (byte)1 : (byte)0);
             _lastHostStates.TryGetValue(pair.Key, out var previous);
             _lastHostKeyframes.TryGetValue(pair.Key, out var lastKeyframe);
@@ -231,6 +245,7 @@ internal sealed class BossReplicator
             target.Position = new Vector3(state.X, state.Y, state.Z);
             target.Boss.bossMaxHP = state.MaxHp;
             target.Boss.CurrentBossHP = state.CurrentHp;
+            ApplyAnimation(target.Animator, state.AnimationHash, state.AnimationTime);
         }
         foreach (var id in _clientTargets.Keys)
             _pendingClientStates.Remove(id);
@@ -245,8 +260,26 @@ internal sealed class BossReplicator
     private static bool Same(BossState left, BossState right) =>
         left.BossId == right.BossId && left.FishId == right.FishId &&
         left.CurrentHp == right.CurrentHp && left.MaxHp == right.MaxHp && left.Flags == right.Flags &&
+        left.AnimationHash == right.AnimationHash &&
         MathF.Abs(left.X - right.X) < 0.02f && MathF.Abs(left.Y - right.Y) < 0.02f &&
         MathF.Abs(left.Z - right.Z) < 0.02f;
+
+    private static void ApplyAnimation(Animator animator, int hash, float time)
+    {
+        if (animator == null || hash == 0 || animator.layerCount == 0)
+            return;
+        var current = animator.GetCurrentAnimatorStateInfo(0);
+        if (current.fullPathHash == hash &&
+            AnimationDistance(Mathf.Repeat(current.normalizedTime, 1f), time) < 0.2f)
+            return;
+        animator.Play(hash, 0, time);
+    }
+
+    private static float AnimationDistance(float left, float right)
+    {
+        var difference = MathF.Abs(left - right);
+        return MathF.Min(difference, 1f - difference);
+    }
 
     private static bool InRange(Vector3 boss, PlayerSnapshot player, float maxSquaredDistance)
     {

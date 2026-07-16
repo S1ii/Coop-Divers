@@ -5,13 +5,14 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DaveTheDiverMP</AssemblyName>
-    <Version>0.15.0</Version>
+    <Version>0.16.0</Version>
     <Deterministic>true</Deterministic>
     <GameInstallPath Condition="'$(GameInstallPath)' == ''">..\DAVE THE DIVER</GameInstallPath>
     <DeployPlugin Condition="'$(DeployPlugin)' == ''">false</DeployPlugin>
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="references\**\*.cs" />
     <Reference Include="0Harmony" HintPath="$(GameInstallPath)\BepInEx\core\0Harmony.dll" Private="false" />
     <Reference Include="BepInEx.Core" HintPath="$(GameInstallPath)\BepInEx\core\BepInEx.Core.dll" Private="false" />
     <Reference Include="BepInEx.Unity.Common" HintPath="$(GameInstallPath)\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
@@ -25,6 +26,8 @@
     <Reference Include="InputSystemWrapper" HintPath="$(GameInstallPath)\BepInEx\interop\InputSystemWrapper.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="$(GameInstallPath)\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="UnityEngine.AnimationModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.AnimationModule.dll" Private="false" />
+    <Reference Include="UnityEngine.DirectorModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.DirectorModule.dll" Private="false" />
     <Reference Include="UnityEngine.Physics2DModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.Physics2DModule.dll" Private="false" />
     <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.InputLegacyModule.dll" Private="false" />
     <Reference Include="UnityEngine.IMGUIModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.IMGUIModule.dll" Private="false" />

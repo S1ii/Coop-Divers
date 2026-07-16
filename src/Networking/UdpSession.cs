@@ -62,6 +62,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<SushiResultState> _sushiResultStates = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
+    private readonly Queue<byte[]> _reliableBacklog = new();
     private readonly HashSet<uint> _receivedReliable = new();
     private readonly Queue<uint> _receivedReliableOrder = new();
     private UdpClient _udp;
@@ -109,7 +110,9 @@ internal sealed class UdpSession : IDisposable
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
-    internal int ReliableCapacityRemaining => Math.Max(0, 256 - _pendingReliable.Count);
+    internal int ReliableCapacityRemaining => _reliableBacklog.Count == 0
+        ? Math.Max(0, 256 - _pendingReliable.Count)
+        : 0;
     internal bool SceneMatches(uint sceneId) =>
         _connected && _hasRemoteScene && _remoteSceneId == sceneId;
 
@@ -436,10 +439,9 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakeBossState(out BossState state) =>
         _bossStates.TryDequeue(out state);
 
-    internal void SendManagerEvent(ManagerEvent state)
+    internal bool SendManagerEvent(ManagerEvent state)
     {
-        if (_connected)
-            SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
+        return _connected && SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
     }
 
     internal bool TryTakeManagerEvent(out ManagerEvent state) =>
@@ -535,6 +537,7 @@ internal sealed class UdpSession : IDisposable
         while (_incoming.TryDequeue(out var received))
             Handle(received, now);
 
+        FlushReliableBacklog();
         RetryReliable(now);
 
         if (_connected && _nextTrafficLog == 0f)
@@ -545,7 +548,7 @@ internal sealed class UdpSession : IDisposable
             _log.LogDebug(
                 $"Network traffic: tx={_sentBytes / 10f:F0} B/s ({_sentPackets / 10f:F1} pps), " +
                 $"rx={_receivedBytes / 10f:F0} B/s ({_receivedPackets / 10f:F1} pps), " +
-                $"reliable={_pendingReliable.Count}");
+                $"reliable={_pendingReliable.Count}, backlog={_reliableBacklog.Count}");
             _sentBytes = 0;
             _receivedBytes = 0;
             _sentPackets = 0;
@@ -1156,11 +1159,35 @@ internal sealed class UdpSession : IDisposable
 
     private bool SendReliable(byte[] packet)
     {
-        if (!Protocol.TryDecode(packet, out _, out var sequence) || _pendingReliable.Count >= 256)
-        {
-            _log.LogWarning("Network reliable queue is full");
+        if (!Protocol.TryDecode(packet, out _, out var sequence))
             return false;
+        if (_reliableBacklog.Count > 0 || _pendingReliable.Count >= 256)
+        {
+            if (_reliableBacklog.Count >= 2048)
+            {
+                _log.LogWarning("Network reliable backlog is full");
+                return false;
+            }
+            _reliableBacklog.Enqueue(packet);
+            return true;
         }
+        TrackReliable(packet, sequence);
+        return true;
+    }
+
+    private void FlushReliableBacklog()
+    {
+        while (_connected && _pendingReliable.Count < 256 &&
+               _reliableBacklog.Count > 0)
+        {
+            var packet = _reliableBacklog.Dequeue();
+            if (Protocol.TryDecode(packet, out _, out var sequence))
+                TrackReliable(packet, sequence);
+        }
+    }
+
+    private void TrackReliable(byte[] packet, uint sequence)
+    {
         _pendingReliable[sequence] = new PendingReliable
         {
             Packet = packet,
@@ -1168,7 +1195,6 @@ internal sealed class UdpSession : IDisposable
             RetryDelay = 0.1f
         };
         Send(packet);
-        return true;
     }
 
     private void RetryReliable(float now)
@@ -1303,6 +1329,7 @@ internal sealed class UdpSession : IDisposable
         _receivedPackets = 0;
         _nextTrafficLog = 0f;
         _pendingReliable.Clear();
+        _reliableBacklog.Clear();
         _receivedReliable.Clear();
         _receivedReliableOrder.Clear();
         while (_roomReady.TryDequeue(out _))

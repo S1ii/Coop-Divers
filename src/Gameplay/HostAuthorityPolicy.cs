@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Reflection;
+using DR.Save;
 using HarmonyLib;
 
 namespace DaveTheDiverMP;
@@ -138,6 +139,31 @@ internal static class StorySaveAuthorityPatch
     }
 
     private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
+}
+
+[HarmonyPatch]
+internal static class GameSaveAuthorityPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var name in new[]
+                 {
+                     nameof(SaveSystem.SaveGameData),
+                     nameof(SaveSystem.TrySaveGameData),
+                     nameof(SaveSystem.SaveGameDataInSlot)
+                 })
+            foreach (var method in AccessTools.GetDeclaredMethods(typeof(SaveSystem)))
+                if (method.Name == name && method.ReturnType == typeof(bool))
+                    yield return method;
+    }
+
+    private static bool Prefix(ref bool __result)
+    {
+        if (HostAuthorityPolicy.CanMutatePersistentProgress)
+            return true;
+        __result = true;
+        return false;
+    }
 }
 
 [HarmonyPatch]
