@@ -401,6 +401,9 @@ internal sealed class DiveCoordinator
     }
 
     internal bool IsClientSpectating => _clientDead;
+    internal bool HostDead => _hostDead;
+    internal bool ClientDead => _clientDead;
+    internal bool AnyPlayerDead => _hostDead || _clientDead;
 
     private void UpdateClientSpectator(Transform remoteAvatar)
     {

@@ -233,7 +233,7 @@ internal sealed class RemoteCatchLedger
             return false;
         }
 
-        if (failure != null)
+        if (failure != null && capture.Entries.Count == 0)
         {
             _log.LogWarning($"Remote fish capture failed: {failure.Message}");
             return false;
@@ -242,6 +242,8 @@ internal sealed class RemoteCatchLedger
         _entries.AddRange(capture.Entries);
         AddWeight(capture.Entries);
         _acceptedSources.Add(sourceId);
+        if (failure != null)
+            _log.LogWarning($"Remote fish kept partial loot: {failure.Message}");
         return true;
     }
 

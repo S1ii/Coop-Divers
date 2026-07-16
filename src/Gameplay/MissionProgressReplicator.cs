@@ -6,102 +6,202 @@ namespace DaveTheDiverMP;
 
 internal sealed class MissionProgressReplicator
 {
-    private const float SendInterval = 0.25f;
+    private const float ScanInterval = 0.25f;
+    private const float KeyframeInterval = 5f;
     private readonly ManualLogSource _log;
-    private float _nextHostSend;
-    private uint _revision;
-    private uint _lastRevision;
+    private readonly Dictionary<int, MissionState> _hostStates = new();
+    private readonly Dictionary<int, uint> _clientRevisions = new();
+    private readonly Dictionary<int, MissionState> _clientOriginals = new();
+    private float _nextHostScan;
+    private float _nextHostKeyframe;
+    private bool _wasConnected;
 
     internal MissionProgressReplicator(ManualLogSource log) => _log = log;
 
     internal void Update(SessionRole role, UdpSession session, float now)
     {
-        if (session == null || !session.Connected)
+        var connected = session != null && session.Connected;
+        if (!connected)
+        {
+            if (_wasConnected)
+                ClearNetworkState();
+            _wasConnected = false;
             return;
+        }
+        if (!_wasConnected)
+        {
+            _hostStates.Clear();
+            _clientRevisions.Clear();
+            _nextHostScan = 0f;
+            _nextHostKeyframe = now + KeyframeInterval;
+        }
+        _wasConnected = true;
+
         if (role == SessionRole.Host)
         {
-            if (now >= _nextHostSend)
+            if (now >= _nextHostScan)
             {
-                _nextHostSend = now + SendInterval;
-                session.SendMissionState(new MissionState(NextRevision(), ReadActiveConditions()));
+                _nextHostScan = now + ScanInterval;
+                PublishHostChanges(session, now >= _nextHostKeyframe);
+                if (now >= _nextHostKeyframe)
+                    _nextHostKeyframe = now + KeyframeInterval;
             }
             return;
         }
         if (role != SessionRole.Client)
             return;
+
         while (session.TryTakeMissionState(out var state))
         {
-            if (!IsNewer(state.Revision, _lastRevision))
+            _clientRevisions.TryGetValue(state.MissionId, out var previous);
+            if (!IsNewer(state.Revision, previous))
                 continue;
-            _lastRevision = state.Revision;
-            Apply(state);
+            _clientRevisions[state.MissionId] = state.Revision;
+            ApplyClientState(state, preserveOriginal: true);
         }
     }
 
     internal void Clear()
     {
-        _nextHostSend = 0f;
-        _revision = 0;
-        _lastRevision = 0;
+        ClearNetworkState();
+        _wasConnected = false;
     }
 
-    private MissionConditionState[] ReadActiveConditions()
+    private void PublishHostChanges(UdpSession session, bool keyframe)
     {
-        var values = new Dictionary<int, int>();
+        var manager = MissionManager.Instance;
+        if (manager == null)
+            return;
         try
         {
-            var manager = MissionManager.Instance;
-            if (manager == null)
-                return Array.Empty<MissionConditionState>();
-            foreach (var mission in manager.InProgressList)
+            foreach (var mission in manager.MissionDictionary.Values)
             {
-                var task = mission?.CurrentTask;
-                if (task == null)
+                if (mission == null || mission.TID <= 0)
                     continue;
-                foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
-                {
-                    if (condition != null && condition.IsShowCount && condition.NowCount >= 0 &&
-                        (values.ContainsKey(condition.TID) ||
-                         values.Count < Protocol.MaxMissionConditions))
-                        values[condition.TID] = condition.NowCount;
-                }
+                _hostStates.TryGetValue(mission.TID, out var previous);
+                if (mission.State == global::MissionState.NotStarted && previous.MissionId == 0)
+                    continue;
+                var current = Capture(mission, previous.Revision);
+                if (!keyframe && SameContent(previous, current))
+                    continue;
+                current = current with { Revision = NextRevision(previous.Revision) };
+                _hostStates[mission.TID] = current;
+                session.SendMissionState(current);
             }
         }
         catch (Exception exception)
         {
             _log.LogWarning($"Mission state read failed: {exception.Message}");
-            return Array.Empty<MissionConditionState>();
         }
-
-        var conditions = new List<MissionConditionState>(values.Count);
-        foreach (var pair in values)
-            conditions.Add(new MissionConditionState(pair.Key, pair.Value));
-        conditions.Sort((left, right) => left.Id.CompareTo(right.Id));
-        return conditions.ToArray();
     }
 
-    private static void Apply(MissionState state)
+    private MissionState Capture(MissionData mission, uint revision)
     {
-        if (state.Conditions.Length == 0)
-            return;
-        var values = new Dictionary<int, int>(state.Conditions.Length);
-        foreach (var condition in state.Conditions)
-            values[condition.Id] = condition.Count;
-        var manager = MissionManager.Instance;
-        if (manager == null)
-            return;
-        foreach (var mission in manager.InProgressList)
+        var task = mission.CurrentTask;
+        var conditions = new List<MissionConditionState>();
+        if (task != null)
         {
-            var task = mission?.CurrentTask;
-            if (task == null)
-                continue;
             foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
-                if (condition != null && values.TryGetValue(condition.TID, out var count))
-                    condition.NowCount = count;
+            {
+                if (condition == null || condition.TID <= 0 || condition.NowCount < 0 ||
+                    conditions.Count >= Protocol.MaxMissionConditions)
+                    continue;
+                conditions.Add(new MissionConditionState(condition.TID, condition.NowCount));
+            }
+        }
+        conditions.Sort((left, right) => left.Id.CompareTo(right.Id));
+        return new MissionState(
+            revision,
+            mission.TID,
+            Math.Max(0, mission.Progress),
+            (byte)mission.State,
+            task?.TID ?? 0,
+            conditions.ToArray());
+    }
+
+    private void ApplyClientState(MissionState state, bool preserveOriginal)
+    {
+        try
+        {
+            var manager = MissionManager.Instance;
+            var mission = manager?.GetMissionData(state.MissionId);
+            if (mission == null)
+                return;
+            if (preserveOriginal && !_clientOriginals.ContainsKey(state.MissionId))
+                _clientOriginals[state.MissionId] = Capture(mission, 1);
+
+            mission.Progress = state.Progress;
+            mission.ForceUpdateCurrenTask();
+            mission.State = (global::MissionState)state.State;
+            var task = mission.CurrentTask;
+            if (task != null)
+            {
+                var values = new Dictionary<int, int>(state.Conditions.Length);
+                foreach (var condition in state.Conditions)
+                    values[condition.Id] = condition.Count;
+                foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
+                    if (condition != null && values.TryGetValue(condition.TID, out var count))
+                        condition.NowCount = count;
+            }
+            SetMembership(manager.InProgressList, mission,
+                mission.State == global::MissionState.InProgress);
+            SetMembership(manager.NewMissionList, mission,
+                mission.State == global::MissionState.Accept);
+            if (mission.State is global::MissionState.Clear or global::MissionState.Done)
+                manager.ClearedSet.Add(mission.TID);
+            else
+                manager.ClearedSet.Remove(mission.TID);
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning($"Mission state apply failed: {exception.Message}");
         }
     }
 
-    private uint NextRevision() => _revision = _revision == uint.MaxValue ? 1u : _revision + 1u;
+    private void RestoreClientState()
+    {
+        foreach (var state in _clientOriginals.Values)
+            ApplyClientState(state, preserveOriginal: false);
+        _clientOriginals.Clear();
+    }
+
+    private void ClearNetworkState()
+    {
+        RestoreClientState();
+        _hostStates.Clear();
+        _clientRevisions.Clear();
+        _nextHostScan = 0f;
+        _nextHostKeyframe = 0f;
+    }
+
+    private static void SetMembership(
+        Il2CppSystem.Collections.Generic.List<MissionData> list,
+        MissionData mission,
+        bool present)
+    {
+        if (present)
+        {
+            if (!list.Contains(mission))
+                list.Add(mission);
+        }
+        else
+            list.Remove(mission);
+    }
+
+    private static bool SameContent(MissionState left, MissionState right)
+    {
+        if (left.MissionId != right.MissionId || left.Progress != right.Progress ||
+            left.State != right.State || left.CurrentTaskId != right.CurrentTaskId ||
+            left.Conditions == null || right.Conditions == null ||
+            left.Conditions.Length != right.Conditions.Length)
+            return false;
+        for (var index = 0; index < left.Conditions.Length; index++)
+            if (left.Conditions[index] != right.Conditions[index])
+                return false;
+        return true;
+    }
+
+    private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;

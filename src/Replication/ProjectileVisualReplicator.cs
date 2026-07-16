@@ -17,7 +17,9 @@ internal sealed class ProjectileVisualReplicator
     private readonly Dictionary<int, Component> _local = new();
     private readonly Dictionary<int, RemoteProjectile> _remote = new();
     private readonly Dictionary<uint, Sprite> _sprites = new();
+    private readonly List<int> _staleIds = new();
     private Material _ropeMaterial;
+    private float _nextSend;
 
     internal void Register(Component projectile)
     {
@@ -32,18 +34,22 @@ internal sealed class ProjectileVisualReplicator
 
         if (session.SceneMatches(sceneId))
         {
-            var staleLocal = new List<int>();
-            foreach (var pair in _local)
+            if (now >= _nextSend)
             {
-                if (!TryCapture(sceneId, pair.Key, pair.Value, out var state))
+                _nextSend = now + 1f / 30f;
+                _staleIds.Clear();
+                foreach (var pair in _local)
                 {
-                    staleLocal.Add(pair.Key);
-                    continue;
+                    if (!TryCapture(sceneId, pair.Key, pair.Value, out var state))
+                    {
+                        _staleIds.Add(pair.Key);
+                        continue;
+                    }
+                    session.SendProjectileVisualState(state);
                 }
-                session.SendProjectileVisualState(state);
+                foreach (var id in _staleIds)
+                    _local.Remove(id);
             }
-            foreach (var id in staleLocal)
-                _local.Remove(id);
 
             while (session.TryTakeProjectileVisualState(out var state))
             {
@@ -52,22 +58,24 @@ internal sealed class ProjectileVisualReplicator
             }
         }
 
-        var staleRemote = new List<int>();
+        _staleIds.Clear();
         foreach (var pair in _remote)
         {
             if (now - pair.Value.LastSeen > 0.35f)
             {
                 UnityEngine.Object.Destroy(pair.Value.Renderer.gameObject);
-                staleRemote.Add(pair.Key);
+                _staleIds.Add(pair.Key);
             }
         }
-        foreach (var id in staleRemote)
+        foreach (var id in _staleIds)
             _remote.Remove(id);
     }
 
     internal void Clear()
     {
         _local.Clear();
+        _nextSend = 0f;
+        _staleIds.Clear();
         foreach (var remote in _remote.Values)
             if (remote.Renderer != null)
                 UnityEngine.Object.Destroy(remote.Renderer.gameObject);

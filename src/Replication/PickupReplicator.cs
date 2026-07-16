@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
@@ -12,9 +13,12 @@ internal sealed class PickupReplicator
     private readonly RemoteCatchLedger _remoteCatch;
     private readonly Dictionary<uint, PickupInstanceItem> _items = new();
     private readonly Dictionary<uint, PickupRemoved> _pending = new();
+    private readonly Dictionary<uint, PickupRemoved> _hostPending = new();
+    private readonly HashSet<uint> _approvedClientPickups = new();
     private float _nextScan;
     private int _lastItemCount = -1;
     private int _lastDuplicateCount = -1;
+    private PlayerCharacter _clientPlayer;
 
     internal PickupReplicator(ManualLogSource log, RemoteCatchLedger remoteCatch)
     {
@@ -39,14 +43,20 @@ internal sealed class PickupReplicator
             }
             _items.Clear();
             _pending.Clear();
+            _hostPending.Clear();
+            _approvedClientPickups.Clear();
+            _clientPlayer = null;
             return;
         }
+        if (role == SessionRole.Client)
+            _clientPlayer = hostPlayer;
 
         if (now >= _nextScan)
             Refresh(sceneId, now);
 
         if (role == SessionRole.Host)
         {
+            FlushHostPending(session);
             while (session.TryTakePickupRemoved(out _))
             {
             }
@@ -63,17 +73,20 @@ internal sealed class PickupReplicator
         {
             if (removed.SceneId != sceneId)
                 continue;
-            if (!TryApply(removed))
+            if (!TryApply(removed, _clientPlayer))
                 _pending[removed.WorldId] = removed;
         }
     }
 
-    internal void RequestPickup(UdpSession session, uint sceneId, PickupInstanceItem item)
+    internal bool RequestPickup(UdpSession session, uint sceneId, PickupInstanceItem item)
     {
         if (item == null)
-            return;
-        session.SendPickupRequest(new PickupRemoved(
-            sceneId, WorldId(sceneId, item), item.GetItemID()));
+            return false;
+        var worldId = WorldId(sceneId, item);
+        if (_approvedClientPickups.Contains(worldId))
+            return true;
+        session.SendPickupRequest(new PickupRemoved(sceneId, worldId, item.GetItemID()));
+        return false;
     }
 
     internal void OnHostDestroyed(UdpSession session, uint sceneId, PickupInstanceItem item)
@@ -82,16 +95,21 @@ internal sealed class PickupReplicator
             return;
         var worldId = WorldId(sceneId, item);
         _items.Remove(worldId);
-        session.SendPickupRemoved(new PickupRemoved(sceneId, worldId, item.GetItemID()));
+        var removed = new PickupRemoved(sceneId, worldId, item.GetItemID());
+        if (!session.SendPickupRemoved(removed))
+            _hostPending[worldId] = removed;
     }
 
     internal void Clear()
     {
         _items.Clear();
         _pending.Clear();
+        _hostPending.Clear();
+        _approvedClientPickups.Clear();
         _nextScan = 0f;
         _lastItemCount = -1;
         _lastDuplicateCount = -1;
+        _clientPlayer = null;
     }
 
     private void Refresh(uint sceneId, float now)
@@ -122,19 +140,54 @@ internal sealed class PickupReplicator
         var applied = new List<uint>();
         foreach (var pair in _pending)
         {
-            if (TryApply(pair.Value))
+            if (TryApply(pair.Value, _clientPlayer))
                 applied.Add(pair.Key);
         }
         foreach (var worldId in applied)
             _pending.Remove(worldId);
     }
 
-    private bool TryApply(PickupRemoved removed)
+    private void FlushHostPending(UdpSession session)
+    {
+        if (_hostPending.Count == 0 || session.ReliableCapacityRemaining == 0)
+            return;
+        var sent = new List<uint>();
+        foreach (var pair in _hostPending)
+        {
+            if (!session.SendPickupRemoved(pair.Value))
+                break;
+            sent.Add(pair.Key);
+        }
+        foreach (var worldId in sent)
+            _hostPending.Remove(worldId);
+    }
+
+    private bool TryApply(PickupRemoved removed, PlayerCharacter player)
     {
         if (!_items.TryGetValue(removed.WorldId, out var item) ||
             item == null || item.GetItemID() != removed.ItemId)
             return false;
         _items.Remove(removed.WorldId);
+        if (IsPersonalEquipment(item))
+        {
+            if (player == null)
+                return false;
+            _approvedClientPickups.Add(removed.WorldId);
+            try
+            {
+                item.SuccessInteract(player);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning($"Network equipment apply failed: {exception.Message}");
+                return false;
+            }
+            finally
+            {
+                _approvedClientPickups.Remove(removed.WorldId);
+            }
+        }
         item.DestroyItem();
         return true;
     }
@@ -158,13 +211,6 @@ internal sealed class PickupReplicator
         }
         if (item == null || item.GetItemID() != request.ItemId)
             return;
-        if (item.GetType() != typeof(PickupInstanceItem))
-        {
-            _log.LogWarning(
-                $"Network pickup deferred: special item type {item.GetType().Name}");
-            return;
-        }
-
         var itemPosition = item.transform.position;
         var dx = itemPosition.x - remotePlayer.X;
         var dy = itemPosition.y - remotePlayer.Y;
@@ -181,10 +227,23 @@ internal sealed class PickupReplicator
             _log.LogWarning($"Network pickup rejected: unknown item {itemId}");
             return;
         }
-        if (integrated.IntegratedType != (int)IntegratedItemType.Loot ||
-            integrated.IsEquipmentType() || item.IsUpgradeKit())
+        var personalEquipment = integrated.IsEquipmentType() || item.IsUpgradeKit();
+        if (personalEquipment)
         {
-            _log.LogWarning($"Network pickup deferred: personal equipment {itemId}");
+            item.DestroyItem();
+            _items.Remove(request.WorldId);
+            _log.LogInfo($"Network personal equipment accepted: {itemId}");
+            return;
+        }
+        if (item.GetType() != typeof(PickupInstanceItem))
+        {
+            _log.LogWarning(
+                $"Network pickup rejected: unsupported item type {item.GetType().Name}");
+            return;
+        }
+        if (integrated.IntegratedType != (int)IntegratedItemType.Loot)
+        {
+            _log.LogWarning($"Network pickup rejected: unsupported integrated item {itemId}");
             return;
         }
 
@@ -218,28 +277,12 @@ internal sealed class PickupReplicator
     }
 
     private static uint WorldId(uint sceneId, PickupInstanceItem item)
-    {
-        var hash = Mix(Mix(2166136261u, unchecked((int)sceneId)), item.GetItemID());
-        for (var current = item.transform; current != null; current = current.parent)
-        {
-            hash = Mix(hash, unchecked((int)Protocol.SceneId(current.name)));
-            if (current.parent != null)
-                hash = Mix(hash, current.GetSiblingIndex());
-        }
-        return hash;
-    }
+        => WorldObjectId.For(sceneId, item, item.GetItemID());
 
-    private static uint Mix(uint hash, int value)
+    private static bool IsPersonalEquipment(PickupInstanceItem item)
     {
-        unchecked
-        {
-            for (var shift = 0; shift < 32; shift += 8)
-            {
-                hash ^= (byte)(value >> shift);
-                hash *= 16777619u;
-            }
-            return hash;
-        }
+        var integrated = DataManager.Instance?.GetIntegratedItem(item.GetItemID());
+        return integrated != null && (integrated.IsEquipmentType() || item.IsUpgradeKit());
     }
 }
 
@@ -250,9 +293,22 @@ internal static class PickupDestroyPatch
         ProbeBehaviour.Instance?.OnPickupDestroyed(__instance);
 }
 
-[HarmonyPatch(typeof(PickupInstanceItem), nameof(PickupInstanceItem.SuccessInteract))]
+[HarmonyPatch]
 internal static class PickupInteractPatch
 {
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var type in AccessTools.GetTypesFromAssembly(typeof(PickupInstanceItem).Assembly))
+        {
+            if (type != typeof(PickupInstanceItem) && !type.IsSubclassOf(typeof(PickupInstanceItem)))
+                continue;
+            var method = AccessTools.DeclaredMethod(
+                type, nameof(PickupInstanceItem.SuccessInteract), new[] { typeof(BaseCharacter) });
+            if (method != null)
+                yield return method;
+        }
+    }
+
     private static bool Prefix(PickupInstanceItem __instance) =>
         ProbeBehaviour.Instance?.OnPickupInteract(__instance) ?? true;
 }

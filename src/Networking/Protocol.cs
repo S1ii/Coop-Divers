@@ -9,11 +9,10 @@ internal enum PacketType : byte
 {
     Hello = 1,
     HelloAck = 2,
-    Heartbeat = 3,
     Disconnect = 4,
     PlayerSnapshot = 5,
     SceneState = 6,
-    FishSnapshot = 7,
+    FishSnapshotBatch = 7,
     PickupRemoved = 8,
     PickupRequest = 9,
     SceneTransition = 10,
@@ -26,8 +25,6 @@ internal enum PacketType : byte
     IngredientsDelta = 17,
     RoomReady = 18,
     RoomState = 19,
-    CampaignSnapshotChunk = 20,
-    CampaignSnapshotAck = 21,
     DiveReady = 22,
     DiveState = 23,
     BoatDecoState = 24,
@@ -42,13 +39,11 @@ internal enum PacketType : byte
     DiveLootRequest = 33,
     DiveResultEntry = 34,
     DiveResultState = 35,
-    MissionState = 36
-}
-
-internal enum TravelTarget : byte
-{
-    SushiBar = 1,
-    Lobby = 2
+    MissionState = 36,
+    WorldFlagRequest = 37,
+    WorldFlagState = 38,
+    BossDamageRequest = 39,
+    BossState = 40
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -102,12 +97,15 @@ internal readonly record struct ProjectileVisualState(
 
 internal readonly record struct FishSnapshot(
     uint SceneId,
+    uint Tick,
     int Id,
     int FishDataTID,
     float X,
     float Y,
     float Z,
     float Rotation,
+    float VelocityX,
+    float VelocityY,
     float Hp,
     byte Flags);
 
@@ -177,16 +175,24 @@ internal readonly record struct DiveState(uint Revision, bool HostReady, bool Cl
 internal readonly record struct BoatDecoState(int Id);
 internal readonly record struct DiverLifeState(uint Revision, bool IsDead);
 internal readonly record struct DiveExitRequest(uint Revision);
+internal readonly record struct TravelRoute(
+    string SceneName,
+    int SceneType,
+    int Location,
+    int TransitionType);
 internal readonly record struct TravelReady(
-    TravelTarget Target,
+    uint TargetId,
     uint Revision,
     bool Ready,
-    bool NativeStarted);
+    bool NativeStarted,
+    TravelRoute Route);
 internal readonly record struct TravelState(
-    TravelTarget Target,
+    uint TargetId,
     uint Revision,
     bool HostReady,
-    bool ClientReady);
+    bool ClientReady,
+    bool SoloAllowed,
+    bool HostDead);
 internal readonly record struct DiveLootRequest(
     int ItemId,
     int Count,
@@ -203,27 +209,47 @@ internal readonly record struct DiveResultEntry(
     int LiftType);
 internal readonly record struct DiveResultState(ulong TransferId, ushort Total);
 internal readonly record struct MissionConditionState(int Id, int Count);
-internal readonly record struct MissionState(uint Revision, MissionConditionState[] Conditions);
-internal readonly record struct CampaignSnapshotChunk(
-    ulong TransferId,
+internal readonly record struct MissionState(
     uint Revision,
-    ushort ChunkIndex,
-    ushort ChunkCount,
-    byte[] Payload);
-internal readonly record struct CampaignSnapshotAck(ulong TransferId, uint Revision);
-
+    int MissionId,
+    int Progress,
+    byte State,
+    int CurrentTaskId,
+    MissionConditionState[] Conditions);
+internal readonly record struct WorldFlagRequest(string Key, bool Value);
+internal readonly record struct WorldFlagState(uint Revision, string Key, bool Value);
+internal readonly record struct BossDamageRequest(
+    uint SceneId,
+    uint BossId,
+    int Damage,
+    int Element,
+    int AttackType);
+internal readonly record struct BossState(
+    uint SceneId,
+    uint Tick,
+    uint BossId,
+    int FishId,
+    int CurrentHp,
+    int MaxHp,
+    float X,
+    float Y,
+    float Z,
+    byte Flags);
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 22;
-    internal const int HeaderSize = 10;
+    private const byte Version = 25;
+    internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
     private const int VisualSpriteSize = 38;
     private const int ProjectileVisualStateSize = HeaderSize + 70;
     internal const int MaxVisualSprites = 16;
-    private const int FishSnapshotSize = HeaderSize + 33;
+    private const int FishSnapshotBatchFixedSize = HeaderSize + 9;
+    private const int FishSnapshotEntrySize = 37;
     private const int FishDamageRequestSize = HeaderSize + 20;
+    private const int BossDamageRequestSize = HeaderSize + 20;
+    private const int BossStateSize = HeaderSize + 37;
     private const int FishPickupRequestSize = HeaderSize + 8;
     private const int FishRemovedSize = HeaderSize + 8;
     private const int FishManifestFixedSize = HeaderSize + 38;
@@ -239,21 +265,22 @@ internal static class Protocol
     private const int BoatDecoStatePacketSize = HeaderSize + 4;
     private const int DiverLifeStatePacketSize = HeaderSize + 5;
     private const int DiveExitRequestPacketSize = HeaderSize + 4;
-    private const int TravelReadyPacketSize = HeaderSize + 7;
-    private const int TravelStatePacketSize = HeaderSize + 7;
+    private const int TravelReadyFixedSize = HeaderSize + 24;
+    private const int TravelStatePacketSize = HeaderSize + 12;
     private const int DiveLootRequestPacketSize = HeaderSize + 17;
     private const int DiveResultEntryPacketSize = HeaderSize + 28;
     private const int DiveResultStatePacketSize = HeaderSize + 10;
-    private const int MissionStateFixedSize = HeaderSize + 5;
+    private const int MissionStateFixedSize = HeaderSize + 18;
     private const int MissionConditionStateSize = 8;
-    private const int CampaignSnapshotChunkFixedSize = HeaderSize + 18;
-    private const int CampaignSnapshotAckSize = HeaderSize + 12;
-    internal const int MaxIngredientEntriesPerPacket = 97;
+    internal const int MaxIngredientEntriesPerPacket =
+        (1200 - IngredientsSnapshotChunkFixedSize) / IngredientCountSize;
     internal const int MaxIngredientSnapshotChunks = 256;
     internal const int MaxIngredientPlaces = 32;
-    internal const int MaxCampaignSnapshotChunks = 2048;
-    internal const int MaxCampaignSnapshotPayloadBytes = 1172;
-    internal const int MaxMissionConditions = 32;
+    internal const int MaxMissionConditions = 64;
+    internal const int MaxWorldFlagKeyBytes = 128;
+    internal const int MaxTravelSceneNameBytes = 128;
+    internal const int MaxFishSnapshotsPerPacket =
+        (1200 - FishSnapshotBatchFixedSize) / FishSnapshotEntrySize;
     private const int MaxFishAllocatorUidBytes = byte.MaxValue;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
@@ -261,17 +288,37 @@ internal static class Protocol
     internal static byte[] Encode(PacketType type, uint sequence)
     {
         var packet = new byte[HeaderSize];
-        BinaryPrimitives.WriteUInt32LittleEndian(packet, Magic);
-        packet[4] = Version;
-        packet[5] = (byte)type;
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(6), sequence);
+        WriteHeader(packet, type, sequence);
         return packet;
     }
 
+    private static void WriteHeader(Span<byte> packet, PacketType type, uint sequence)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(packet, Magic);
+        packet[4] = Version;
+        packet[5] = (byte)type;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.Slice(6), sequence);
+    }
+
+    internal static void SetSessionId(Span<byte> packet, ulong sessionId)
+    {
+        if (packet.Length < HeaderSize)
+            throw new ArgumentException("Packet is shorter than the protocol header", nameof(packet));
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.Slice(10), sessionId);
+    }
+
     internal static bool TryDecode(ReadOnlySpan<byte> packet, out PacketType type, out uint sequence)
+        => TryDecode(packet, out type, out sequence, out _);
+
+    internal static bool TryDecode(
+        ReadOnlySpan<byte> packet,
+        out PacketType type,
+        out uint sequence,
+        out ulong sessionId)
     {
         type = default;
         sequence = 0;
+        sessionId = 0;
 
         if (packet.Length < HeaderSize ||
             BinaryPrimitives.ReadUInt32LittleEndian(packet) != Magic ||
@@ -281,13 +328,14 @@ internal static class Protocol
 
         type = (PacketType)packet[5];
         sequence = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(6));
+        sessionId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(10));
         return true;
     }
 
     internal static byte[] EncodeSnapshot(uint sequence, PlayerSnapshot snapshot)
     {
         var packet = new byte[SnapshotSize];
-        Encode(PacketType.PlayerSnapshot, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.PlayerSnapshot, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), snapshot.SceneId);
         WriteSingle(packet.AsSpan(HeaderSize + 4), snapshot.X);
         WriteSingle(packet.AsSpan(HeaderSize + 8), snapshot.Y);
@@ -343,7 +391,7 @@ internal static class Protocol
         if (state.SceneId == 0 || sprites.Length > MaxVisualSprites)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[VisualStateFixedSize + sprites.Length * VisualSpriteSize];
-        Encode(PacketType.PlayerVisualState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.PlayerVisualState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
         packet[HeaderSize + 4] = (byte)sprites.Length;
         for (var index = 0; index < sprites.Length; index++)
@@ -414,7 +462,7 @@ internal static class Protocol
         if (!IsValidProjectileVisualState(state))
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[ProjectileVisualStateSize];
-        Encode(PacketType.ProjectileVisualState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.ProjectileVisualState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Id);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.SpriteId);
@@ -482,7 +530,7 @@ internal static class Protocol
         var name = NormalizePlayerName(playerName);
         var encodedName = StrictUtf8.GetBytes(name);
         var packet = new byte[HeaderSize + 5 + encodedName.Length];
-        Encode(type, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, type, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), buildId);
         packet[HeaderSize + 4] = (byte)encodedName.Length;
         encodedName.CopyTo(packet, HeaderSize + 5);
@@ -519,7 +567,7 @@ internal static class Protocol
     internal static byte[] EncodeSceneState(uint sequence, uint sceneId)
     {
         var packet = new byte[HeaderSize + 4];
-        Encode(PacketType.SceneState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.SceneState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
         return packet;
     }
@@ -535,52 +583,97 @@ internal static class Protocol
         return true;
     }
 
-    internal static byte[] EncodeFishSnapshot(uint sequence, FishSnapshot snapshot)
+    internal static byte[] EncodeFishSnapshotBatch(
+        uint sequence,
+        uint sceneId,
+        uint tick,
+        IReadOnlyList<FishSnapshot> snapshots,
+        int offset,
+        int count)
     {
-        var packet = new byte[FishSnapshotSize];
-        Encode(PacketType.FishSnapshot, sequence).CopyTo(packet, 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), snapshot.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), snapshot.Id);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), snapshot.FishDataTID);
-        WriteSingle(packet.AsSpan(HeaderSize + 12), snapshot.X);
-        WriteSingle(packet.AsSpan(HeaderSize + 16), snapshot.Y);
-        WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.Z);
-        WriteSingle(packet.AsSpan(HeaderSize + 24), snapshot.Rotation);
-        WriteSingle(packet.AsSpan(HeaderSize + 28), snapshot.Hp);
-        packet[HeaderSize + 32] = snapshot.Flags;
+        if (sceneId == 0 || tick == 0 || snapshots == null || offset < 0 || count < 1 ||
+            count > MaxFishSnapshotsPerPacket || offset > snapshots.Count - count)
+            throw new ArgumentOutOfRangeException(nameof(count));
+
+        var packet = new byte[FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize];
+        WriteHeader(packet, PacketType.FishSnapshotBatch, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), tick);
+        packet[HeaderSize + 8] = (byte)count;
+        for (var index = 0; index < count; index++)
+        {
+            var snapshot = snapshots[offset + index];
+            if (snapshot.SceneId != sceneId || snapshot.Tick != tick || !IsValidFishSnapshot(snapshot))
+                throw new ArgumentOutOfRangeException(nameof(snapshots));
+            var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset), snapshot.Id);
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset + 4), snapshot.FishDataTID);
+            WriteSingle(packet.AsSpan(entryOffset + 8), snapshot.X);
+            WriteSingle(packet.AsSpan(entryOffset + 12), snapshot.Y);
+            WriteSingle(packet.AsSpan(entryOffset + 16), snapshot.Z);
+            WriteSingle(packet.AsSpan(entryOffset + 20), snapshot.Rotation);
+            WriteSingle(packet.AsSpan(entryOffset + 24), snapshot.VelocityX);
+            WriteSingle(packet.AsSpan(entryOffset + 28), snapshot.VelocityY);
+            WriteSingle(packet.AsSpan(entryOffset + 32), snapshot.Hp);
+            packet[entryOffset + 36] = snapshot.Flags;
+        }
         return packet;
     }
 
-    internal static bool TryDecodeFishSnapshot(
+    internal static bool TryDecodeFishSnapshotBatch(
         ReadOnlySpan<byte> packet,
         out uint sequence,
-        out FishSnapshot snapshot)
+        out FishSnapshot[] snapshots)
     {
         sequence = 0;
-        snapshot = default;
-        if (packet.Length != FishSnapshotSize ||
-            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishSnapshot)
+        snapshots = Array.Empty<FishSnapshot>();
+        if (packet.Length < FishSnapshotBatchFixedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishSnapshotBatch)
             return false;
 
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        var fishDataTID = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        var x = ReadSingle(packet.Slice(HeaderSize + 12));
-        var y = ReadSingle(packet.Slice(HeaderSize + 16));
-        var z = ReadSingle(packet.Slice(HeaderSize + 20));
-        var rotation = ReadSingle(packet.Slice(HeaderSize + 24));
-        var hp = ReadSingle(packet.Slice(HeaderSize + 28));
-        var flags = packet[HeaderSize + 32];
-        if (sceneId == 0 || id <= 0 || fishDataTID <= 0 ||
-            !float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
-            !float.IsFinite(rotation) || !float.IsFinite(hp) || hp < 0f || hp > 1_000_000_000f ||
-            MathF.Abs(x) > 1_000_000f ||
-            MathF.Abs(y) > 1_000_000f || MathF.Abs(z) > 1_000_000f || flags > 7)
+        var tick = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var count = packet[HeaderSize + 8];
+        if (sceneId == 0 || tick == 0 || count is < 1 || count > MaxFishSnapshotsPerPacket ||
+            packet.Length != FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize)
             return false;
 
-        snapshot = new FishSnapshot(sceneId, id, fishDataTID, x, y, z, rotation, hp, flags);
+        snapshots = new FishSnapshot[count];
+        for (var index = 0; index < count; index++)
+        {
+            var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
+            var snapshot = new FishSnapshot(
+                sceneId,
+                tick,
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset + 4)),
+                ReadSingle(packet.Slice(entryOffset + 8)),
+                ReadSingle(packet.Slice(entryOffset + 12)),
+                ReadSingle(packet.Slice(entryOffset + 16)),
+                ReadSingle(packet.Slice(entryOffset + 20)),
+                ReadSingle(packet.Slice(entryOffset + 24)),
+                ReadSingle(packet.Slice(entryOffset + 28)),
+                ReadSingle(packet.Slice(entryOffset + 32)),
+                packet[entryOffset + 36]);
+            if (!IsValidFishSnapshot(snapshot))
+            {
+                snapshots = Array.Empty<FishSnapshot>();
+                return false;
+            }
+            snapshots[index] = snapshot;
+        }
         return true;
     }
+
+    private static bool IsValidFishSnapshot(FishSnapshot snapshot) =>
+        snapshot.Id > 0 && snapshot.FishDataTID > 0 &&
+        float.IsFinite(snapshot.X) && float.IsFinite(snapshot.Y) && float.IsFinite(snapshot.Z) &&
+        float.IsFinite(snapshot.Rotation) && float.IsFinite(snapshot.VelocityX) &&
+        float.IsFinite(snapshot.VelocityY) && float.IsFinite(snapshot.Hp) &&
+        snapshot.Hp is >= 0f and <= 1_000_000_000f &&
+        MathF.Abs(snapshot.X) <= 1_000_000f && MathF.Abs(snapshot.Y) <= 1_000_000f &&
+        MathF.Abs(snapshot.Z) <= 1_000_000f && MathF.Abs(snapshot.VelocityX) <= 10_000f &&
+        MathF.Abs(snapshot.VelocityY) <= 10_000f && snapshot.Flags <= 7;
 
     internal static byte[] EncodeFishDamageRequest(uint sequence, FishDamageRequest request)
     {
@@ -588,7 +681,7 @@ internal static class Protocol
             request.AttackType is < 0 or > 64)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[FishDamageRequestSize];
-        Encode(PacketType.FishDamageRequest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.FishDamageRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Id);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Damage);
@@ -619,10 +712,104 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodeBossDamageRequest(uint sequence, BossDamageRequest request)
+    {
+        if (request.SceneId == 0 || request.BossId == 0 ||
+            request.Damage is < 1 or > 10_000 || request.Element is < 0 or > 32 ||
+            request.AttackType is < 0 or > 64)
+            throw new ArgumentOutOfRangeException(nameof(request));
+        var packet = new byte[BossDamageRequestSize];
+        WriteHeader(packet, PacketType.BossDamageRequest, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.BossId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.AttackType);
+        return packet;
+    }
+
+    internal static bool TryDecodeBossDamageRequest(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out BossDamageRequest request)
+    {
+        sequence = 0;
+        request = default;
+        if (packet.Length != BossDamageRequestSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.BossDamageRequest)
+            return false;
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var bossId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
+        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
+        if (sceneId == 0 || bossId == 0 || damage is < 1 or > 10_000 ||
+            element is < 0 or > 32 || attackType is < 0 or > 64)
+            return false;
+        request = new BossDamageRequest(sceneId, bossId, damage, element, attackType);
+        return true;
+    }
+
+    internal static byte[] EncodeBossState(uint sequence, BossState state)
+    {
+        if (!IsValidBossState(state))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[BossStateSize];
+        WriteHeader(packet, PacketType.BossState, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Tick);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.BossId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.FishId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), state.CurrentHp);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), state.MaxHp);
+        WriteSingle(packet.AsSpan(HeaderSize + 24), state.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), state.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), state.Z);
+        packet[HeaderSize + 36] = state.Flags;
+        return packet;
+    }
+
+    internal static bool TryDecodeBossState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out BossState state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != BossStateSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.BossState)
+            return false;
+        state = new BossState(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            ReadSingle(packet.Slice(HeaderSize + 24)),
+            ReadSingle(packet.Slice(HeaderSize + 28)),
+            ReadSingle(packet.Slice(HeaderSize + 32)),
+            packet[HeaderSize + 36]);
+        if (!IsValidBossState(state))
+        {
+            state = default;
+            return false;
+        }
+        return true;
+    }
+
+    private static bool IsValidBossState(BossState state) =>
+        state.SceneId != 0 && state.Tick != 0 && state.BossId != 0 && state.FishId >= 0 &&
+        state.CurrentHp >= 0 && state.MaxHp is > 0 and <= 1_000_000_000 &&
+        state.CurrentHp <= state.MaxHp && float.IsFinite(state.X) && float.IsFinite(state.Y) &&
+        float.IsFinite(state.Z) && MathF.Abs(state.X) <= 1_000_000f &&
+        MathF.Abs(state.Y) <= 1_000_000f && MathF.Abs(state.Z) <= 1_000_000f &&
+        state.Flags <= 1;
+
     internal static byte[] EncodeFishPickupRequest(uint sequence, FishPickupRequest request)
     {
         var packet = new byte[FishPickupRequestSize];
-        Encode(PacketType.FishPickupRequest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.FishPickupRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Id);
         return packet;
@@ -647,7 +834,7 @@ internal static class Protocol
     internal static byte[] EncodeFishRemoved(uint sequence, FishRemoved removed)
     {
         var packet = new byte[FishRemovedSize];
-        Encode(PacketType.FishRemoved, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.FishRemoved, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), removed.SceneId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.Id);
         return packet;
@@ -676,7 +863,7 @@ internal static class Protocol
             throw new ArgumentOutOfRangeException(nameof(manifest));
 
         var packet = new byte[FishManifestFixedSize + uid.Length];
-        Encode(PacketType.FishManifest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.FishManifest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), manifest.SceneId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), manifest.Revision);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), manifest.Id);
@@ -738,7 +925,7 @@ internal static class Protocol
         if (state.SceneId == 0 || state.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[FishManifestStateSize];
-        Encode(PacketType.FishManifestState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.FishManifestState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Revision);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 8), state.EntryCount);
@@ -768,7 +955,7 @@ internal static class Protocol
     internal static byte[] EncodePickupRemoved(uint sequence, PickupRemoved removed)
     {
         var packet = new byte[PickupRemovedSize];
-        Encode(PacketType.PickupRemoved, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.PickupRemoved, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), removed.SceneId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.WorldId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), removed.ItemId);
@@ -823,7 +1010,7 @@ internal static class Protocol
         if (encodedName.Length is < 1 or > 128 || (command.Options & 0x7e00) != 0)
             throw new ArgumentOutOfRangeException(nameof(command));
         var packet = new byte[HeaderSize + 7 + encodedName.Length];
-        Encode(PacketType.SceneTransition, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.SceneTransition, sequence);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), command.TransitionType);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 4), command.Options);
         packet[HeaderSize + 6] = (byte)encodedName.Length;
@@ -869,7 +1056,7 @@ internal static class Protocol
         if (request.RequestId == 0)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[IngredientsSyncRequestSize];
-        Encode(PacketType.IngredientsSyncRequest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.IngredientsSyncRequest, sequence);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), request.RequestId);
         return packet;
     }
@@ -909,7 +1096,7 @@ internal static class Protocol
         if (ready.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(ready));
         var packet = new byte[DiveReadyPacketSize];
-        Encode(PacketType.DiveReady, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveReady, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), ready.Revision);
         packet[HeaderSize + 4] = ready.Ready ? (byte)1 : (byte)0;
         return packet;
@@ -935,7 +1122,7 @@ internal static class Protocol
         if (state.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[DiveStatePacketSize];
-        Encode(PacketType.DiveState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
         packet[HeaderSize + 4] = state.HostReady ? (byte)1 : (byte)0;
         packet[HeaderSize + 5] = state.ClientReady ? (byte)1 : (byte)0;
@@ -960,7 +1147,7 @@ internal static class Protocol
     internal static byte[] EncodeBoatDecoState(uint sequence, BoatDecoState state)
     {
         var packet = new byte[BoatDecoStatePacketSize];
-        Encode(PacketType.BoatDecoState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.BoatDecoState, sequence);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), state.Id);
         return packet;
     }
@@ -984,7 +1171,7 @@ internal static class Protocol
         if (state.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[DiverLifeStatePacketSize];
-        Encode(PacketType.DiverLifeState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiverLifeState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
         packet[HeaderSize + 4] = state.IsDead ? (byte)1 : (byte)0;
         return packet;
@@ -1013,7 +1200,7 @@ internal static class Protocol
         if (request.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[DiveExitRequestPacketSize];
-        Encode(PacketType.DiveExitRequest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveExitRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.Revision);
         return packet;
     }
@@ -1037,15 +1224,23 @@ internal static class Protocol
 
     internal static byte[] EncodeTravelReady(uint sequence, TravelReady ready)
     {
-        if (!Enum.IsDefined(typeof(TravelTarget), ready.Target) || ready.Revision == 0 ||
-            (!ready.Ready && ready.NativeStarted))
+        var sceneNameBytes = StrictUtf8.GetBytes(ready.Route.SceneName ?? string.Empty);
+        if (ready.TargetId == 0 || ready.Revision == 0 ||
+            (!ready.Ready && ready.NativeStarted) ||
+            sceneNameBytes.Length > MaxTravelSceneNameBytes)
             throw new ArgumentOutOfRangeException(nameof(ready));
-        var packet = new byte[TravelReadyPacketSize];
-        Encode(PacketType.TravelReady, sequence).CopyTo(packet, 0);
-        packet[HeaderSize] = (byte)ready.Target;
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 1), ready.Revision);
-        packet[HeaderSize + 5] = ready.Ready ? (byte)1 : (byte)0;
-        packet[HeaderSize + 6] = ready.NativeStarted ? (byte)1 : (byte)0;
+        var packet = new byte[TravelReadyFixedSize + sceneNameBytes.Length];
+        WriteHeader(packet, PacketType.TravelReady, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), ready.TargetId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), ready.Revision);
+        packet[HeaderSize + 8] = ready.Ready ? (byte)1 : (byte)0;
+        packet[HeaderSize + 9] = ready.NativeStarted ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), ready.Route.SceneType);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), ready.Route.Location);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 18), ready.Route.TransitionType);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            packet.AsSpan(HeaderSize + 22), (ushort)sceneNameBytes.Length);
+        sceneNameBytes.CopyTo(packet.AsSpan(HeaderSize + 24));
         return packet;
     }
 
@@ -1056,31 +1251,51 @@ internal static class Protocol
     {
         sequence = 0;
         ready = default;
-        if (packet.Length != TravelReadyPacketSize ||
+        if (packet.Length < TravelReadyFixedSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.TravelReady ||
-            !Enum.IsDefined(typeof(TravelTarget), packet[HeaderSize]) ||
-            packet[HeaderSize + 5] > 1 || packet[HeaderSize + 6] > 1 ||
-            (packet[HeaderSize + 5] == 0 && packet[HeaderSize + 6] == 1))
+            packet[HeaderSize + 8] > 1 || packet[HeaderSize + 9] > 1 ||
+            (packet[HeaderSize + 8] == 0 && packet[HeaderSize + 9] == 1))
             return false;
-        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 1));
-        if (revision == 0)
+        var targetId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var sceneNameLength = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 22));
+        if (targetId == 0 || revision == 0 ||
+            sceneNameLength > MaxTravelSceneNameBytes ||
+            packet.Length != TravelReadyFixedSize + sceneNameLength)
             return false;
+        string sceneName;
+        try
+        {
+            sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 24, sceneNameLength));
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
         ready = new TravelReady(
-            (TravelTarget)packet[HeaderSize], revision,
-            packet[HeaderSize + 5] == 1, packet[HeaderSize + 6] == 1);
+            targetId, revision,
+            packet[HeaderSize + 8] == 1, packet[HeaderSize + 9] == 1,
+            new TravelRoute(
+                sceneName,
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 18))));
         return true;
     }
 
     internal static byte[] EncodeTravelState(uint sequence, TravelState state)
     {
-        if (!Enum.IsDefined(typeof(TravelTarget), state.Target) || state.Revision == 0)
+        if (state.TargetId == 0 || state.Revision == 0 ||
+            (state.HostDead && !state.SoloAllowed))
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[TravelStatePacketSize];
-        Encode(PacketType.TravelState, sequence).CopyTo(packet, 0);
-        packet[HeaderSize] = (byte)state.Target;
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 1), state.Revision);
-        packet[HeaderSize + 5] = state.HostReady ? (byte)1 : (byte)0;
-        packet[HeaderSize + 6] = state.ClientReady ? (byte)1 : (byte)0;
+        WriteHeader(packet, PacketType.TravelState, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.TargetId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Revision);
+        packet[HeaderSize + 8] = state.HostReady ? (byte)1 : (byte)0;
+        packet[HeaderSize + 9] = state.ClientReady ? (byte)1 : (byte)0;
+        packet[HeaderSize + 10] = state.SoloAllowed ? (byte)1 : (byte)0;
+        packet[HeaderSize + 11] = state.HostDead ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -1093,15 +1308,18 @@ internal static class Protocol
         state = default;
         if (packet.Length != TravelStatePacketSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.TravelState ||
-            !Enum.IsDefined(typeof(TravelTarget), packet[HeaderSize]) ||
-            packet[HeaderSize + 5] > 1 || packet[HeaderSize + 6] > 1)
+            packet[HeaderSize + 8] > 1 || packet[HeaderSize + 9] > 1 ||
+            packet[HeaderSize + 10] > 1 || packet[HeaderSize + 11] > 1 ||
+            (packet[HeaderSize + 11] == 1 && packet[HeaderSize + 10] == 0))
             return false;
-        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 1));
-        if (revision == 0)
+        var targetId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        if (targetId == 0 || revision == 0)
             return false;
         state = new TravelState(
-            (TravelTarget)packet[HeaderSize], revision,
-            packet[HeaderSize + 5] == 1, packet[HeaderSize + 6] == 1);
+            targetId, revision,
+            packet[HeaderSize + 8] == 1, packet[HeaderSize + 9] == 1,
+            packet[HeaderSize + 10] == 1, packet[HeaderSize + 11] == 1);
         return true;
     }
 
@@ -1110,7 +1328,7 @@ internal static class Protocol
         if (!IsValidLoot(request.ItemId, request.Count, request.BonusGrade, request.LiftType))
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[DiveLootRequestPacketSize];
-        Encode(PacketType.DiveLootRequest, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveLootRequest, sequence);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), request.ItemId);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Count);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.BonusGrade);
@@ -1145,7 +1363,7 @@ internal static class Protocol
             !IsValidLoot(entry.ItemId, entry.Count, entry.BonusGrade, entry.LiftType))
             throw new ArgumentOutOfRangeException(nameof(entry));
         var packet = new byte[DiveResultEntryPacketSize];
-        Encode(PacketType.DiveResultEntry, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveResultEntry, sequence);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), entry.TransferId);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 8), entry.Index);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 10), entry.Total);
@@ -1183,7 +1401,7 @@ internal static class Protocol
         if (state.TransferId == 0 || state.Total > 200)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[DiveResultStatePacketSize];
-        Encode(PacketType.DiveResultState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.DiveResultState, sequence);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), state.TransferId);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 8), state.Total);
         return packet;
@@ -1208,13 +1426,18 @@ internal static class Protocol
     internal static byte[] EncodeMissionState(uint sequence, MissionState state)
     {
         var conditions = state.Conditions ?? throw new ArgumentNullException(nameof(state));
-        if (state.Revision == 0 || conditions.Length > MaxMissionConditions ||
+        if (state.Revision == 0 || state.MissionId <= 0 || state.Progress < 0 ||
+            state.State > 6 || state.CurrentTaskId < 0 || conditions.Length > MaxMissionConditions ||
             !AreValidMissionConditions(conditions))
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[MissionStateFixedSize + conditions.Length * MissionConditionStateSize];
-        Encode(PacketType.MissionState, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.MissionState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
-        packet[HeaderSize + 4] = (byte)conditions.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.MissionId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Progress);
+        packet[HeaderSize + 12] = state.State;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 13), state.CurrentTaskId);
+        packet[HeaderSize + 17] = (byte)conditions.Length;
         for (var index = 0; index < conditions.Length; index++)
         {
             var offset = MissionStateFixedSize + index * MissionConditionStateSize;
@@ -1234,12 +1457,16 @@ internal static class Protocol
         if (packet.Length < MissionStateFixedSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.MissionState)
             return false;
-        var count = packet[HeaderSize + 4];
+        var count = packet[HeaderSize + 17];
         if (count > MaxMissionConditions ||
             packet.Length != MissionStateFixedSize + count * MissionConditionStateSize)
             return false;
         var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        if (revision == 0)
+        var missionId = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var progress = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var stateValue = packet[HeaderSize + 12];
+        var currentTaskId = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 13));
+        if (revision == 0 || missionId <= 0 || progress < 0 || stateValue > 6 || currentTaskId < 0)
             return false;
         var conditions = new MissionConditionState[count];
         for (var index = 0; index < count; index++)
@@ -1251,82 +1478,95 @@ internal static class Protocol
         }
         if (!AreValidMissionConditions(conditions))
             return false;
-        state = new MissionState(revision, conditions);
+        state = new MissionState(revision, missionId, progress, stateValue, currentTaskId, conditions);
         return true;
     }
 
-    internal static byte[] EncodeCampaignSnapshotChunk(uint sequence, CampaignSnapshotChunk chunk)
+    internal static byte[] EncodeWorldFlagRequest(uint sequence, WorldFlagRequest request) =>
+        EncodeWorldFlag(PacketType.WorldFlagRequest, sequence, 0, request.Key, request.Value);
+
+    internal static byte[] EncodeWorldFlagState(uint sequence, WorldFlagState state)
     {
-        var payload = chunk.Payload ?? throw new ArgumentNullException(nameof(chunk.Payload));
-        if (chunk.TransferId == 0 || chunk.Revision == 0 ||
-            chunk.ChunkCount is < 1 or > MaxCampaignSnapshotChunks ||
-            chunk.ChunkIndex >= chunk.ChunkCount ||
-            payload.Length is < 1 or > MaxCampaignSnapshotPayloadBytes)
-            throw new ArgumentOutOfRangeException(nameof(chunk));
-        var packet = new byte[CampaignSnapshotChunkFixedSize + payload.Length];
-        Encode(PacketType.CampaignSnapshotChunk, sequence).CopyTo(packet, 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), chunk.TransferId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), chunk.Revision);
-        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 12), chunk.ChunkIndex);
-        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 14), chunk.ChunkCount);
-        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 16), (ushort)payload.Length);
-        payload.CopyTo(packet.AsSpan(CampaignSnapshotChunkFixedSize));
-        return packet;
+        if (state.Revision == 0)
+            throw new ArgumentOutOfRangeException(nameof(state));
+        return EncodeWorldFlag(PacketType.WorldFlagState, sequence, state.Revision, state.Key, state.Value);
     }
 
-    internal static bool TryDecodeCampaignSnapshotChunk(
+    internal static bool TryDecodeWorldFlagRequest(
         ReadOnlySpan<byte> packet,
         out uint sequence,
-        out CampaignSnapshotChunk chunk)
+        out WorldFlagRequest request)
     {
-        sequence = 0;
-        chunk = default;
-        if (packet.Length < CampaignSnapshotChunkFixedSize ||
-            !TryDecode(packet, out var type, out sequence) || type != PacketType.CampaignSnapshotChunk)
+        request = default;
+        if (!TryDecodeWorldFlag(packet, PacketType.WorldFlagRequest, out sequence,
+                out var revision, out var key, out var value) || revision != 0)
             return false;
-        var payloadLength = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 16));
-        if (payloadLength is < 1 or > MaxCampaignSnapshotPayloadBytes ||
-            packet.Length != CampaignSnapshotChunkFixedSize + payloadLength)
-            return false;
-        var transferId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize));
-        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        var chunkIndex = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 12));
-        var chunkCount = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 14));
-        if (transferId == 0 || revision == 0 ||
-            chunkCount is < 1 or > MaxCampaignSnapshotChunks || chunkIndex >= chunkCount)
-            return false;
-        chunk = new CampaignSnapshotChunk(
-            transferId, revision, chunkIndex, chunkCount,
-            packet.Slice(CampaignSnapshotChunkFixedSize, payloadLength).ToArray());
+        request = new WorldFlagRequest(key, value);
         return true;
     }
 
-    internal static byte[] EncodeCampaignSnapshotAck(uint sequence, CampaignSnapshotAck acknowledgement)
+    internal static bool TryDecodeWorldFlagState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out WorldFlagState state)
     {
-        if (acknowledgement.TransferId == 0 || acknowledgement.Revision == 0)
-            throw new ArgumentOutOfRangeException(nameof(acknowledgement));
-        var packet = new byte[CampaignSnapshotAckSize];
-        Encode(PacketType.CampaignSnapshotAck, sequence).CopyTo(packet, 0);
-        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), acknowledgement.TransferId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), acknowledgement.Revision);
+        state = default;
+        if (!TryDecodeWorldFlag(packet, PacketType.WorldFlagState, out sequence,
+                out var revision, out var key, out var value) || revision == 0)
+            return false;
+        state = new WorldFlagState(revision, key, value);
+        return true;
+    }
+
+    private static byte[] EncodeWorldFlag(
+        PacketType type,
+        uint sequence,
+        uint revision,
+        string key,
+        bool value)
+    {
+        var encodedKey = StrictUtf8.GetBytes(key ?? string.Empty);
+        if (encodedKey.Length is < 1 or > MaxWorldFlagKeyBytes)
+            throw new ArgumentOutOfRangeException(nameof(key));
+        var packet = new byte[HeaderSize + 6 + encodedKey.Length];
+        WriteHeader(packet, type, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), revision);
+        packet[HeaderSize + 4] = value ? (byte)1 : (byte)0;
+        packet[HeaderSize + 5] = (byte)encodedKey.Length;
+        encodedKey.CopyTo(packet, HeaderSize + 6);
         return packet;
     }
 
-    internal static bool TryDecodeCampaignSnapshotAck(
+    private static bool TryDecodeWorldFlag(
         ReadOnlySpan<byte> packet,
+        PacketType expectedType,
         out uint sequence,
-        out CampaignSnapshotAck acknowledgement)
+        out uint revision,
+        out string key,
+        out bool value)
     {
         sequence = 0;
-        acknowledgement = default;
-        if (packet.Length != CampaignSnapshotAckSize ||
-            !TryDecode(packet, out var type, out sequence) || type != PacketType.CampaignSnapshotAck)
+        revision = 0;
+        key = string.Empty;
+        value = false;
+        if (packet.Length < HeaderSize + 7 ||
+            !TryDecode(packet, out var type, out sequence) || type != expectedType ||
+            packet[HeaderSize + 4] > 1)
             return false;
-        var transferId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize));
-        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        if (transferId == 0 || revision == 0)
+        var keyLength = packet[HeaderSize + 5];
+        if (keyLength is < 1 or > MaxWorldFlagKeyBytes ||
+            packet.Length != HeaderSize + 6 + keyLength)
             return false;
-        acknowledgement = new CampaignSnapshotAck(transferId, revision);
+        try
+        {
+            key = StrictUtf8.GetString(packet.Slice(HeaderSize + 6));
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+        revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        value = packet[HeaderSize + 4] == 1;
         return true;
     }
 
@@ -1360,7 +1600,7 @@ internal static class Protocol
             throw new ArgumentOutOfRangeException(nameof(chunk));
 
         var packet = new byte[IngredientsSnapshotChunkFixedSize + entries.Length * IngredientCountSize];
-        Encode(PacketType.IngredientsSnapshotChunk, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.IngredientsSnapshotChunk, sequence);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), chunk.RequestId);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 8), chunk.HostEpoch);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), chunk.Revision);
@@ -1412,7 +1652,7 @@ internal static class Protocol
             throw new ArgumentOutOfRangeException(nameof(delta));
 
         var packet = new byte[IngredientsDeltaFixedSize + entries.Length * IngredientCountSize];
-        Encode(PacketType.IngredientsDelta, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, PacketType.IngredientsDelta, sequence);
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), delta.HostEpoch);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), delta.BaseRevision);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), delta.Revision);
@@ -1529,7 +1769,7 @@ internal static class Protocol
         if (roomId == 0 || revision == 0)
             throw new ArgumentOutOfRangeException(nameof(revision));
         var packet = new byte[RoomPacketSize];
-        Encode(type, sequence).CopyTo(packet, 0);
+        WriteHeader(packet, type, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), roomId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), revision);
         packet[HeaderSize + 8] = value ? (byte)1 : (byte)0;
@@ -1610,8 +1850,9 @@ internal static class Protocol
     internal static void SelfTest()
     {
         var packet = Encode(PacketType.Hello, 42);
-        if (!TryDecode(packet, out var type, out var sequence) ||
-            type != PacketType.Hello || sequence != 42)
+        SetSessionId(packet, 0x123456789abcdef0);
+        if (!TryDecode(packet, out var type, out var sequence, out var sessionId) ||
+            type != PacketType.Hello || sequence != 42 || sessionId != 0x123456789abcdef0)
             throw new InvalidOperationException("Protocol round-trip failed");
 
         var ack = Encode(PacketType.Ack, 41);
@@ -1635,14 +1876,19 @@ internal static class Protocol
             sequence != 44 || sceneId != SceneId("A02_01_01"))
             throw new InvalidOperationException("Scene state round-trip failed");
 
-        var expectedFish = new FishSnapshot(
-            SceneId("A02_01_01"), 17, 2501, 1.25f, -2.5f, -0.1f, 183f, 42.5f, 5);
-        var fishPacket = EncodeFishSnapshot(45, expectedFish);
-        if (!TryDecodeFishSnapshot(fishPacket, out sequence, out var actualFish) ||
-            sequence != 45 || actualFish != expectedFish)
-            throw new InvalidOperationException("Fish snapshot round-trip failed");
-        fishPacket[HeaderSize + 32] = 8;
-        if (TryDecodeFishSnapshot(fishPacket, out _, out _))
+        var fishSceneId = SceneId("A02_01_01");
+        var expectedFish = new[]
+        {
+            new FishSnapshot(fishSceneId, 9, 17, 2501, 1.25f, -2.5f, -0.1f, 183f, 2f, -1f, 42.5f, 5),
+            new FishSnapshot(fishSceneId, 9, 18, 2502, 3f, 4f, 0f, 10f, 0f, 0f, 8f, 0)
+        };
+        var fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 9, expectedFish, 0, expectedFish.Length);
+        if (!TryDecodeFishSnapshotBatch(fishPacket, out sequence, out var actualFish) ||
+            sequence != 45 || actualFish.Length != 2 ||
+            actualFish[0] != expectedFish[0] || actualFish[1] != expectedFish[1])
+            throw new InvalidOperationException("Fish snapshot batch round-trip failed");
+        fishPacket[^1] = 8;
+        if (TryDecodeFishSnapshotBatch(fishPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish flags");
 
         var expectedDamage = new FishDamageRequest(SceneId("A02_01_01"), 17, 23, 2, 4);
@@ -1653,6 +1899,25 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(damagePacket.AsSpan(HeaderSize + 8), -1);
         if (TryDecodeFishDamageRequest(damagePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish damage");
+
+        var expectedBossDamage = new BossDamageRequest(fishSceneId, 0x11223344, 37, 2, 4);
+        var bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
+        if (!TryDecodeBossDamageRequest(bossDamagePacket, out sequence, out var actualBossDamage) ||
+            sequence != 46 || actualBossDamage != expectedBossDamage)
+            throw new InvalidOperationException("Boss damage request round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeBossDamageRequest(bossDamagePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted an invalid boss ID");
+
+        var expectedBossState = new BossState(
+            fishSceneId, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f, 0);
+        var bossStatePacket = EncodeBossState(46, expectedBossState);
+        if (!TryDecodeBossState(bossStatePacket, out sequence, out var actualBossState) ||
+            sequence != 46 || actualBossState != expectedBossState)
+            throw new InvalidOperationException("Boss state round-trip failed");
+        BinaryPrimitives.WriteInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 16), 1001);
+        if (TryDecodeBossState(bossStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted boss HP above maximum");
 
         var expectedFishPickup = new FishPickupRequest(SceneId("A02_01_01"), 17);
         var fishPickupPacket = EncodeFishPickupRequest(47, expectedFishPickup);
@@ -1759,18 +2024,22 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted a zero dive exit revision");
 
         var travelReadyPacket = EncodeTravelReady(
-            66, new TravelReady(TravelTarget.SushiBar, 5, true, false));
+            66, new TravelReady(
+                0x102, 5, true, false,
+                new TravelRoute("DR_Jungle_RPG_Forest", 1, 504, 2)));
         if (!TryDecodeTravelReady(travelReadyPacket, out sequence, out var travelReady) ||
-            sequence != 66 || travelReady != new TravelReady(TravelTarget.SushiBar, 5, true, false))
+            sequence != 66 || travelReady != new TravelReady(
+                0x102, 5, true, false,
+                new TravelRoute("DR_Jungle_RPG_Forest", 1, 504, 2)))
             throw new InvalidOperationException("Travel ready round-trip failed");
-        travelReadyPacket[HeaderSize + 6] = 2;
+        travelReadyPacket[HeaderSize + 9] = 2;
         if (TryDecodeTravelReady(travelReadyPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid travel readiness");
 
         var travelStatePacket = EncodeTravelState(
-            67, new TravelState(TravelTarget.Lobby, 6, true, false));
+            67, new TravelState(0x101, 6, true, false, true, true));
         if (!TryDecodeTravelState(travelStatePacket, out sequence, out var travelState) ||
-            sequence != 67 || travelState != new TravelState(TravelTarget.Lobby, 6, true, false))
+            sequence != 67 || travelState != new TravelState(0x101, 6, true, false, true, true))
             throw new InvalidOperationException("Travel state round-trip failed");
 
         var lootRequestPacket = EncodeDiveLootRequest(
@@ -1793,7 +2062,7 @@ internal static class Protocol
             sequence != 70 || resultState != new DiveResultState(7, 1))
             throw new InvalidOperationException("Dive result state round-trip failed");
 
-        var expectedMissionState = new MissionState(8, new[]
+        var expectedMissionState = new MissionState(8, 501, 2, 2, 7001, new[]
         {
             new MissionConditionState(101, 6), new MissionConditionState(102, 7)
         });
@@ -1804,6 +2073,20 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(missionStatePacket.AsSpan(MissionStateFixedSize), 0);
         if (TryDecodeMissionState(missionStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid mission state");
+
+        var worldRequestPacket = EncodeWorldFlagRequest(
+            72, new WorldFlagRequest("glacier/mirror-1", true));
+        if (!TryDecodeWorldFlagRequest(worldRequestPacket, out sequence, out var worldRequest) ||
+            sequence != 72 || worldRequest != new WorldFlagRequest("glacier/mirror-1", true))
+            throw new InvalidOperationException("World flag request round-trip failed");
+        var worldStatePacket = EncodeWorldFlagState(
+            73, new WorldFlagState(4, "glacier/mirror-1", false));
+        if (!TryDecodeWorldFlagState(worldStatePacket, out sequence, out var worldState) ||
+            sequence != 73 || worldState != new WorldFlagState(4, "glacier/mirror-1", false))
+            throw new InvalidOperationException("World flag state round-trip failed");
+        worldStatePacket[HeaderSize + 4] = 2;
+        if (TryDecodeWorldFlagState(worldStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid world flag value");
 
         var ingredientEntries = new[]
         {
@@ -1836,7 +2119,7 @@ internal static class Protocol
         ingredientChunkPacket = EncodeIngredientsSnapshotChunk(
             55,
             new IngredientsSnapshotChunk(1, 2, 10, 0, 1, maximumEntries));
-        if (ingredientChunkPacket.Length != 1200 ||
+        if (ingredientChunkPacket.Length > 1200 ||
             !TryDecodeIngredientsSnapshotChunk(ingredientChunkPacket, out _, out _))
             throw new InvalidOperationException("Ingredients snapshot datagram boundary failed");
 
@@ -1918,7 +2201,10 @@ internal static class Protocol
 
     private static bool SameMissionState(MissionState left, MissionState right)
     {
-        if (left.Revision != right.Revision || left.Conditions == null || right.Conditions == null ||
+        if (left.Revision != right.Revision || left.MissionId != right.MissionId ||
+            left.Progress != right.Progress || left.State != right.State ||
+            left.CurrentTaskId != right.CurrentTaskId ||
+            left.Conditions == null || right.Conditions == null ||
             left.Conditions.Length != right.Conditions.Length)
             return false;
         for (var index = 0; index < left.Conditions.Length; index++)

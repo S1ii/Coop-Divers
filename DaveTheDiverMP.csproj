@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DaveTheDiverMP</AssemblyName>
-    <Version>0.12.0</Version>
+    <Version>0.14.0</Version>
     <Deterministic>true</Deterministic>
     <GameInstallPath Condition="'$(GameInstallPath)' == ''">..\DAVE THE DIVER</GameInstallPath>
     <DeployPlugin Condition="'$(DeployPlugin)' == ''">false</DeployPlugin>
@@ -18,7 +18,9 @@
     <Reference Include="BepInEx.Unity.IL2CPP" HintPath="$(GameInstallPath)\BepInEx\core\BepInEx.Unity.IL2CPP.dll" Private="false" />
     <Reference Include="Il2CppInterop.Runtime" HintPath="$(GameInstallPath)\BepInEx\core\Il2CppInterop.Runtime.dll" Private="false" />
     <Reference Include="Assembly-CSharp" HintPath="$(GameInstallPath)\BepInEx\interop\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="Assembly-CSharp-firstpass" HintPath="$(GameInstallPath)\BepInEx\interop\Assembly-CSharp-firstpass.dll" Private="false" />
     <Reference Include="Il2Cppmscorlib" HintPath="$(GameInstallPath)\BepInEx\interop\Il2Cppmscorlib.dll" Private="false" />
+    <Reference Include="Il2CppSystem.Core" HintPath="$(GameInstallPath)\BepInEx\interop\Il2CppSystem.Core.dll" Private="false" />
     <Reference Include="InputSystemWrapper" HintPath="$(GameInstallPath)\BepInEx\interop\InputSystemWrapper.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="$(GameInstallPath)\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />

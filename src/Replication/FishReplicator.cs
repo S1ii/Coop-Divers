@@ -9,7 +9,7 @@ namespace DaveTheDiverMP;
 
 internal sealed class FishReplicator
 {
-    private const float ManifestResendSeconds = 2f;
+    private const float SnapshotKeyframeSeconds = 1f;
 
     private sealed class Target
     {
@@ -18,6 +18,9 @@ internal sealed class FishReplicator
         internal float Rotation;
         internal float Hp;
         internal byte Flags;
+        internal uint LastTick;
+        internal Vector3 Velocity;
+        internal float SinceSnapshot;
         internal bool HasSnapshot;
     }
 
@@ -26,7 +29,10 @@ internal sealed class FishReplicator
         internal FishAISystem Fish;
         internal string AllocatorUid;
         internal int FishDataTID;
-        internal float LastManifestSend = float.NegativeInfinity;
+        internal FishSnapshot LastSnapshot;
+        internal float LastSnapshotSend;
+        internal bool HasSnapshot;
+        internal bool ManifestQueued;
     }
 
     private readonly ManualLogSource _log;
@@ -42,13 +48,15 @@ internal sealed class FishReplicator
     private readonly Dictionary<uint, HashSet<int>> _clientManifestIds = new();
     private readonly Dictionary<uint, ushort> _clientManifestCounts = new();
     private readonly Dictionary<uint, ushort> _finalizedClientManifestCounts = new();
+    private readonly List<FishSnapshot> _snapshotBuffer = new();
     private float _nextHostScan;
     private float _nextSend;
-    private float _lastManifestStateSend = float.NegativeInfinity;
+    private bool _manifestStateQueued;
     private int _nextHostId = 1;
     private int _lastHostCount = -1;
     private int _lastHostDuplicates = -1;
     private uint _manifestRevision;
+    private uint _fishTick;
     private uint _latestClientManifestRevision;
 
     internal FishReplicator(ManualLogSource log, RemoteCatchLedger remoteCatch)
@@ -145,7 +153,12 @@ internal sealed class FishReplicator
                     continue;
             }
 
+            if (target.HasSnapshot && !IsNewer(snapshot.Tick, target.LastTick))
+                continue;
             target.Position = new Vector3(snapshot.X, snapshot.Y, snapshot.Z);
+            target.LastTick = snapshot.Tick;
+            target.Velocity = new Vector3(snapshot.VelocityX, snapshot.VelocityY, 0f);
+            target.SinceSnapshot = 0f;
             target.Rotation = snapshot.Rotation;
             target.Hp = snapshot.Hp;
             target.Flags = snapshot.Flags;
@@ -158,8 +171,10 @@ internal sealed class FishReplicator
         {
             if (!target.HasSnapshot || target.Fish == null)
                 continue;
+            target.SinceSnapshot += deltaTime;
+            var predicted = target.Position + target.Velocity * Mathf.Min(target.SinceSnapshot, 0.2f);
             target.Fish.transform.position = Vector3.Lerp(
-                target.Fish.transform.position, target.Position, blend);
+                target.Fish.transform.position, predicted, blend);
             target.Fish.Rotation = Mathf.LerpAngle(
                 target.Fish.Rotation, target.Rotation, blend);
             if (Mathf.Abs(target.Fish.HP - target.Hp) > 0.01f)
@@ -207,11 +222,12 @@ internal sealed class FishReplicator
         _finalizedClientManifestCounts.Clear();
         _nextHostScan = 0f;
         _nextSend = 0f;
-        _lastManifestStateSend = float.NegativeInfinity;
+        _manifestStateQueued = false;
         _nextHostId = 1;
         _lastHostCount = -1;
         _lastHostDuplicates = -1;
         _manifestRevision = 0;
+        _fishTick = 0;
         _latestClientManifestRevision = 0;
     }
 
@@ -230,7 +246,8 @@ internal sealed class FishReplicator
             {
             }
             foreach (var info in _hostInfoById.Values)
-                info.LastManifestSend = float.NegativeInfinity;
+                info.ManifestQueued = false;
+            _manifestStateQueued = false;
             return;
         }
         if (now >= _nextHostScan)
@@ -241,22 +258,34 @@ internal sealed class FishReplicator
         while (session.TryTakeFishPickupRequest(out var pickupRequest))
             ApplyHostPickup(session, sceneId, now, hostPlayer, pickupRequest);
 
-        SendFishManifests(session, sceneId, now);
+        SendFishManifests(session, sceneId);
         if (now < _nextSend)
             return;
 
         _nextSend = now + 0.1f;
+        _fishTick = NextRevision(_fishTick);
+        _snapshotBuffer.Clear();
         foreach (var pair in _hostFishById)
         {
             var fish = pair.Value;
             if (fish == null || !fish.gameObject.activeInHierarchy)
                 continue;
             var position = fish.transform.position;
-            session.SendFishSnapshot(new FishSnapshot(
-                sceneId, pair.Key, fish.FishDataTID,
+            var velocity = fish.Velocity;
+            var snapshot = new FishSnapshot(
+                sceneId, _fishTick, pair.Key, fish.FishDataTID,
                 position.x, position.y, position.z, fish.Rotation,
-                Mathf.Max(0f, fish.HP), BuildFlags(fish)));
+                velocity.x, velocity.y, Mathf.Max(0f, fish.HP), BuildFlags(fish));
+            var info = _hostInfoById[pair.Key];
+            if (!ShouldSendSnapshot(info, snapshot, now))
+                continue;
+            info.LastSnapshot = snapshot;
+            info.LastSnapshotSend = now;
+            info.HasSnapshot = true;
+            _snapshotBuffer.Add(snapshot);
         }
+        if (_snapshotBuffer.Count > 0)
+            session.SendFishSnapshots(sceneId, _fishTick, _snapshotBuffer);
     }
 
     private void RefreshHostFish(UdpSession session, uint sceneId, float now)
@@ -290,6 +319,7 @@ internal sealed class FishReplicator
             }
         }
 
+        var topologyChanged = false;
         var staleFish = new List<FishAISystem>();
         foreach (var pair in _hostIdsByFish)
         {
@@ -301,6 +331,7 @@ internal sealed class FishReplicator
             var id = _hostIdsByFish[fish];
             session.SendFishRemoved(new FishRemoved(sceneId, id));
             RemoveHostFish(id);
+            topologyChanged = true;
         }
 
         foreach (var pair in allocatorByFish)
@@ -324,7 +355,10 @@ internal sealed class FishReplicator
             {
                 info = new HostFish();
                 _hostInfoById.Add(id, info);
+                topologyChanged = true;
             }
+            else if (info.AllocatorUid != uid || info.FishDataTID != fishDataTID)
+                topologyChanged = true;
             info.Fish = fish;
             info.AllocatorUid = uid;
             info.FishDataTID = fishDataTID;
@@ -338,18 +372,22 @@ internal sealed class FishReplicator
             _lastHostCount = _hostFishById.Count;
             _lastHostDuplicates = duplicateUids.Count;
         }
-        if (_manifestRevision == 0)
-            _manifestRevision = 1;
+        if (_manifestRevision == 0 || topologyChanged)
+        {
+            _manifestRevision = NextRevision(_manifestRevision);
+            foreach (var info in _hostInfoById.Values)
+                info.ManifestQueued = false;
+            _manifestStateQueued = false;
+        }
     }
 
-    private void SendFishManifests(UdpSession session, uint sceneId, float now)
+    private void SendFishManifests(UdpSession session, uint sceneId)
     {
         foreach (var pair in _hostInfoById)
         {
             var info = pair.Value;
             var fish = info.Fish;
-            if (fish == null || !fish.gameObject.activeInHierarchy ||
-                now < info.LastManifestSend + ManifestResendSeconds)
+            if (fish == null || !fish.gameObject.activeInHierarchy || info.ManifestQueued)
                 continue;
             var position = fish.transform.position;
             var manifest = new FishManifest(
@@ -358,12 +396,12 @@ internal sealed class FishReplicator
                 Mathf.Max(0f, fish.HP), BuildFlags(fish));
             if (!session.SendFishManifest(manifest))
                 return;
-            info.LastManifestSend = now;
+            info.ManifestQueued = true;
         }
-        if (AllCurrentManifestsSent(now) && now >= _lastManifestStateSend + ManifestResendSeconds &&
+        if (!_manifestStateQueued && AllCurrentManifestsQueued() &&
             session.SendFishManifestState(new FishManifestState(
                 sceneId, _manifestRevision, (ushort)Math.Min(ushort.MaxValue, _hostInfoById.Count))))
-            _lastManifestStateSend = now;
+            _manifestStateQueued = true;
     }
 
     private void ApplyHostDamage(
@@ -630,15 +668,33 @@ internal sealed class FishReplicator
         return best;
     }
 
-    private bool AllCurrentManifestsSent(float now)
+    private bool AllCurrentManifestsQueued()
     {
         if (_manifestRevision == 0)
             return false;
         foreach (var info in _hostInfoById.Values)
-            if (info.LastManifestSend < now - ManifestResendSeconds)
+            if (!info.ManifestQueued)
                 return false;
         return true;
     }
+
+    private static bool ShouldSendSnapshot(HostFish info, FishSnapshot snapshot, float now)
+    {
+        if (!info.HasSnapshot || now >= info.LastSnapshotSend + SnapshotKeyframeSeconds)
+            return true;
+        var previous = info.LastSnapshot;
+        var dx = snapshot.X - previous.X;
+        var dy = snapshot.Y - previous.Y;
+        var dz = snapshot.Z - previous.Z;
+        var dvx = snapshot.VelocityX - previous.VelocityX;
+        var dvy = snapshot.VelocityY - previous.VelocityY;
+        return dx * dx + dy * dy + dz * dz >= 0.0025f ||
+            Mathf.Abs(Mathf.DeltaAngle(previous.Rotation, snapshot.Rotation)) >= 1f ||
+            dvx * dvx + dvy * dvy >= 0.04f ||
+            Mathf.Abs(snapshot.Hp - previous.Hp) >= 0.01f || snapshot.Flags != previous.Flags;
+    }
+
+    private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
 
     private static bool IsNewer(uint candidate, uint previous) =>
         unchecked((int)(candidate - previous)) > 0;
@@ -733,20 +789,6 @@ internal sealed class FishReplicator
         if (target.Fish.IsFishEnable != enabled)
             target.Fish.IsFishEnable = enabled;
     }
-}
-
-[HarmonyPatch(typeof(FishAllocator), nameof(FishAllocator.Spawn), new Type[] { })]
-internal static class ClientFishAllocatorSpawnPatch
-{
-    private static bool Prefix() =>
-        ProbeBehaviour.Instance?.AllowFishAllocatorSpawn() ?? true;
-}
-
-[HarmonyPatch(typeof(FishAllocator), nameof(FishAllocator.Spawn), new[] { typeof(bool) })]
-internal static class ClientFishAllocatorForcedSpawnPatch
-{
-    private static bool Prefix() =>
-        ProbeBehaviour.Instance?.AllowFishAllocatorSpawn() ?? true;
 }
 
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetHPDamage))]

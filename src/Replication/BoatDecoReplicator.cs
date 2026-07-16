@@ -9,7 +9,6 @@ internal sealed class BoatDecoReplicator
 {
     private readonly ManualLogSource _log;
     private int _lastHostId = int.MinValue;
-    private int _lastClientId = int.MinValue;
     private int? _pendingClientId;
     private float _nextRead;
     private bool _applyFailed;
@@ -52,7 +51,6 @@ internal sealed class BoatDecoReplicator
             return;
         if (TryApply(_pendingClientId.Value))
         {
-            _lastClientId = _pendingClientId.Value;
             _pendingClientId = null;
             _applyFailed = false;
         }
@@ -69,7 +67,6 @@ internal sealed class BoatDecoReplicator
         }
         else if (role == SessionRole.Client)
         {
-            _lastClientId = id;
             session.SendBoatDecoState(new BoatDecoState(id));
         }
     }
@@ -77,7 +74,6 @@ internal sealed class BoatDecoReplicator
     internal void Clear()
     {
         _lastHostId = int.MinValue;
-        _lastClientId = int.MinValue;
         _pendingClientId = null;
         _nextRead = 0f;
         _applyFailed = false;

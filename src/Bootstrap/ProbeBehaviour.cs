@@ -40,6 +40,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private PickupReplicator _pickupReplicator;
     private SceneReplicator _sceneReplicator;
     private MissionProgressReplicator _missionProgressReplicator;
+    private WorldStateReplicator _worldStateReplicator;
+    private BossReplicator _bossReplicator;
     private IngredientsReplicator _ingredientsReplicator;
     private BoatDecoReplicator _boatDecoReplicator;
     private DiveCoordinator _diveCoordinator;
@@ -74,6 +76,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
         _missionProgressReplicator = new MissionProgressReplicator(Logger);
+        _worldStateReplicator = new WorldStateReplicator(Logger);
+        _bossReplicator = new BossReplicator(Logger);
         _ingredientsReplicator = new IngredientsReplicator(Logger);
         _boatDecoReplicator = new BoatDecoReplicator(Logger);
         _diveCoordinator = new DiveCoordinator(Logger);
@@ -132,6 +136,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _remoteAvatar.Clear();
             _fishReplicator?.Clear();
             _pickupReplicator?.Clear();
+            _bossReplicator?.Clear();
             _boatDecoReplicator?.Clear();
             _diveCoordinator?.Reset();
             _travelCoordinator?.Reset();
@@ -151,15 +156,21 @@ public sealed class ProbeBehaviour : MonoBehaviour
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+        _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
         _diveCoordinator?.Update(
             Role, _session, Time.realtimeSinceStartup, _player, _remoteAvatar.Transform);
-        _travelCoordinator?.Update(Role, _session);
+        _travelCoordinator?.Update(
+            Role, _session,
+            _diveCoordinator?.HostDead ?? false,
+            _diveCoordinator?.ClientDead ?? false);
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime, _player);
+        _bossReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
         _pickupReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
 
@@ -321,6 +332,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
         _missionProgressReplicator?.Clear();
+        _worldStateReplicator?.Clear();
+        _bossReplicator?.Clear();
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
@@ -492,8 +505,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
+        _missionProgressReplicator?.Clear();
+        _worldStateReplicator?.Clear();
+        _bossReplicator?.Clear();
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
+        _projectileVisualReplicator?.Clear();
     }
 
     private void SetLobbyVisible(bool visible, bool restoreCursor = true)
@@ -571,13 +588,84 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void ReportBoatDecoChange(int id) =>
         _boatDecoReplicator?.OnLocalChange(Role, _session, id);
 
-    internal bool RequestSushiBarTravel(Common.Contents.MoveSceneElement element) =>
-        _travelCoordinator?.Request(
-            Role, _session, TravelTarget.SushiBar, element.OnClick, element) ?? true;
+    internal bool RequestMoveSceneTravel(Common.Contents.MoveSceneElement element)
+    {
+        var targetId = element == null ? 0 : TravelTargets.FromMoveScene(element.Scene);
+        Action action = element == null ? null : element.OnClick;
+        return _travelCoordinator?.Request(
+            Role, _session, targetId, action,
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false,
+            element) ?? true;
+    }
 
     internal bool RequestSushiBarReturn(SushiBarExitPanel panel) =>
         _travelCoordinator?.Request(
-            Role, _session, TravelTarget.Lobby, panel.OnExecute) ?? true;
+            Role, _session, TravelTargets.Lobby, panel.OnExecute,
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false) ?? true;
+
+    internal bool RequestFishFarmTravel(FishFarm.FishFarmManager manager, string methodName)
+    {
+        uint targetId;
+        Action action;
+        switch (methodName)
+        {
+            case nameof(FishFarm.FishFarmManager.GoToSushiBar):
+                targetId = TravelTargets.SushiBar;
+                action = manager.GoToSushiBar;
+                break;
+            case nameof(FishFarm.FishFarmManager.GoToFarm):
+                targetId = TravelTargets.Farm;
+                action = manager.GoToFarm;
+                break;
+            case nameof(FishFarm.FishFarmManager.GoToLobby):
+                targetId = TravelTargets.Lobby;
+                action = manager.GoToLobby;
+                break;
+            case nameof(FishFarm.FishFarmManager.GoToSushiBarBranch):
+                targetId = TravelTargets.SushiBranch;
+                action = manager.GoToSushiBarBranch;
+                break;
+            default:
+                return true;
+        }
+        return _travelCoordinator?.Request(
+            Role, _session, targetId, action,
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false) ?? true;
+    }
+
+    internal bool RequestDredgeReturn(Dredge.DredgeManager manager) =>
+        _travelCoordinator?.Request(
+            Role, _session, TravelTargets.Lobby, manager.ReturnToLobby,
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false) ?? true;
+
+    internal bool RequestEscapeMirror(
+        Interaction.Escape.EscapeMirror mirror,
+        BaseCharacter player) =>
+        _travelCoordinator?.Request(
+            Role, _session, TravelTargets.Lobby,
+            () => mirror.SuccessInteract(player),
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false) ?? true;
+
+    internal bool RequestJungleFastTravel(
+        JDLC.FastTravelPanelController panel,
+        string sceneName,
+        SceneType sceneType,
+        SceneConnectLocationID location,
+        SceneTransitionType transitionType) =>
+        _travelCoordinator?.Request(
+            Role, _session,
+            TravelTargets.JungleFastTravel(sceneName, sceneType, location),
+            () => panel.ChangeScene(sceneName, sceneType, location, transitionType),
+            _diveCoordinator?.AnyPlayerDead ?? false,
+            _diveCoordinator?.HostDead ?? false,
+            null,
+            new TravelRoute(
+                sceneName, (int)sceneType, (int)location, (int)transitionType)) ?? true;
 
     internal bool AllowSceneTransition(string sceneName)
     {
@@ -609,6 +697,15 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (Role == SessionRole.Host)
             _ingredientsReplicator?.MarkDirty();
     }
+
+    internal bool AllowPuzzleSave(PuzzleStateSaveObject saveObject, bool value) =>
+        _worldStateReplicator?.AllowLocalSave(Role, _session, saveObject, value) ?? true;
+
+    internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value) =>
+        _worldStateReplicator?.ObserveHostSave(Role, _session, saveObject, value);
+
+    internal bool AllowBossDamage(BossControllerBase boss, AttackData attack) =>
+        _bossReplicator?.AllowDamage(Role, _session, _sceneId, boss, attack) ?? true;
 
     internal bool TryCaptureRemoteLoot(
         int itemId,
@@ -657,8 +754,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role != SessionRole.Client)
             return true;
-        _pickupReplicator?.RequestPickup(_session, _sceneId, item);
-        return false;
+        return _pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false;
     }
 
     internal bool AllowFishDamage(
@@ -674,8 +770,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
         return !(_fishReplicator?.RequestDamage(
             _session, _sceneId, fish, damage, element, attackType) ?? false);
     }
-
-    internal bool AllowFishAllocatorSpawn() => true;
 
     internal bool AllowFishSimulation(FishAISystem fish) =>
         Role != SessionRole.Client || !(_fishReplicator?.IsClientProxy(fish) ?? false);
@@ -732,7 +826,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool RequestDiveExit(Common.SceneExitTrigger trigger)
     {
-        if (!IsDiveScene())
+        if (!IsSharedActionScene())
             return true;
         return _diveCoordinator?.RequestExit(
             Role, _session, Time.realtimeSinceStartup, _player, trigger) ?? true;
@@ -743,7 +837,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         SceneTransitionColorType color,
         bool playerDead)
     {
-        if (!IsDiveScene())
+        if (!IsSharedActionScene())
             return true;
         return _diveCoordinator?.RequestLobbyExit(
             Role, _session, Time.realtimeSinceStartup, _player,
@@ -752,17 +846,17 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void ReportDiveLife(bool dead)
     {
-        if (IsDiveScene())
+        if (IsSharedActionScene())
             _diveCoordinator?.ReportLocalLife(Role, _session, dead);
     }
 
     internal bool ShouldSuppressClientDeathPopup() =>
-        Role == SessionRole.Client && IsDiveScene() &&
+        Role == SessionRole.Client && IsSharedActionScene() &&
         (_diveCoordinator?.IsClientSpectating ?? false);
 
     internal bool RequestDiveDeathReturn()
     {
-        if (Role != SessionRole.Client || !IsDiveScene())
+        if (Role != SessionRole.Client || !IsSharedActionScene())
             return true;
         return _diveCoordinator?.RequestExit(
             Role, _session, Time.realtimeSinceStartup, _player, null) ?? true;
@@ -770,6 +864,27 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private bool IsDiveScene() => IsDiveSceneName(_scene);
 
+    private bool IsSharedActionScene() => IsSharedActionSceneName(_scene);
+
     private static bool IsDiveSceneName(string sceneName) =>
-        !string.IsNullOrEmpty(sceneName) && sceneName.StartsWith("A0", StringComparison.Ordinal);
+        HasPrefix(sceneName,
+            "A0", "B0", "C0", "Boss_", "ControlCenter_", "GlacialArea_",
+            "GlacialPassage_", "MermanWarehouse", "SecretRoom_", "C00_",
+            "Godzilla_Boss_", "Godzilla_underwater_", "DR_Jungle_Lake");
+
+    private static bool IsSharedActionSceneName(string sceneName) =>
+        IsDiveSceneName(sceneName) || HasPrefix(sceneName,
+            "DR_Jungle_HollowEarth", "DR_Jungle_RPG_", "DR_Jungle_MiniGames_",
+            "DR_Jungle_DaiMuDaimu", "DR_Jungle_Basilo_Inside",
+            "Godzilla_Lobby_Fight");
+
+    private static bool HasPrefix(string value, params string[] prefixes)
+    {
+        if (string.IsNullOrEmpty(value))
+            return false;
+        foreach (var prefix in prefixes)
+            if (value.StartsWith(prefix, StringComparison.Ordinal))
+                return true;
+        return false;
+    }
 }

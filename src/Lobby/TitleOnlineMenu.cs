@@ -43,8 +43,8 @@ internal static class TitleOnlineMenu
         Connecting,
         WaitingForHostRoom,
         LocalNetwork,
-        StartingCampaign
-        ,HostDisconnected
+        StartingCampaign,
+        HostDisconnected
     }
 
     // Korean, English, Japanese, Chinese, Chinese Traditional, French, Italian, German, Spanish, Portuguese, Russian.
@@ -74,7 +74,6 @@ internal static class TitleOnlineMenu
     private static readonly List<TitleMenuButton> TitleButtons = new();
     private static readonly List<TitleMenuButton> RoomButtons = new();
     private static readonly List<TitleMenuButton> RoomLabels = new();
-    private static readonly Dictionary<int, TitleMenuButton> ActionButtons = new();
     private static TitleManager _manager;
     private static TitleMenuButton _template;
     private static RectTransform _roomContent;
@@ -109,7 +108,13 @@ internal static class TitleOnlineMenu
 
     internal static void RequestHostDisconnect()
     {
-        _openAfterHostLoss = true;
+        if (_visible)
+        {
+            _message = Text(OnlineText.HostDisconnected, CurrentLanguage());
+            _openAfterHostLoss = false;
+        }
+        else
+            _openAfterHostLoss = true;
         MarkDirty();
     }
 
@@ -452,6 +457,9 @@ internal static class TitleOnlineMenu
         _lastRemoteName = string.Empty;
         _lastLanguage = Languages.Unknown;
         _keyboardVisible = false;
+        _pendingKeyboardValue = string.Empty;
+        _pendingKeyboardLimit = 0;
+        _pendingKeyboardApply = null;
         _closing = false;
     }
 
@@ -465,9 +473,9 @@ internal static class TitleOnlineMenu
 
         if (ProbeBehaviour.Role == SessionRole.Offline)
         {
-            AddInput(OnlineText.Name, _name, 24, value => _name = value, EditName);
-            AddInput(OnlineText.HostIp, _address, 45, value => _address = value, EditHostIp);
-            AddInput(OnlineText.Port, _port, 5, value => _port = value, EditPort);
+            AddInput(OnlineText.Name, _name, EditName);
+            AddInput(OnlineText.HostIp, _address, EditHostIp);
+            AddInput(OnlineText.Port, _port, EditPort);
             AddAction(language => Text(OnlineText.CreateLobby, language), Host);
             AddAction(language => Text(OnlineText.Join, language), Join);
             AddAction(language => Text(OnlineText.Back, language), Back);
@@ -512,7 +520,6 @@ internal static class TitleOnlineMenu
         if (button == null)
             return;
         RoomButtons.Add(button);
-        ActionButtons[action] = button;
         _manager.buttons.Add(button);
         button.Init(_manager);
         BindAction(button, _manager, action);
@@ -532,8 +539,6 @@ internal static class TitleOnlineMenu
     private static void AddInput(
         OnlineText label,
         string value,
-        int limit,
-        Action<string> apply,
         int action)
     {
         AddAction(language => Value(label, value ?? string.Empty, language), action);
@@ -576,6 +581,14 @@ internal static class TitleOnlineMenu
     private static void OnKeyboardPrefabLoaded(GameObject prefab)
     {
         _keyboardLoading = false;
+        var label = _pendingKeyboardLabel;
+        var value = _pendingKeyboardValue;
+        var limit = _pendingKeyboardLimit;
+        var apply = _pendingKeyboardApply;
+        _pendingKeyboardApply = null;
+        if (!_visible || _manager == null || apply == null)
+            return;
+
         var keyboard = FindKeyboard();
         if (keyboard == null && prefab != null)
         {
@@ -585,12 +598,7 @@ internal static class TitleOnlineMenu
             keyboard?.Init();
         }
 
-        var label = _pendingKeyboardLabel;
-        var value = _pendingKeyboardValue;
-        var limit = _pendingKeyboardLimit;
-        var apply = _pendingKeyboardApply;
-        _pendingKeyboardApply = null;
-        if (keyboard == null || apply == null)
+        if (keyboard == null)
         {
             SetKeyboardError(label, "keyboard prefab was not loaded");
             return;
@@ -729,7 +737,6 @@ internal static class TitleOnlineMenu
         }
         RoomButtons.Clear();
         RoomLabels.Clear();
-        ActionButtons.Clear();
     }
 
     private static void SetLocalizedText(TitleMenuButton button, Func<Languages, string> text)
