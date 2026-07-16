@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <Compile Remove="references\**\*.cs" />
+    <Compile Remove="build\**\*.cs" />
     <Reference Include="0Harmony" HintPath="$(GameInstallPath)\BepInEx\core\0Harmony.dll" Private="false" />
     <Reference Include="BepInEx.Core" HintPath="$(GameInstallPath)\BepInEx\core\BepInEx.Core.dll" Private="false" />
     <Reference Include="BepInEx.Unity.Common" HintPath="$(GameInstallPath)\BepInEx\core\BepInEx.Unity.Common.dll" Private="false" />
