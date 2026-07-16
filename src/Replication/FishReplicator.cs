@@ -36,13 +36,14 @@ internal sealed class FishReplicator
     }
 
     private readonly ManualLogSource _log;
-    private readonly RemoteCatchLedger _remoteCatch;
     private readonly Dictionary<int, FishAISystem> _hostFishById = new();
     private readonly Dictionary<FishAISystem, int> _hostIdsByFish = new();
     private readonly Dictionary<int, HostFish> _hostInfoById = new();
     private readonly Dictionary<int, Target> _targets = new();
     private readonly Dictionary<FishAISystem, int> _clientIdsByFish = new();
     private readonly HashSet<int> _removedIds = new();
+    private readonly HashSet<int> _pendingClientPickups = new();
+    private readonly HashSet<FishAISystem> _hostRemovedFish = new();
     private readonly HashSet<int> _missingAllocatorIds = new();
     private readonly HashSet<int> _fallbackAllocatorIds = new();
     private readonly Dictionary<uint, HashSet<int>> _clientManifestIds = new();
@@ -56,16 +57,12 @@ internal sealed class FishReplicator
     private bool _manifestStateQueued;
     private int _nextHostId = 1;
     private int _lastHostCount = -1;
-    private int _lastHostDuplicates = -1;
+    private bool _applyingClientPickup;
     private uint _manifestRevision;
     private uint _fishTick;
     private uint _latestClientManifestRevision;
 
-    internal FishReplicator(ManualLogSource log, RemoteCatchLedger remoteCatch)
-    {
-        _log = log;
-        _remoteCatch = remoteCatch;
-    }
+    internal FishReplicator(ManualLogSource log) => _log = log;
 
     internal void Update(
         SessionRole role,
@@ -81,6 +78,9 @@ internal sealed class FishReplicator
             {
             }
             while (session.TryTakeFishRemoved(out _))
+            {
+            }
+            while (session.TryTakeFishPickupResult(out _))
             {
             }
             while (session.TryTakeFishManifest(out _))
@@ -111,6 +111,9 @@ internal sealed class FishReplicator
             while (session.TryTakeFishRemoved(out _))
             {
             }
+            while (session.TryTakeFishPickupResult(out _))
+            {
+            }
             while (session.TryTakeFishManifest(out _))
             {
             }
@@ -131,6 +134,12 @@ internal sealed class FishReplicator
         {
             if (state.SceneId == sceneId)
                 ApplyClientManifestState(state);
+        }
+
+        while (session.TryTakeFishPickupResult(out var result))
+        {
+            if (result.SceneId == sceneId)
+                ApplyClientPickupResult(result, hostPlayer);
         }
 
         while (session.TryTakeFishRemoved(out var removed))
@@ -205,8 +214,23 @@ internal sealed class FishReplicator
 
     internal void RequestPickup(UdpSession session, uint sceneId, FishAISystem fish)
     {
-        if (fish != null && _clientIdsByFish.TryGetValue(fish, out var id))
+        if (fish != null && _clientIdsByFish.TryGetValue(fish, out var id) &&
+            _pendingClientPickups.Add(id))
             session.SendFishPickupRequest(new FishPickupRequest(sceneId, id));
+    }
+
+    internal bool ApplyingClientPickup => _applyingClientPickup;
+
+    internal void ObserveHostPickup(UdpSession session, uint sceneId, FishAISystem fish)
+    {
+        if (fish == null)
+            return;
+        _hostRemovedFish.Add(fish);
+        if (!_hostIdsByFish.TryGetValue(fish, out var id))
+            return;
+        session.SendFishRemoved(new FishRemoved(sceneId, id));
+        RemoveHostFish(id);
+        _log.LogInfo($"Network host fish pickup completed: id={id}");
     }
 
     internal bool IsClientProxy(FishAISystem fish) =>
@@ -219,6 +243,7 @@ internal sealed class FishReplicator
         _hostFishById.Clear();
         _hostIdsByFish.Clear();
         _hostInfoById.Clear();
+        _hostRemovedFish.Clear();
         ResetClientManifest();
         _nextHostScan = 0f;
         _nextSend = 0f;
@@ -226,7 +251,6 @@ internal sealed class FishReplicator
         _manifestStateQueued = false;
         _nextHostId = 1;
         _lastHostCount = -1;
-        _lastHostDuplicates = -1;
         _manifestRevision = 0;
         _fishTick = 0;
         _latestClientManifestRevision = 0;
@@ -293,20 +317,10 @@ internal sealed class FishReplicator
     {
         _nextHostScan = now + 1f;
         var allocators = new List<FishAllocator>();
-        var allocatorUidCounts = new Dictionary<string, int>();
-        var duplicateUids = new HashSet<string>();
         foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(FindObjectsSortMode.None))
         {
-            if (allocator == null)
-                continue;
-            var uid = GetAllocatorUid(allocator);
-            if (string.IsNullOrEmpty(uid))
-                continue;
-            allocators.Add(allocator);
-            allocatorUidCounts.TryGetValue(uid, out var count);
-            allocatorUidCounts[uid] = ++count;
-            if (count > 1)
-                duplicateUids.Add(uid);
+            if (allocator != null)
+                allocators.Add(allocator);
         }
 
         var allocatorByFish = new Dictionary<FishAISystem, FishAllocator>();
@@ -317,7 +331,7 @@ internal sealed class FishReplicator
                 continue;
             foreach (var fish in fishs)
             {
-                if (fish != null)
+                if (fish != null && !fish.IsFishCaptured && !_hostRemovedFish.Contains(fish))
                     allocatorByFish.TryAdd(fish, allocator);
             }
         }
@@ -365,13 +379,10 @@ internal sealed class FishReplicator
             info.FishDataTID = fishDataTID;
         }
 
-        if (_lastHostCount != _hostFishById.Count || _lastHostDuplicates != duplicateUids.Count)
+        if (_lastHostCount != _hostFishById.Count)
         {
-            _log.LogInfo(
-                $"Network fish host manifest: {_hostFishById.Count} fish; " +
-                $"{duplicateUids.Count} duplicate allocator UIDs");
+            _log.LogInfo($"Network fish host manifest: {_hostFishById.Count} fish");
             _lastHostCount = _hostFishById.Count;
-            _lastHostDuplicates = duplicateUids.Count;
         }
         if (_manifestRevision == 0 || topologyChanged)
         {
@@ -441,9 +452,13 @@ internal sealed class FishReplicator
         PlayerCharacter hostPlayer,
         FishPickupRequest request)
     {
-        if (request.SceneId != sceneId || hostPlayer == null ||
-            !TryGetRemotePlayer(session, sceneId, now, out var remotePlayer))
+        if (request.SceneId != sceneId)
             return;
+        if (hostPlayer == null || !TryGetRemotePlayer(session, sceneId, now, out var remotePlayer))
+        {
+            RejectHostPickup(session, request);
+            return;
+        }
         if (!_hostFishById.TryGetValue(request.Id, out var fish))
         {
             RefreshHostFish(session, sceneId, now);
@@ -455,31 +470,68 @@ internal sealed class FishReplicator
             !InRange(fish.transform.position, remotePlayer, 16f))
         {
             _log.LogWarning($"Network fish pickup rejected: id={request.Id}");
+            RejectHostPickup(session, request);
             return;
         }
 
-        var sourceId = RemoteCatchLedger.FishSource(sceneId, request.Id);
-        var expectedItemId = fish.GetDropItemID();
-        if (!_remoteCatch.CaptureFish(
-                sourceId,
-                expectedItemId,
-                () => body.SuccessInteract(null),
-                out var nativeCompleted))
+        try
         {
-            if (nativeCompleted && (fish == null || !fish.gameObject.activeInHierarchy))
-            {
-                session.SendFishRemoved(new FishRemoved(sceneId, request.Id));
-                RemoveHostFish(request.Id);
-            }
-            _log.LogWarning($"Network fish pickup could not enter remote carry: id={request.Id}");
+            _hostRemovedFish.Add(fish);
+            fish.DestroySelf();
+            session.SendFishPickupResult(new FishPickupResult(sceneId, request.Id, true));
+            RemoveHostFish(request.Id);
+            _log.LogInfo($"Network client fish pickup approved: id={request.Id}");
+        }
+        catch (Exception exception)
+        {
+            _hostRemovedFish.Remove(fish);
+            RejectHostPickup(session, request);
+            _log.LogWarning($"Network fish pickup failed: id={request.Id}; {exception.Message}");
+        }
+    }
+
+    private void RejectHostPickup(UdpSession session, FishPickupRequest request) =>
+        session.SendFishPickupResult(new FishPickupResult(request.SceneId, request.Id, false));
+
+    private void ApplyClientPickupResult(FishPickupResult result, PlayerCharacter player)
+    {
+        _pendingClientPickups.Remove(result.Id);
+        if (!result.Accepted)
+        {
+            player?.SuccessInteraction();
+            _log.LogWarning($"Network fish pickup was rejected: id={result.Id}");
             return;
         }
-        if (!nativeCompleted && fish != null)
-            fish.DestroySelf();
 
-        session.SendFishRemoved(new FishRemoved(sceneId, request.Id));
-        RemoveHostFish(request.Id);
-        _log.LogInfo($"Network fish pickup accepted: id={request.Id}");
+        _removedIds.Add(result.Id);
+        if (!_targets.TryGetValue(result.Id, out var target) || target.Fish == null || player == null)
+        {
+            player?.SuccessInteraction();
+            RemoveClientTarget(result.Id, true);
+            _log.LogWarning($"Network fish pickup approval had no local target: id={result.Id}");
+            return;
+        }
+
+        var fish = target.Fish;
+        try
+        {
+            var body = fish.GetInteractionBody;
+            if (body == null)
+                throw new InvalidOperationException("fish interaction body is missing");
+            _applyingClientPickup = true;
+            body.SuccessInteract(player);
+            _log.LogInfo($"Network client fish pickup completed: id={result.Id}");
+        }
+        catch (Exception exception)
+        {
+            player.SuccessInteraction();
+            _log.LogWarning($"Network client fish pickup completion failed: id={result.Id}; {exception.Message}");
+        }
+        finally
+        {
+            _applyingClientPickup = false;
+            RemoveClientTarget(result.Id, true);
+        }
     }
 
     private void ApplyClientManifest(FishManifest manifest, bool trackManifest = true)
@@ -703,6 +755,7 @@ internal sealed class FishReplicator
     private void ResetClientManifest()
     {
         _removedIds.Clear();
+        _pendingClientPickups.Clear();
         _missingAllocatorIds.Clear();
         _fallbackAllocatorIds.Clear();
         _clientManifestIds.Clear();
@@ -822,7 +875,16 @@ internal sealed class FishReplicator
             return;
         _clientIdsByFish.Remove(target.Fish);
         if (destroy)
-            target.Fish.DestroySelf();
+        {
+            try
+            {
+                target.Fish.DestroySelf();
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning($"Network fish proxy removal failed: id={id}; {exception.Message}");
+            }
+        }
     }
 
     private void RemoveHostFish(int id)
@@ -842,18 +904,6 @@ internal sealed class FishReplicator
                 _nextHostId = 1;
         }
         return _nextHostId++;
-    }
-
-    private static string GetAllocatorUid(FishAllocator allocator)
-    {
-        try
-        {
-            return allocator != null ? allocator.GetAllocatorUID() : string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
     }
 
     private static string GetNetworkAllocatorUid(uint sceneId, FishAllocator allocator) =>
@@ -936,8 +986,14 @@ internal static class FishQteDamagePatch
 [HarmonyPatch(typeof(FishInteractionBody), nameof(FishInteractionBody.SuccessInteract))]
 internal static class FishPickupPatch
 {
-    private static bool Prefix(FishInteractionBody __instance) =>
-        ProbeBehaviour.Instance?.AllowFishPickup(__instance) ?? true;
+    private static bool Prefix(FishInteractionBody __instance, out FishAISystem __state)
+    {
+        __state = __instance?.GetComponentInParent<FishAISystem>();
+        return ProbeBehaviour.Instance?.AllowFishPickup(__instance) ?? true;
+    }
+
+    private static void Postfix(FishAISystem __state) =>
+        ProbeBehaviour.Instance?.OnFishPickupSucceeded(__state);
 }
 
 [HarmonyPatch(typeof(FishAISystem), "Update")]

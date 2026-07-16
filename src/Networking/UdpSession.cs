@@ -30,6 +30,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
     private readonly ConcurrentQueue<FishDamageRequest> _fishDamageRequests = new();
     private readonly ConcurrentQueue<FishPickupRequest> _fishPickupRequests = new();
+    private readonly ConcurrentQueue<FishPickupResult> _fishPickupResults = new();
     private readonly ConcurrentQueue<FishRemoved> _fishRemovals = new();
     private readonly ConcurrentQueue<FishManifest> _fishManifests = new();
     private readonly ConcurrentQueue<FishManifestState> _fishManifestStates = new();
@@ -203,6 +204,15 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeFishPickupRequest(out FishPickupRequest request) =>
         _fishPickupRequests.TryDequeue(out request);
+
+    internal void SendFishPickupResult(FishPickupResult result)
+    {
+        if (_role == SessionRole.Host && SceneMatches(result.SceneId))
+            SendReliable(Protocol.EncodeFishPickupResult(++_sequence, result));
+    }
+
+    internal bool TryTakeFishPickupResult(out FishPickupResult result) =>
+        _fishPickupResults.TryDequeue(out result);
 
     internal void SendFishRemoved(FishRemoved removed)
     {
@@ -751,6 +761,18 @@ internal sealed class UdpSession : IDisposable
                 {
                     _fishPickupRequests.Enqueue(request);
                 }
+            }
+            return;
+        }
+
+        if (type == PacketType.FishPickupResult)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeFishPickupResult(received.Buffer, out _, out var result))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _fishPickupResults.Enqueue(result);
             }
             return;
         }
@@ -1306,6 +1328,9 @@ internal sealed class UdpSession : IDisposable
         while (_fishPickupRequests.TryDequeue(out _))
         {
         }
+        while (_fishPickupResults.TryDequeue(out _))
+        {
+        }
         while (_fishRemovals.TryDequeue(out _))
         {
         }
@@ -1392,6 +1417,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_missionStates.TryDequeue(out _))
+        {
+        }
+        while (_missionRosters.TryDequeue(out _))
         {
         }
         while (_worldFlagRequests.TryDequeue(out _))

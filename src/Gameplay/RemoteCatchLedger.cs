@@ -194,60 +194,6 @@ internal sealed class RemoteCatchLedger
         _log.LogInfo($"Dive result snapshot sent: {total} stacks");
     }
 
-    internal bool CaptureFish(
-        ulong sourceId,
-        int expectedItemId,
-        Action nativePickup,
-        out bool nativeCompleted)
-    {
-        nativeCompleted = false;
-        if (_acceptedSources.Contains(sourceId))
-        {
-            nativeCompleted = true;
-            return true;
-        }
-        if (_capture != null || _acceptedSources.Count >= MaxSources || nativePickup == null ||
-            _entries.Count > MaxStacks - 32 || !HasCarryCapacity())
-            return false;
-
-        var capture = new Capture();
-        Exception failure = null;
-        _capture = capture;
-        try
-        {
-            nativePickup();
-            nativeCompleted = true;
-        }
-        catch (Exception exception)
-        {
-            failure = exception;
-        }
-        finally
-        {
-            _capture = null;
-        }
-
-        if (capture.Entries.Count == 0 && expectedItemId > 0)
-        {
-            _log.LogWarning($"Remote fish produced no captured loot for item {expectedItemId}");
-            return false;
-        }
-
-        if (failure != null && capture.Entries.Count == 0)
-        {
-            _log.LogWarning($"Remote fish capture failed: {failure.Message}");
-            return false;
-        }
-
-        UpdateAcceptedMissions(capture.Entries);
-        _entries.AddRange(capture.Entries);
-        AddWeight(capture.Entries);
-        _acceptedSources.Add(sourceId);
-        if (failure != null)
-            _log.LogWarning($"Remote fish kept partial loot: {failure.Message}");
-        return true;
-    }
-
     internal bool CapturePickup(
         ulong sourceId,
         int expectedItemId,
@@ -433,9 +379,6 @@ internal sealed class RemoteCatchLedger
         Clear("result complete");
     }
 
-    internal static ulong FishSource(uint sceneId, int networkId) =>
-        0x4600000000000000UL ^ ((ulong)sceneId << 32) ^ (uint)networkId;
-
     internal static ulong PickupSource(uint sceneId, uint worldId) =>
         0x5000000000000000UL ^ ((ulong)sceneId << 32) ^ worldId;
 
@@ -489,7 +432,7 @@ internal sealed class RemoteCatchLedger
     private void AcceptRemoteLoot(DiveLootRequest request)
     {
         if (_entries.Count >= MaxStacks || request.ItemId <= 0 ||
-            request.Count is < 1 or > MaxCountPerAdd || !HasCarryCapacity())
+            request.Count is < 1 or > MaxCountPerAdd)
         {
             _log.LogWarning(
                 $"Remote loot rejected: item={request.ItemId}; count={request.Count}");

@@ -71,9 +71,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Instance = this;
         Application.runInBackground = true;
         _buildId = Protocol.SceneId(
-            $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}");
+            $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}|" +
+            typeof(Plugin).Module.ModuleVersionId);
         _remoteCatchLedger = new RemoteCatchLedger(Logger);
-        _fishReplicator = new FishReplicator(Logger, _remoteCatchLedger);
+        _fishReplicator = new FishReplicator(Logger);
         _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
         _missionProgressReplicator = new MissionProgressReplicator(Logger);
@@ -823,8 +824,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var fish = body.GetComponentInParent<FishAISystem>();
         if (fish == null)
             return true;
+        if (_fishReplicator?.ApplyingClientPickup ?? false)
+            return true;
         _fishReplicator?.RequestPickup(_session, _sceneId, fish);
         return false;
+    }
+
+    internal void OnFishPickupSucceeded(FishAISystem fish)
+    {
+        if (Role == SessionRole.Host && _session != null)
+            _fishReplicator?.ObserveHostPickup(_session, _sceneId, fish);
     }
 
     internal void OnSceneTransition(

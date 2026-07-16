@@ -46,7 +46,8 @@ internal enum PacketType : byte
     BossState = 40,
     ManagerEvent = 41,
     SushiResultState = 42,
-    MissionRoster = 43
+    MissionRoster = 43,
+    FishPickupResult = 44
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -120,6 +121,7 @@ internal readonly record struct FishDamageRequest(
     int AttackType);
 
 internal readonly record struct FishPickupRequest(uint SceneId, int Id);
+internal readonly record struct FishPickupResult(uint SceneId, int Id, bool Accepted);
 internal readonly record struct FishRemoved(uint SceneId, int Id);
 
 internal readonly record struct FishManifest(
@@ -260,7 +262,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 28;
+    private const byte Version = 29;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -275,6 +277,7 @@ internal static class Protocol
     private const int ManagerEventSize = HeaderSize + 22;
     private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 8;
+    private const int FishPickupResultSize = HeaderSize + 9;
     private const int FishRemovedSize = HeaderSize + 8;
     private const int FishManifestFixedSize = HeaderSize + 38;
     private const int FishManifestStateSize = HeaderSize + 10;
@@ -966,6 +969,8 @@ internal static class Protocol
 
     internal static byte[] EncodeFishPickupRequest(uint sequence, FishPickupRequest request)
     {
+        if (request.SceneId == 0 || request.Id <= 0)
+            throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[FishPickupRequestSize];
         WriteHeader(packet, PacketType.FishPickupRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
@@ -983,9 +988,42 @@ internal static class Protocol
         if (packet.Length != FishPickupRequestSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishPickupRequest)
             return false;
-        request = new FishPickupRequest(
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)));
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        if (sceneId == 0 || id <= 0)
+            return false;
+        request = new FishPickupRequest(sceneId, id);
+        return true;
+    }
+
+    internal static byte[] EncodeFishPickupResult(uint sequence, FishPickupResult result)
+    {
+        if (result.SceneId == 0 || result.Id <= 0)
+            throw new ArgumentOutOfRangeException(nameof(result));
+        var packet = new byte[FishPickupResultSize];
+        WriteHeader(packet, PacketType.FishPickupResult, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), result.SceneId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), result.Id);
+        packet[HeaderSize + 8] = result.Accepted ? (byte)1 : (byte)0;
+        return packet;
+    }
+
+    internal static bool TryDecodeFishPickupResult(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out FishPickupResult result)
+    {
+        sequence = 0;
+        result = default;
+        if (packet.Length != FishPickupResultSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishPickupResult)
+            return false;
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var accepted = packet[HeaderSize + 8];
+        if (sceneId == 0 || id <= 0 || accepted > 1)
+            return false;
+        result = new FishPickupResult(sceneId, id, accepted != 0);
         return true;
     }
 
@@ -2166,6 +2204,16 @@ internal static class Protocol
         if (!TryDecodeFishPickupRequest(fishPickupPacket, out sequence, out var actualFishPickup) ||
             sequence != 47 || actualFishPickup != expectedFishPickup)
             throw new InvalidOperationException("Fish pickup request round-trip failed");
+
+        var expectedFishPickupResult = new FishPickupResult(SceneId("A02_01_01"), 17, true);
+        var fishPickupResultPacket = EncodeFishPickupResult(48, expectedFishPickupResult);
+        if (!TryDecodeFishPickupResult(
+                fishPickupResultPacket, out sequence, out var actualFishPickupResult) ||
+            sequence != 48 || actualFishPickupResult != expectedFishPickupResult)
+            throw new InvalidOperationException("Fish pickup result round-trip failed");
+        fishPickupResultPacket[HeaderSize + 8] = 2;
+        if (TryDecodeFishPickupResult(fishPickupResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish pickup result");
 
         var expectedFishRemoved = new FishRemoved(SceneId("A02_01_01"), 17);
         var fishRemovedPacket = EncodeFishRemoved(48, expectedFishRemoved);

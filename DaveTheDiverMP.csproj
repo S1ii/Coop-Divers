@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DaveTheDiverMP</AssemblyName>
-    <Version>0.17.0</Version>
+    <Version>0.18.0</Version>
     <Deterministic>true</Deterministic>
     <GameInstallPath Condition="'$(GameInstallPath)' == ''">..\DAVE THE DIVER</GameInstallPath>
     <DeployPlugin Condition="'$(DeployPlugin)' == ''">false</DeployPlugin>
