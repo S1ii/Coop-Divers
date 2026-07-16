@@ -34,8 +34,8 @@ internal static class TravelTargets
     internal static uint JungleFastTravel(
         string sceneName,
         SceneType sceneType,
-        SceneConnectLocationID location) =>
-        Protocol.SceneId($"travel:jungle:{sceneName}:{(int)sceneType}:{(int)location}") | 0x80000000u;
+        int location) =>
+        Protocol.SceneId($"travel:jungle:{sceneName}:{(int)sceneType}:{location}") | 0x80000000u;
 
     internal static string Name(uint targetId) => targetId switch
     {
@@ -336,14 +336,15 @@ internal sealed class TravelCoordinator
             TravelTargets.JungleFastTravel(
                 route.SceneName,
                 (SceneType)route.SceneType,
-                (SceneConnectLocationID)route.Location) == targetId)
+                route.Location) == targetId)
         {
             var fastTravel = FindLoaded<JDLC.FastTravelPanelController>();
             if (fastTravel != null)
-                return () => fastTravel.ChangeScene(
+                return () => ChangeJungleScene(
+                    fastTravel,
                     route.SceneName,
                     (SceneType)route.SceneType,
-                    (SceneConnectLocationID)route.Location,
+                    route.Location,
                     (SceneTransitionType)route.TransitionType);
         }
 
@@ -395,6 +396,25 @@ internal sealed class TravelCoordinator
 
     private static bool IsLoaded(Component component) =>
         component != null && component.gameObject != null && component.gameObject.scene.IsValid();
+
+    internal static void ChangeJungleScene(
+        JDLC.FastTravelPanelController panel,
+        string sceneName,
+        SceneType sceneType,
+        object location,
+        SceneTransitionType transitionType)
+    {
+        var method = Array.Find(
+            typeof(JDLC.FastTravelPanelController).GetMethods(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic),
+            candidate =>
+                candidate.Name == nameof(JDLC.FastTravelPanelController.ChangeScene) &&
+                candidate.GetParameters().Length == 4);
+        var locationType = method?.GetParameters()[2].ParameterType;
+        if (locationType?.IsEnum == true && !locationType.IsInstanceOfType(location))
+            location = Enum.ToObject(locationType, Convert.ToInt32(location));
+        method?.Invoke(panel, new[] { sceneName, sceneType, location, transitionType });
+    }
 
     private void ScanElements()
     {
@@ -549,7 +569,7 @@ internal static class JungleFastTravelPatch
         JDLC.FastTravelPanelController __instance,
         string __0,
         SceneType __1,
-        SceneConnectLocationID __2,
+        object __2,
         SceneTransitionType __3) =>
         ProbeBehaviour.Instance?.RequestJungleFastTravel(__instance, __0, __1, __2, __3) ?? true;
 }

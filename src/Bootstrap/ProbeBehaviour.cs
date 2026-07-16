@@ -655,17 +655,17 @@ public sealed class ProbeBehaviour : MonoBehaviour
         JDLC.FastTravelPanelController panel,
         string sceneName,
         SceneType sceneType,
-        SceneConnectLocationID location,
+        object location,
         SceneTransitionType transitionType) =>
         _travelCoordinator?.Request(
             Role, _session,
-            TravelTargets.JungleFastTravel(sceneName, sceneType, location),
-            () => panel.ChangeScene(sceneName, sceneType, location, transitionType),
+            TravelTargets.JungleFastTravel(sceneName, sceneType, Convert.ToInt32(location)),
+            () => TravelCoordinator.ChangeJungleScene(panel, sceneName, sceneType, location, transitionType),
             _diveCoordinator?.AnyPlayerDead ?? false,
             _diveCoordinator?.HostDead ?? false,
             null,
             new TravelRoute(
-                sceneName, (int)sceneType, (int)location, (int)transitionType)) ?? true;
+                sceneName, (int)sceneType, Convert.ToInt32(location), (int)transitionType)) ?? true;
 
     internal bool AllowSceneTransition(string sceneName)
     {
