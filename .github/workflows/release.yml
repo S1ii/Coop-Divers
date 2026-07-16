@@ -1,76 +1,30 @@
-name: Release
+name: Promote release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Prerelease tag to promote
+        required: true
+        type: string
 
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
-  release:
-    name: Build and publish release
-    runs-on: windows-latest
+  promote:
+    name: Promote prerelease
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - name: Check release configuration
-        shell: pwsh
-        env:
-          REFERENCE_REPOSITORY: ${{ vars.REFERENCE_REPOSITORY }}
-          REFERENCE_REPOSITORY_SSH_KEY: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY)) {
-            throw 'Repository variable REFERENCE_REPOSITORY is required for releases.'
-          }
-          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_SSH_KEY)) {
-            throw 'Repository secret REFERENCE_REPOSITORY_SSH_KEY is required for releases.'
-          }
-      - name: Check version
-        shell: pwsh
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          [xml]$project = Get-Content .\DaveTheDiverMP.csproj
-          $projectVersion = [string]$project.Project.PropertyGroup.Version
-          $releaseVersion = $env:REF_NAME.TrimStart('v')
-          if ($releaseVersion -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Release version must use major.minor.patch: $releaseVersion"
-          }
-          if ($projectVersion -ne $releaseVersion) {
-            throw "Project version $projectVersion does not match release version $releaseVersion."
-          }
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: 6.0.x
-      - name: Fetch private game references
-        uses: actions/checkout@v7
-        with:
-          repository: ${{ vars.REFERENCE_REPOSITORY }}
-          ssh-key: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
-          path: game-references
-      - name: Restore
-        shell: pwsh
-        run: dotnet restore .\DaveTheDiverMP.csproj
-      - name: Build
-        shell: pwsh
-        run: dotnet build .\DaveTheDiverMP.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
-      - name: Package
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          $version = $env:RELEASE_VERSION.TrimStart('v')
-          .\build\package.ps1 -Configuration Release -Version $version
-      - name: Create GitHub Release
-        shell: pwsh
+      - name: Promote GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
-          $archive = Get-ChildItem .\artifacts\*.zip | Select-Object -First 1
-          $checksum = Get-ChildItem .\artifacts\*.sha256 | Select-Object -First 1
-          gh release create $env:GITHUB_REF_NAME $archive.FullName $checksum.FullName --verify-tag --generate-notes
+          set -euo pipefail
+          is_prerelease=$(gh release view "$RELEASE_TAG" --json isPrerelease --jq .isPrerelease)
+          if [ "$is_prerelease" != true ]; then
+            echo "Release $RELEASE_TAG is not a prerelease." >&2
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --prerelease=false --latest

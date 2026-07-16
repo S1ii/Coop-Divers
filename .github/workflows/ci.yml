@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -17,61 +19,101 @@ jobs:
     name: Repository hygiene
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Verify repository hygiene
         shell: pwsh
         run: .\build\verify-repo.ps1
 
   build:
     name: Build and package
-    if: ${{ vars.REFERENCE_REPOSITORY != '' }}
+    if: github.event_name != 'pull_request'
     needs: hygiene
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Check reference configuration
         shell: pwsh
         env:
+          REFERENCE_REPOSITORY: ${{ vars.REFERENCE_REPOSITORY }}
+          REFERENCE_REPOSITORY_REF: ${{ vars.REFERENCE_REPOSITORY_REF }}
           REFERENCE_REPOSITORY_SSH_KEY: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_SSH_KEY)) {
-            throw 'Repository secret REFERENCE_REPOSITORY_SSH_KEY is required when REFERENCE_REPOSITORY is set.'
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY)) {
+            throw 'Repository variable REFERENCE_REPOSITORY is required.'
           }
-      - uses: actions/setup-dotnet@v5
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_REF)) {
+            throw 'Repository variable REFERENCE_REPOSITORY_REF is required.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:REFERENCE_REPOSITORY_SSH_KEY)) {
+            throw 'Repository secret REFERENCE_REPOSITORY_SSH_KEY is required.'
+          }
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 6.0.x
       - name: Fetch private game references
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ vars.REFERENCE_REPOSITORY }}
+          ref: ${{ vars.REFERENCE_REPOSITORY_REF }}
           ssh-key: ${{ secrets.REFERENCE_REPOSITORY_SSH_KEY }}
           path: game-references
+          persist-credentials: false
+      - name: Set prerelease version
+        id: version
+        shell: pwsh
+        run: |
+          [xml]$project = Get-Content .\DaveTheDiverMP.csproj
+          $baseVersion = [string]$project.Project.PropertyGroup.Version
+          if ($baseVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Project version must use major.minor.patch: $baseVersion"
+          }
+          "value=$baseVersion-ci.${{ github.run_number }}" >> $env:GITHUB_OUTPUT
       - name: Restore
         shell: pwsh
         run: dotnet restore .\DaveTheDiverMP.csproj
       - name: Build
         shell: pwsh
-        run: dotnet build .\DaveTheDiverMP.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
+        run: dotnet build .\DaveTheDiverMP.csproj -c Release --no-restore -p:ContinuousIntegrationBuild=true -p:Version=${{ steps.version.outputs.value }} -p:GameInstallPath="$env:GITHUB_WORKSPACE\game-references" -p:DeployPlugin=false
       - name: Package
         shell: pwsh
-        run: .\build\package.ps1 -Configuration Release
+        run: .\build\package.ps1 -Configuration Release -Version ${{ steps.version.outputs.value }}
       - name: Upload package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0 # v7.0.1
         with:
-          name: DaveTheDiverMP
+          name: DaveTheDiverMP-${{ steps.version.outputs.value }}
           path: |
             artifacts/*.zip
             artifacts/*.sha256
           if-no-files-found: error
           retention-days: 14
 
-  reference-configuration:
-    name: Reference configuration
-    if: ${{ vars.REFERENCE_REPOSITORY == '' }}
-    needs: hygiene
+  prerelease:
+    name: Publish prerelease
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build
     runs-on: windows-latest
+    permissions:
+      contents: write
     steps:
-      - name: Explain skipped build
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: DaveTheDiverMP-${{ needs.build.outputs.version }}
+          path: artifacts
+      - name: Create GitHub prerelease
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: v${{ needs.build.outputs.version }}
         run: |
-          Write-Host 'Build/package skipped: set repository variable REFERENCE_REPOSITORY and secret REFERENCE_REPOSITORY_SSH_KEY to enable CI builds.'
+          if (gh release view $env:RELEASE_TAG 2>$null) {
+            Write-Host "Prerelease $env:RELEASE_TAG already exists."
+            exit 0
+          }
+          $assets = Get-ChildItem .\artifacts\DaveTheDiverMP-*
+          gh release create $env:RELEASE_TAG $assets.FullName --prerelease --target $env:GITHUB_SHA --generate-notes --title $env:RELEASE_TAG
