@@ -745,8 +745,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value) =>
         _worldStateReplicator?.ObserveHostSave(Role, _session, saveObject, value);
 
-    internal bool AllowBossDamage(BossControllerBase boss, AttackData attack) =>
-        _bossReplicator?.AllowDamage(Role, _session, _sceneId, boss, attack) ?? true;
+    internal bool AllowBossHpWrite(BossControllerBase boss, int hp) =>
+        _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
 
     internal bool TryCaptureRemoteLoot(
         int itemId,

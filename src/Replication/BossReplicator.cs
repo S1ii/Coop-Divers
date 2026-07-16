@@ -17,6 +17,7 @@ internal sealed class BossReplicator
         internal bool WasEnabled;
         internal int OriginalHp;
         internal int OriginalMaxHp;
+        internal int AuthoritativeHp;
         internal Vector3 OriginalPosition;
         internal Animator Animator;
     }
@@ -30,6 +31,7 @@ internal sealed class BossReplicator
     private float _nextScan;
     private float _nextSend;
     private uint _tick;
+    private bool _applyingClientState;
 
     internal BossReplicator(ManualLogSource log) => _log = log;
 
@@ -82,45 +84,48 @@ internal sealed class BossReplicator
         ApplyClientStates(deltaTime);
     }
 
-    internal bool AllowDamage(
+    internal bool AllowHpWrite(
         SessionRole role,
         UdpSession session,
         uint sceneId,
         BossControllerBase boss,
-        AttackData attack)
+        int hp)
     {
-        if (role != SessionRole.Client || session == null || !session.Connected || boss == null)
+        if (_applyingClientState || role != SessionRole.Client || session == null ||
+            !session.Connected || boss == null)
             return true;
-        try
+        foreach (var pair in _clientTargets)
         {
-            if (attack != null && FishReplicator.IsPlayerAttack(attack.attackType))
-            {
-                var element = Math.Clamp((int)attack.element, 0, 32);
+            var target = pair.Value;
+            if (target.Boss != boss)
+                continue;
+            if (hp < target.AuthoritativeHp)
                 session.SendBossDamageRequest(new BossDamageRequest(
-                    sceneId,
-                    WorldObjectId.For(sceneId, boss, boss.fishID),
-                    Math.Clamp(attack.BuffedDamage, 1, 10_000),
-                    element,
-                    (int)attack.attackType));
-            }
+                    sceneId, pair.Key, Math.Clamp(target.AuthoritativeHp - hp, 1, 10_000),
+                    0, (int)AttackType.Player_All));
+            return false;
         }
-        catch (Exception exception)
-        {
-            _log.LogWarning($"Network boss damage request failed: {exception.Message}");
-        }
-        return false;
+        return true;
     }
 
     internal void Clear()
     {
-        foreach (var target in _clientTargets.Values)
-            if (target.Boss != null)
-            {
-                target.Boss.enabled = target.WasEnabled;
-                target.Boss.bossMaxHP = target.OriginalMaxHp;
-                target.Boss.CurrentBossHP = target.OriginalHp;
-                target.Boss.transform.position = target.OriginalPosition;
-            }
+        _applyingClientState = true;
+        try
+        {
+            foreach (var target in _clientTargets.Values)
+                if (target.Boss != null)
+                {
+                    target.Boss.enabled = target.WasEnabled;
+                    target.Boss.bossMaxHP = target.OriginalMaxHp;
+                    target.Boss.CurrentBossHP = target.OriginalHp;
+                    target.Boss.transform.position = target.OriginalPosition;
+                }
+        }
+        finally
+        {
+            _applyingClientState = false;
+        }
         _hostBosses.Clear();
         _clientTargets.Clear();
         _lastHostStates.Clear();
@@ -160,6 +165,7 @@ internal sealed class BossReplicator
                 WasEnabled = boss.enabled,
                 OriginalHp = boss.CurrentBossHP,
                 OriginalMaxHp = boss.bossMaxHP,
+                AuthoritativeHp = boss.CurrentBossHP,
                 OriginalPosition = boss.transform.position,
                 Animator = boss.GetComponentInChildren<Animator>(true)
             };
@@ -236,16 +242,25 @@ internal sealed class BossReplicator
 
     private void ApplyClientStates(float deltaTime)
     {
-        foreach (var pair in _pendingClientStates)
+        _applyingClientState = true;
+        try
         {
-            if (!_clientTargets.TryGetValue(pair.Key, out var target) || target.Boss == null)
-                continue;
-            var state = pair.Value;
-            target.Tick = state.Tick;
-            target.Position = new Vector3(state.X, state.Y, state.Z);
-            target.Boss.bossMaxHP = state.MaxHp;
-            target.Boss.CurrentBossHP = state.CurrentHp;
-            ApplyAnimation(target.Animator, state.AnimationHash, state.AnimationTime);
+            foreach (var pair in _pendingClientStates)
+            {
+                if (!_clientTargets.TryGetValue(pair.Key, out var target) || target.Boss == null)
+                    continue;
+                var state = pair.Value;
+                target.Tick = state.Tick;
+                target.Position = new Vector3(state.X, state.Y, state.Z);
+                target.Boss.bossMaxHP = state.MaxHp;
+                target.AuthoritativeHp = state.CurrentHp;
+                target.Boss.CurrentBossHP = state.CurrentHp;
+                ApplyAnimation(target.Animator, state.AnimationHash, state.AnimationTime);
+            }
+        }
+        finally
+        {
+            _applyingClientState = false;
         }
         foreach (var id in _clientTargets.Keys)
             _pendingClientStates.Remove(id);
@@ -292,24 +307,9 @@ internal sealed class BossReplicator
         unchecked((int)(value - previous)) > 0;
 }
 
-[HarmonyPatch]
-internal static class BossDamagePatch
+[HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.CurrentBossHP), MethodType.Setter)]
+internal static class BossHpAuthorityPatch
 {
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        foreach (var type in AccessTools.GetTypesFromAssembly(typeof(BossControllerBase).Assembly))
-        {
-            if (type != typeof(BossControllerBase) && !type.IsSubclassOf(typeof(BossControllerBase)))
-                continue;
-            var method = AccessTools.DeclaredMethod(
-                type,
-                nameof(BossControllerBase.OnTakeDamage),
-                new[] { typeof(AttackData), typeof(DefenseData) });
-            if (method != null)
-                yield return method;
-        }
-    }
-
-    private static bool Prefix(BossControllerBase __instance, AttackData __0) =>
-        ProbeBehaviour.Instance?.AllowBossDamage(__instance, __0) ?? true;
+    private static bool Prefix(BossControllerBase __instance, int __0) =>
+        ProbeBehaviour.Instance?.AllowBossHpWrite(__instance, __0) ?? true;
 }
