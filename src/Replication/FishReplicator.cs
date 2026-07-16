@@ -45,6 +45,8 @@ internal sealed class FishReplicator
     private readonly Dictionary<FishAISystem, int> _clientIdsByFish = new();
     private readonly HashSet<int> _removedIds = new();
     private readonly HashSet<int> _pendingClientPickups = new();
+    private readonly HashSet<int> _pendingClientCaptures = new();
+    private readonly HashSet<FishAISystem> _clientDamageScopes = new();
     private readonly HashSet<FishAISystem> _hostRemovedFish = new();
     private readonly HashSet<FishAISystem> _suppressedClientFish = new();
     private readonly HashSet<int> _missingAllocatorIds = new();
@@ -53,6 +55,7 @@ internal sealed class FishReplicator
     private readonly Dictionary<uint, ushort> _finalizedClientManifestCounts = new();
     private readonly Dictionary<int, FishManifest> _pendingClientManifests = new();
     private readonly Dictionary<int, float> _nextRemoteStimulusById = new();
+    private readonly Dictionary<int, float> _lastRemoteDamageById = new();
     private readonly HashSet<int> _remoteStimulatedIds = new();
     private readonly List<FishSnapshot> _snapshotBuffer = new();
     private float _nextHostScan;
@@ -236,7 +239,43 @@ internal sealed class FishReplicator
         return true;
     }
 
+    internal bool BeginClientDamage(
+        UdpSession session,
+        uint sceneId,
+        FishAISystem fish,
+        AttackData attackData)
+    {
+        if (fish == null || attackData == null || !IsPlayerAttack(attackData.attackType))
+            return false;
+        if (!IsClientProxy(fish))
+        {
+            _trace?.Write("DAMAGE-BLOCK",
+                $"unmapped OnTakeDamage type={fish.FishDataTID} instance={fish.GetInstanceID()}");
+            return false;
+        }
+        RequestDamage(
+            session, sceneId, fish, Math.Max(1, attackData.damage),
+            attackData.element, attackData.attackType);
+        _clientDamageScopes.Add(fish);
+        return true;
+    }
+
+    internal void EndClientDamage(FishAISystem fish) => _clientDamageScopes.Remove(fish);
+
+    internal bool IsClientDamageScoped(FishAISystem fish) =>
+        fish != null && _clientDamageScopes.Contains(fish);
+
     internal bool RequestPickup(UdpSession session, uint sceneId, FishAISystem fish)
+        => RequestPickup(session, sceneId, fish, false);
+
+    internal bool RequestCapture(UdpSession session, uint sceneId, FishAISystem fish)
+        => RequestPickup(session, sceneId, fish, true);
+
+    private bool RequestPickup(
+        UdpSession session,
+        uint sceneId,
+        FishAISystem fish,
+        bool capture)
     {
         if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id))
         {
@@ -245,10 +284,13 @@ internal sealed class FishReplicator
                 $"unmapped type={fish.FishDataTID} instance={fish.GetInstanceID()}");
             return false;
         }
+        if (capture)
+            _pendingClientCaptures.Add(id);
         if (!_pendingClientPickups.Add(id))
             return true;
         session.SendFishPickupRequest(new FishPickupRequest(sceneId, id));
-        _trace?.Write("PICKUP-SEND", $"id={id} type={fish.FishDataTID}");
+        _trace?.Write(capture ? "CAPTURE-SEND" : "PICKUP-SEND",
+            $"id={id} type={fish.FishDataTID}");
         return true;
     }
 
@@ -277,6 +319,8 @@ internal sealed class FishReplicator
         _hostIdsByFish.Clear();
         _hostInfoById.Clear();
         _hostRemovedFish.Clear();
+        _clientDamageScopes.Clear();
+        _lastRemoteDamageById.Clear();
         _nextRemoteStimulusById.Clear();
         _remoteStimulatedIds.Clear();
         ResetClientManifest();
@@ -649,6 +693,7 @@ internal sealed class FishReplicator
                 $"id={request.Id} type={fish.FishDataTID} damage={request.Damage} " +
                 $"attack={(AttackType)request.AttackType} hp={hpBefore:F1}->{fish.HP:F1} " +
                 $"corpse={fish.IsCorpse} enabled={fish.IsFishEnable}");
+            _lastRemoteDamageById[request.Id] = now;
         }
         catch (Exception exception)
         {
@@ -682,14 +727,20 @@ internal sealed class FishReplicator
             _hostFishById.TryGetValue(request.Id, out fish);
         }
         var body = fish != null ? fish.GetInteractionBody : null;
-        if (fish == null || body == null || !body.IsEnableInteraction ||
-            body.InteractionType != FishInteractionBody.FishInteractionType.Pickup ||
-            !InRange(fish.transform.position, remotePlayer, 16f))
+        var normalPickup = fish != null && body != null && body.IsEnableInteraction &&
+            body.InteractionType == FishInteractionBody.FishInteractionType.Pickup &&
+            InRange(fish.transform.position, remotePlayer, 16f);
+        var recentCapture = fish != null &&
+            _lastRemoteDamageById.TryGetValue(request.Id, out var lastDamage) &&
+            now - lastDamage is >= 0f and <= 12f &&
+            InRange(fish.transform.position, remotePlayer, 1600f);
+        if (!normalPickup && !recentCapture)
         {
             _log.LogWarning($"Network fish pickup rejected: id={request.Id}");
             _trace?.Write("PICKUP-REJECT",
                 $"id={request.Id} reason=state fish={fish != null} body={body != null} " +
-                $"enabled={body?.IsEnableInteraction} type={body?.InteractionType}");
+                $"enabled={body?.IsEnableInteraction} type={body?.InteractionType} " +
+                $"recentDamage={recentCapture}");
             RejectHostPickup(session, request);
             return;
         }
@@ -701,7 +752,8 @@ internal sealed class FishReplicator
             session.SendFishPickupResult(new FishPickupResult(sceneId, request.Id, true));
             RemoveHostFish(request.Id);
             _log.LogInfo($"Network client fish pickup approved: id={request.Id}");
-            _trace?.Write("PICKUP-ACCEPT", $"id={request.Id} type={fish.FishDataTID}");
+            _trace?.Write(recentCapture && !normalPickup ? "CAPTURE-ACCEPT" : "PICKUP-ACCEPT",
+                $"id={request.Id} type={fish.FishDataTID}");
         }
         catch (Exception exception)
         {
@@ -719,6 +771,17 @@ internal sealed class FishReplicator
     private void ApplyClientPickupResult(FishPickupResult result, PlayerCharacter player)
     {
         _pendingClientPickups.Remove(result.Id);
+        if (_pendingClientCaptures.Remove(result.Id))
+        {
+            if (result.Accepted)
+            {
+                _removedIds.Add(result.Id);
+                RemoveClientTarget(result.Id, true);
+            }
+            _trace?.Write("CAPTURE-RESULT",
+                $"id={result.Id} accepted={result.Accepted}");
+            return;
+        }
         if (!result.Accepted)
         {
             player?.SuccessInteraction();
@@ -902,6 +965,7 @@ internal sealed class FishReplicator
     {
         _removedIds.Clear();
         _pendingClientPickups.Clear();
+        _pendingClientCaptures.Clear();
         _missingAllocatorIds.Clear();
         _pendingClientManifests.Clear();
         _clientManifestIds.Clear();
@@ -1084,6 +1148,7 @@ internal sealed class FishReplicator
             _hostIdsByFish.Remove(fish);
         _hostFishById.Remove(id);
         _hostInfoById.Remove(id);
+        _lastRemoteDamageById.Remove(id);
         _nextRemoteStimulusById.Remove(id);
         _remoteStimulatedIds.Remove(id);
     }
@@ -1165,6 +1230,38 @@ internal static class FishDamagePatch
     }
 }
 
+[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.OnTakeDamage))]
+internal static class FishTakeDamagePatch
+{
+    private static bool Prefix(
+        FishAISystem __instance,
+        AttackData __0,
+        ref bool __result,
+        out bool __state)
+    {
+        var behaviour = ProbeBehaviour.Instance;
+        if (behaviour == null)
+        {
+            __state = false;
+            return true;
+        }
+        var allow = behaviour.BeginFishDamage(__instance, __0, out __state);
+        if (!allow)
+            __result = false;
+        return allow;
+    }
+
+    private static void Postfix(FishAISystem __instance, bool __state) =>
+        ProbeBehaviour.Instance?.EndFishDamage(__instance, __state);
+}
+
+[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetTrueHPDamage))]
+internal static class FishTrueDamagePatch
+{
+    private static bool Prefix(FishAISystem __instance) =>
+        ProbeBehaviour.Instance?.AllowFishTrueDamage(__instance) ?? true;
+}
+
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetHPDamageQTE))]
 internal static class FishQteDamagePatch
 {
@@ -1174,6 +1271,13 @@ internal static class FishQteDamagePatch
         return behaviour?.AllowFishDamage(
             __instance, damage, element, AttackType.QTE_Damage) ?? true;
     }
+}
+
+[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.WinFromProjectileinFight))]
+internal static class FishHarpoonWinPatch
+{
+    private static void Prefix(FishAISystem __instance) =>
+        ProbeBehaviour.Instance?.OnFishCaptureWon(__instance);
 }
 
 [HarmonyPatch(typeof(FishInteractionBody), nameof(FishInteractionBody.SuccessInteract))]

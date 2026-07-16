@@ -10,6 +10,7 @@ internal sealed class MissionProgressReplicator
     private const float KeyframeInterval = 5f;
     private const float FullKeyframeInterval = 60f;
     private readonly ManualLogSource _log;
+    private readonly SessionTrace _trace;
     private readonly Dictionary<int, MissionState> _hostStates = new();
     private readonly Dictionary<int, uint> _clientRevisions = new();
     private readonly Dictionary<int, MissionState> _pendingClientStates = new();
@@ -26,7 +27,11 @@ internal sealed class MissionProgressReplicator
     private uint _clientRosterRevision;
     private MissionRoster _pendingClientRoster;
 
-    internal MissionProgressReplicator(ManualLogSource log) => _log = log;
+    internal MissionProgressReplicator(ManualLogSource log, SessionTrace trace)
+    {
+        _log = log;
+        _trace = trace;
+    }
 
     internal void Update(SessionRole role, UdpSession session, float now)
     {
@@ -106,12 +111,16 @@ internal sealed class MissionProgressReplicator
                 continue;
             _pendingClientStates[state.MissionId] = state;
         }
+        var changed = false;
         foreach (var pair in new List<KeyValuePair<int, MissionState>>(_pendingClientStates))
             if (ApplyClientState(pair.Value, preserveOriginal: true))
             {
                 _clientRevisions[pair.Key] = pair.Value.Revision;
                 _pendingClientStates.Remove(pair.Key);
+                changed = true;
             }
+        if (changed)
+            RefreshClientMissionUI("state");
     }
 
     internal void Clear()
@@ -189,6 +198,7 @@ internal sealed class MissionProgressReplicator
                 _clientRosterIds.Add(missionId);
 
             var reset = 0;
+            var resetIds = new List<int>();
             foreach (var mission in manager.MissionDictionary.Values)
             {
                 if (mission == null || mission.TID <= 0 ||
@@ -199,7 +209,10 @@ internal sealed class MissionProgressReplicator
                     1, mission.TID, 0, (byte)global::MissionState.NotStarted, 0,
                     Array.Empty<MissionConditionState>());
                 if (ApplyClientState(state, preserveOriginal: true))
+                {
                     reset++;
+                    resetIds.Add(mission.TID);
+                }
             }
             foreach (var missionId in new List<int>(_pendingClientStates.Keys))
                 if (!_clientRosterIds.Contains(missionId))
@@ -207,6 +220,10 @@ internal sealed class MissionProgressReplicator
             _log.LogInfo(
                 $"Mission roster applied: revision={roster.Revision}; " +
                 $"missions={roster.MissionIds.Length}; reset={reset}");
+            RefreshClientMissionUI("roster");
+            _trace?.Write("MISSION-ROSTER",
+                $"revision={roster.Revision} missions={roster.MissionIds.Length} " +
+                $"reset={reset} ids={string.Join(',', resetIds)}");
             return true;
         }
         catch (Exception exception)
@@ -289,6 +306,26 @@ internal sealed class MissionProgressReplicator
         foreach (var state in _clientOriginals.Values)
             ApplyClientState(state, preserveOriginal: false);
         _clientOriginals.Clear();
+    }
+
+    private void RefreshClientMissionUI(string source)
+    {
+        try
+        {
+            var manager = MissionManager.Instance;
+            if (manager == null)
+                return;
+            manager.OrderInProgressList();
+            manager.RaiseInProgressChanged();
+            manager.RefreshMissionEventListener();
+            _trace?.Write("MISSION-HUD", $"refreshed source={source}");
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning($"Mission HUD refresh failed: {exception.Message}");
+            _trace?.Write("MISSION-HUD-ERROR",
+                $"source={source} error={exception.GetType().Name}:{exception.Message}");
+        }
     }
 
     private void ClearNetworkState()

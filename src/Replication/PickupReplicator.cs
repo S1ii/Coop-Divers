@@ -11,6 +11,7 @@ internal sealed class PickupReplicator
 {
     private readonly ManualLogSource _log;
     private readonly RemoteCatchLedger _remoteCatch;
+    private readonly SessionTrace _trace;
     private readonly Dictionary<uint, PickupInstanceItem> _items = new();
     private readonly Dictionary<uint, PickupRemoved> _pending = new();
     private readonly Dictionary<uint, PickupRemoved> _hostPending = new();
@@ -20,10 +21,14 @@ internal sealed class PickupReplicator
     private int _lastDuplicateCount = -1;
     private PlayerCharacter _clientPlayer;
 
-    internal PickupReplicator(ManualLogSource log, RemoteCatchLedger remoteCatch)
+    internal PickupReplicator(
+        ManualLogSource log,
+        RemoteCatchLedger remoteCatch,
+        SessionTrace trace)
     {
         _log = log;
         _remoteCatch = remoteCatch;
+        _trace = trace;
     }
 
     internal void Update(
@@ -86,6 +91,7 @@ internal sealed class PickupReplicator
         if (_approvedClientPickups.Contains(worldId))
             return true;
         session.SendPickupRequest(new PickupRemoved(sceneId, worldId, item.GetItemID()));
+        _trace?.Write("ITEM-SEND", $"world={worldId:X8} item={item.GetItemID()}");
         return false;
     }
 
@@ -189,6 +195,9 @@ internal sealed class PickupReplicator
             }
         }
         item.DestroyItem();
+        player?.SuccessInteraction();
+        _trace?.Write("ITEM-APPLY",
+            $"world={removed.WorldId:X8} item={removed.ItemId} interaction=completed");
         return true;
     }
 
@@ -202,7 +211,10 @@ internal sealed class PickupReplicator
         if (request.SceneId != sceneId || hostPlayer == null ||
             !session.TryGetFreshRemotePlayerSnapshot(now, 0.75f, out var remotePlayer) ||
             remotePlayer.SceneId != sceneId)
+        {
+            _trace?.Write("ITEM-REJECT", $"world={request.WorldId:X8} reason=player-or-scene");
             return;
+        }
 
         if (!_items.TryGetValue(request.WorldId, out var item))
         {
@@ -210,7 +222,10 @@ internal sealed class PickupReplicator
             _items.TryGetValue(request.WorldId, out item);
         }
         if (item == null || item.GetItemID() != request.ItemId)
+        {
+            _trace?.Write("ITEM-REJECT", $"world={request.WorldId:X8} reason=missing-or-id");
             return;
+        }
         var itemPosition = item.transform.position;
         var dx = itemPosition.x - remotePlayer.X;
         var dy = itemPosition.y - remotePlayer.Y;
@@ -274,6 +289,8 @@ internal sealed class PickupReplicator
 
         _items.Remove(request.WorldId);
         _log.LogInfo($"Network pickup accepted into remote carry: {itemId} x{count}");
+        _trace?.Write("ITEM-ACCEPT",
+            $"world={request.WorldId:X8} item={itemId} count={count}");
     }
 
     private static uint WorldId(uint sceneId, PickupInstanceItem item)

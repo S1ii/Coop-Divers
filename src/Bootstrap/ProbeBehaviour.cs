@@ -77,9 +77,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _sessionTrace = new SessionTrace(Logger);
         _remoteCatchLedger = new RemoteCatchLedger(Logger);
         _fishReplicator = new FishReplicator(Logger, _sessionTrace);
-        _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
+        _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger, _sessionTrace);
         _sceneReplicator = new SceneReplicator(Logger);
-        _missionProgressReplicator = new MissionProgressReplicator(Logger);
+        _missionProgressReplicator = new MissionProgressReplicator(Logger, _sessionTrace);
         _managerEventReplicator = new ManagerEventReplicator(Logger);
         _worldStateReplicator = new WorldStateReplicator(Logger);
         _bossReplicator = new BossReplicator(Logger);
@@ -816,9 +816,42 @@ public sealed class ProbeBehaviour : MonoBehaviour
             !_session.SceneMatches(_sceneId) ||
             !FishReplicator.IsPlayerAttack(attackType))
             return true;
+        if (_fishReplicator?.IsClientDamageScoped(fish) ?? false)
+            return false;
         _fishReplicator?.RequestDamage(
             _session, _sceneId, fish, damage, element, attackType);
         return false;
+    }
+
+    internal bool BeginFishDamage(
+        FishAISystem fish,
+        AttackData attackData,
+        out bool scoped)
+    {
+        scoped = false;
+        if (Role != SessionRole.Client || _session == null ||
+            !_session.SceneMatches(_sceneId))
+            return true;
+        scoped = _fishReplicator?.BeginClientDamage(
+            _session, _sceneId, fish, attackData) ?? false;
+        return scoped;
+    }
+
+    internal void EndFishDamage(FishAISystem fish, bool scoped)
+    {
+        if (scoped)
+            _fishReplicator?.EndClientDamage(fish);
+    }
+
+    internal bool AllowFishTrueDamage(FishAISystem fish) =>
+        Role != SessionRole.Client || _session == null ||
+        !_session.SceneMatches(_sceneId) || fish == null;
+
+    internal void OnFishCaptureWon(FishAISystem fish)
+    {
+        if (Role == SessionRole.Client && _session != null &&
+            _session.SceneMatches(_sceneId))
+            _fishReplicator?.RequestCapture(_session, _sceneId, fish);
     }
 
     internal bool AllowFishSimulation(FishAISystem fish) =>
