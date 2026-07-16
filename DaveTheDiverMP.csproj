@@ -5,7 +5,7 @@
     <Nullable>disable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
     <AssemblyName>DaveTheDiverMP</AssemblyName>
-    <Version>0.18.1</Version>
+    <Version>0.18.2</Version>
     <Deterministic>true</Deterministic>
     <GameInstallPath Condition="'$(GameInstallPath)' == ''">..\DAVE THE DIVER</GameInstallPath>
     <DeployPlugin Condition="'$(DeployPlugin)' == ''">false</DeployPlugin>
@@ -25,6 +25,7 @@
     <Reference Include="Il2CppSystem.Core" HintPath="$(GameInstallPath)\BepInEx\interop\Il2CppSystem.Core.dll" Private="false" />
     <Reference Include="InputSystemWrapper" HintPath="$(GameInstallPath)\BepInEx\interop\InputSystemWrapper.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="$(GameInstallPath)\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
+    <Reference Include="Sirenix.Serialization" HintPath="$(GameInstallPath)\BepInEx\interop\Sirenix.Serialization.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
     <Reference Include="UnityEngine.AnimationModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.AnimationModule.dll" Private="false" />
     <Reference Include="UnityEngine.DirectorModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.DirectorModule.dll" Private="false" />

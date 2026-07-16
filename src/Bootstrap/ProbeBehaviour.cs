@@ -49,6 +49,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private TravelCoordinator _travelCoordinator;
     private ProjectileVisualReplicator _projectileVisualReplicator;
     private RemoteCatchLedger _remoteCatchLedger;
+    private SessionTrace _sessionTrace;
     private readonly RemoteAvatar _remoteAvatar = new();
     private bool _showLobby;
     private bool _cursorWasVisible;
@@ -73,8 +74,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _buildId = Protocol.SceneId(
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}|" +
             typeof(Plugin).Module.ModuleVersionId);
+        _sessionTrace = new SessionTrace(Logger);
         _remoteCatchLedger = new RemoteCatchLedger(Logger);
-        _fishReplicator = new FishReplicator(Logger);
+        _fishReplicator = new FishReplicator(Logger, _sessionTrace);
         _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
         _missionProgressReplicator = new MissionProgressReplicator(Logger);
@@ -148,6 +150,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             if (Role == SessionRole.Host)
                 _sceneReplicator?.OnHostObservedScene(_session, _scene);
             Logger.LogInfo($"Scene: {_scene}");
+            _sessionTrace?.Write("SCENE", $"entered name={_scene} id={_sceneId:X8}");
         }
 
         _session?.Update(Time.realtimeSinceStartup);
@@ -172,7 +175,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diveCoordinator?.ClientDead ?? false);
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
-            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime, _player);
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
+            _player, _remoteAvatar.Transform);
         _bossReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
         _pickupReplicator?.Update(
@@ -344,6 +348,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _projectileVisualReplicator?.Clear();
         _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
+        _sessionTrace?.Dispose();
     }
 
     private void DrawLobbyPanel()
@@ -444,6 +449,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Port = port;
             ConfiguredName = configuredName ?? string.Empty;
             SaveSelectedSettings(Role, Address, Port, ConfiguredName, persist, ref error);
+            _sessionTrace?.SwitchRole(Role, _localName, _buildId);
             error = "Network start failed; see BepInEx log";
             return false;
         }
@@ -460,6 +466,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _session.SetLocalScene(_sceneId);
         _nextSnapshot = 0f;
         SaveSelectedSettings(Role, Address, Port, ConfiguredName, persist, ref error);
+        _sessionTrace?.SwitchRole(Role, _localName, _buildId);
         Logger.LogInfo($"Network identity: {_localName}; build={_buildId:X8}; role={Role}");
         return true;
     }
@@ -809,14 +816,24 @@ public sealed class ProbeBehaviour : MonoBehaviour
             !_session.SceneMatches(_sceneId) ||
             !FishReplicator.IsPlayerAttack(attackType))
             return true;
-        return !(_fishReplicator?.RequestDamage(
-            _session, _sceneId, fish, damage, element, attackType) ?? false);
+        _fishReplicator?.RequestDamage(
+            _session, _sceneId, fish, damage, element, attackType);
+        return false;
     }
 
     internal bool AllowFishSimulation(FishAISystem fish) =>
         Role != SessionRole.Client || !(_fishReplicator?.IsClientProxy(fish) ?? false);
 
-    internal bool AllowFishPickup(FishInteractionBody body)
+    internal bool AllowFishInteraction(FishInteractionBody body)
+    {
+        if (Role != SessionRole.Client || _session == null ||
+            !_session.SceneMatches(_sceneId) || body == null)
+            return true;
+        var fish = body.GetComponentInParent<FishAISystem>();
+        return fish != null && (_fishReplicator?.IsClientProxy(fish) ?? false);
+    }
+
+    internal bool AllowFishPickup(FishInteractionBody body, BaseCharacter character)
     {
         if (Role != SessionRole.Client || _session == null ||
             !_session.SceneMatches(_sceneId) || body == null)
@@ -826,7 +843,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
             return true;
         if (_fishReplicator?.ApplyingClientPickup ?? false)
             return true;
-        _fishReplicator?.RequestPickup(_session, _sceneId, fish);
+        if (!(_fishReplicator?.RequestPickup(_session, _sceneId, fish) ?? false))
+            character?.SuccessInteraction();
         return false;
     }
 
