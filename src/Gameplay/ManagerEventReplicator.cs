@@ -97,6 +97,12 @@ internal sealed class ManagerEventReplicator
     private float _nextSushiScan;
     private bool _wasConnected;
     private bool _storySnapshotPublished;
+    private float _nextStoryScan;
+    private int _hostCurrentChapter = int.MinValue;
+    private int _hostReservedChapter = int.MinValue;
+    private readonly HashSet<int> _hostEvents = new();
+    private readonly HashSet<int> _hostCutscenes = new();
+    private readonly HashSet<int> _hostIntermissions = new();
     private long _hostDayTicks = long.MinValue;
     private int _hostDayTime = int.MinValue;
     private int _hostWeather = int.MinValue;
@@ -139,12 +145,22 @@ internal sealed class ManagerEventReplicator
             Array.Fill(_hostWasabi, -1);
             _nextSushiScan = 0f;
             _nextDayScan = 0f;
+            _nextStoryScan = 0f;
         }
         _wasConnected = true;
         FlushOutbound(session);
 
         if (role == SessionRole.Host && !_storySnapshotPublished)
+        {
             _storySnapshotPublished = PublishStorySnapshot(session);
+            if (_storySnapshotPublished)
+                _nextStoryScan = now + 1f;
+        }
+        if (role == SessionRole.Host && _storySnapshotPublished && now >= _nextStoryScan)
+        {
+            _nextStoryScan = now + 1f;
+            PublishStoryChanges(session);
+        }
         if (role == SessionRole.Host && now >= _nextDayScan)
         {
             _nextDayScan = now + 1f;
@@ -301,6 +317,12 @@ internal sealed class ManagerEventReplicator
         _suppressPublish = 0;
         _nextSushiScan = 0f;
         _nextDayScan = 0f;
+        _nextStoryScan = 0f;
+        _hostCurrentChapter = int.MinValue;
+        _hostReservedChapter = int.MinValue;
+        _hostEvents.Clear();
+        _hostCutscenes.Clear();
+        _hostIntermissions.Clear();
         _hostDayTicks = long.MinValue;
         _hostDayTime = int.MinValue;
         _hostWeather = int.MinValue;
@@ -652,21 +674,93 @@ internal sealed class ManagerEventReplicator
             return false;
         Publish(session, ManagerDomain.Story, ManagerAction.CurrentChapter,
             chapter.CurrentChapter, 0);
+        _hostCurrentChapter = chapter.CurrentChapter;
         Publish(session, ManagerDomain.Story, ManagerAction.ReservedChapter,
             chapter.ReservedChapter, 0);
+        _hostReservedChapter = chapter.ReservedChapter;
         Publish(session, ManagerDomain.Story, ManagerAction.ResetEvents, 0, 0);
+        _hostEvents.Clear();
         if (save.EventData?.clearedEvents != null)
             foreach (var id in save.EventData.clearedEvents)
+            {
                 Publish(session, ManagerDomain.Story, ManagerAction.EventCleared, (int)id, 0);
+                _hostEvents.Add((int)id);
+            }
         Publish(session, ManagerDomain.Story, ManagerAction.ResetCutscenes, 0, 0);
+        _hostCutscenes.Clear();
         if (save.m_PlayedCutsceneData != null)
             foreach (var id in save.m_PlayedCutsceneData)
+            {
                 Publish(session, ManagerDomain.Story, ManagerAction.CutsceneMarked, id, 0);
+                _hostCutscenes.Add(id);
+            }
         Publish(session, ManagerDomain.Story, ManagerAction.ResetIntermissions, 0, 0);
+        _hostIntermissions.Clear();
         if (save.m_MarkedIntermissionData != null)
             foreach (var id in save.m_MarkedIntermissionData)
+            {
                 Publish(session, ManagerDomain.Story, ManagerAction.IntermissionMarked, id, 0);
+                _hostIntermissions.Add(id);
+            }
         return true;
+    }
+
+    private void PublishStoryChanges(UdpSession session)
+    {
+        var save = SaveSystem.GetGameSave();
+        var chapter = save?.ChapterData;
+        if (chapter == null)
+            return;
+        if (chapter.CurrentChapter != _hostCurrentChapter)
+        {
+            _hostCurrentChapter = chapter.CurrentChapter;
+            Publish(session, ManagerDomain.Story, ManagerAction.CurrentChapter,
+                _hostCurrentChapter, 0);
+        }
+        if (chapter.ReservedChapter != _hostReservedChapter)
+        {
+            _hostReservedChapter = chapter.ReservedChapter;
+            Publish(session, ManagerDomain.Story, ManagerAction.ReservedChapter,
+                _hostReservedChapter, 0);
+        }
+
+        var events = new HashSet<int>();
+        if (save.EventData?.clearedEvents != null)
+            foreach (var id in save.EventData.clearedEvents)
+                events.Add((int)id);
+        PublishSetChanges(session, _hostEvents, events,
+            ManagerAction.EventCleared, ManagerAction.EventRemoved);
+
+        var cutscenes = new HashSet<int>();
+        if (save.m_PlayedCutsceneData != null)
+            foreach (var id in save.m_PlayedCutsceneData)
+                cutscenes.Add(id);
+        PublishSetChanges(session, _hostCutscenes, cutscenes,
+            ManagerAction.CutsceneMarked, ManagerAction.CutsceneUnmarked);
+
+        var intermissions = new HashSet<int>();
+        if (save.m_MarkedIntermissionData != null)
+            foreach (var id in save.m_MarkedIntermissionData)
+                intermissions.Add(id);
+        PublishSetChanges(session, _hostIntermissions, intermissions,
+            ManagerAction.IntermissionMarked, ManagerAction.IntermissionUnmarked);
+    }
+
+    private void PublishSetChanges(
+        UdpSession session,
+        HashSet<int> previous,
+        HashSet<int> current,
+        ManagerAction added,
+        ManagerAction removed)
+    {
+        foreach (var id in current)
+            if (!previous.Contains(id))
+                Publish(session, ManagerDomain.Story, added, id, 0);
+        foreach (var id in previous)
+            if (!current.Contains(id))
+                Publish(session, ManagerDomain.Story, removed, id, 0);
+        previous.Clear();
+        previous.UnionWith(current);
     }
 
     private void PublishDayChanges(UdpSession session)
@@ -1133,72 +1227,6 @@ internal static class SushiTableStateSyncPatch
             ManagerAction.TableState,
             __0 ? 1 : 0,
             ManagerEventPatchHelper.TableContext(__instance)) ?? true;
-}
-
-[HarmonyPatch]
-internal static class StoryChapterSyncPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        yield return AccessTools.PropertySetter(
-            typeof(SaveData.SaveDataChapter), nameof(SaveData.SaveDataChapter.CurrentChapter));
-        yield return AccessTools.PropertySetter(
-            typeof(SaveData.SaveDataChapter), nameof(SaveData.SaveDataChapter.ReservedChapter));
-    }
-
-    private static bool Prefix(MethodBase __originalMethod, int __0) =>
-        ManagerEventPatchHelper.Intercept(
-            ManagerDomain.Story,
-            __originalMethod.Name == "set_CurrentChapter"
-                ? ManagerAction.CurrentChapter
-                : ManagerAction.ReservedChapter,
-            __0);
-}
-
-[HarmonyPatch]
-internal static class StoryEventSyncPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        yield return AccessTools.DeclaredMethod(
-            typeof(SaveData.SaveDataEvent), nameof(SaveData.SaveDataEvent.AddCleared));
-        yield return AccessTools.DeclaredMethod(
-            typeof(SaveData.SaveDataEvent), nameof(SaveData.SaveDataEvent.RemoveCleared));
-    }
-
-    private static bool Prefix(MethodBase __originalMethod, Common.Contents.Event.Name __0) =>
-        ManagerEventPatchHelper.Intercept(
-            ManagerDomain.Story,
-            __originalMethod.Name == nameof(SaveData.SaveDataEvent.AddCleared)
-                ? ManagerAction.EventCleared
-                : ManagerAction.EventRemoved,
-            (int)__0);
-}
-
-[HarmonyPatch]
-internal static class StoryMarkerSyncPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        foreach (var name in new[]
-                 {
-                     nameof(SaveData.MarkCutscene), nameof(SaveData.UnMarkCutscene),
-                     nameof(SaveData.MarkIntermission), nameof(SaveData.UnMarkIntermission)
-                 })
-            yield return AccessTools.DeclaredMethod(typeof(SaveData), name);
-    }
-
-    private static bool Prefix(MethodBase __originalMethod, int __0)
-    {
-        var action = __originalMethod.Name switch
-        {
-            nameof(SaveData.MarkCutscene) => ManagerAction.CutsceneMarked,
-            nameof(SaveData.UnMarkCutscene) => ManagerAction.CutsceneUnmarked,
-            nameof(SaveData.MarkIntermission) => ManagerAction.IntermissionMarked,
-            _ => ManagerAction.IntermissionUnmarked
-        };
-        return ManagerEventPatchHelper.Intercept(ManagerDomain.Story, action, __0);
-    }
 }
 
 [HarmonyPatch(typeof(TimelineManager), "OnChangePlayState")]

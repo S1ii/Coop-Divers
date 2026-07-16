@@ -94,54 +94,6 @@ internal static class SeahorseSaveAuthorityPatch
 }
 
 [HarmonyPatch]
-internal static class MiniGameSaveAuthorityPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        foreach (var pair in new[]
-                 {
-                     (typeof(SaveData.SaveDataMiniGame), new[]
-                     {
-                         "AddCount", "SetCount", "SetGuideDone", "ResetAllCounts"
-                     }),
-                     (typeof(SaveData.ArcadeSave), new[]
-                     {
-                         "AddChecked", "UpdateConcertscore", "UpdateFlappyBirdBest",
-                         "OwnFlappyBirdCharacter", "CheckFlappyBirdCharacter",
-                         "UpdateKaraokeScore", "UpdateBeatemUpScore"
-                     }),
-                     (typeof(SaveData.SaveDataBalatro), new[] { "UpdateScore" })
-                 })
-        {
-            foreach (var name in pair.Item2)
-            foreach (var method in AccessTools.GetDeclaredMethods(pair.Item1))
-                if (method.Name == name)
-                    yield return method;
-        }
-    }
-
-    private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
-}
-
-[HarmonyPatch]
-internal static class StorySaveAuthorityPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        foreach (var name in new[]
-                 {
-                     nameof(SaveData.UpdateChapterSave),
-                     nameof(SaveData.UpdateEventDataSave),
-                     nameof(SaveData.UpdatePlayedCutsceneSave),
-                     nameof(SaveData.UpdatePlayedIntermissionSave)
-                 })
-            yield return AccessTools.DeclaredMethod(typeof(SaveData), name);
-    }
-
-    private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
-}
-
-[HarmonyPatch]
 internal static class GameSaveAuthorityPatch
 {
     private static IEnumerable<MethodBase> TargetMethods()
