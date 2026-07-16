@@ -21,12 +21,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal static string ConfiguredName { get; set; } = string.Empty;
 
     private string _scene = string.Empty;
+    private int _sceneHandle = int.MinValue;
     private bool _playerPresent;
     private float _nextScan;
     private float _nextPositionLog;
     private float _nextSnapshot;
     private float _nextVisual;
     private uint _sceneId;
+    private ResolvedSceneMetadata _sceneMetadata;
+    private float _nextSceneMetadataRefresh;
+    private float _sceneMetadataRefreshUntil;
     private uint _buildId;
     private string _localName = "Diver";
     private PlayerCharacter _player;
@@ -41,6 +45,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private SceneReplicator _sceneReplicator;
     private MissionProgressReplicator _missionProgressReplicator;
     private ManagerEventReplicator _managerEventReplicator;
+    private NpcInteractionCoordinator _npcInteractionCoordinator;
     private WorldStateReplicator _worldStateReplicator;
     private BossReplicator _bossReplicator;
     private IngredientsReplicator _ingredientsReplicator;
@@ -62,6 +67,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private string _lobbyPort = "27777";
     private string _lobbyName = string.Empty;
     private string _lobbyError = string.Empty;
+    private float _hostAuthorityRefreshAt;
+    private int _remoteMissionApplyDepth;
+    private int _clientPresentationLifecycleDepth;
+    private bool _restoringClientOriginals;
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
     {
@@ -75,12 +84,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
             $"{Application.buildGUID}|{Application.version}|{Application.unityVersion}|" +
             typeof(Plugin).Module.ModuleVersionId);
         _sessionTrace = new SessionTrace(Logger);
-        _remoteCatchLedger = new RemoteCatchLedger(Logger);
+        _remoteCatchLedger = new RemoteCatchLedger(Logger, _sessionTrace);
         _fishReplicator = new FishReplicator(Logger, _sessionTrace);
-        _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger, _sessionTrace);
+        _remoteCatchLedger.SetRemoteLootEvidence(request =>
+            _fishReplicator?.TryCaptureRemoteLoot(
+                _session, _sceneId, request, _remoteCatchLedger) ?? false);
+        _pickupReplicator = new PickupReplicator(Logger, _sessionTrace, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
         _missionProgressReplicator = new MissionProgressReplicator(Logger, _sessionTrace);
         _managerEventReplicator = new ManagerEventReplicator(Logger);
+        _npcInteractionCoordinator = new NpcInteractionCoordinator(Logger);
         _worldStateReplicator = new WorldStateReplicator(Logger);
         _bossReplicator = new BossReplicator(Logger);
         _ingredientsReplicator = new IngredientsReplicator(Logger);
@@ -122,15 +135,24 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void Update()
     {
-        var scene = SceneManager.GetActiveScene().name;
-        if (scene != _scene)
+        var activeScene = SceneManager.GetActiveScene();
+        var scene = activeScene.name;
+        if (scene != _scene || activeScene.handle != _sceneHandle)
         {
-            var wasDiveScene = IsDiveSceneName(_scene);
+            var wasDiveScene = _sceneMetadata.CanDive;
+            _managerEventReplicator?.OnSceneChanged();
+            _npcInteractionCoordinator?.Clear(Role, _session);
             if (_showLobby)
                 SetLobbyVisible(false, false);
             _scene = scene;
+            _sceneHandle = activeScene.handle;
             _sceneId = Protocol.SceneId(scene);
-            if (!wasDiveScene && IsDiveSceneName(scene))
+            _sceneMetadata = SceneMetadataResolver.Resolve(scene);
+            _nextSceneMetadataRefresh = _sceneMetadata.HasNativeSceneType
+                ? 0f
+                : Time.realtimeSinceStartup + 0.1f;
+            _sceneMetadataRefreshUntil = Time.realtimeSinceStartup + 10f;
+            if (!wasDiveScene && _sceneMetadata.CanDive)
                 _remoteCatchLedger?.BeginDive(_session, Time.realtimeSinceStartup);
             _player = null;
             _playerRenderer = null;
@@ -149,20 +171,52 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _session?.SetLocalScene(_sceneId);
             if (Role == SessionRole.Host)
                 _sceneReplicator?.OnHostObservedScene(_session, _scene);
-            Logger.LogInfo($"Scene: {_scene}");
-            _sessionTrace?.Write("SCENE", $"entered name={_scene} id={_sceneId:X8}");
+            LogSceneMetadata("entered");
+            _hostAuthorityRefreshAt = Role == SessionRole.Host &&
+                _sceneMetadata.SceneType == SceneType.lobby
+                ? Time.realtimeSinceStartup + 2f
+                : 0f;
+        }
+        else if (_nextSceneMetadataRefresh > 0f &&
+                 Time.realtimeSinceStartup >= _nextSceneMetadataRefresh)
+        {
+            var refreshed = SceneMetadataResolver.Resolve(_scene);
+            var merged = SceneMetadataResolver.MergeRefresh(_sceneMetadata, refreshed);
+            if (!SceneMetadataResolver.Matches(_sceneMetadata, merged))
+            {
+                var becameDive = !_sceneMetadata.CanDive && merged.CanDive;
+                _sceneMetadata = merged;
+                if (becameDive)
+                    _remoteCatchLedger?.BeginDive(_session, Time.realtimeSinceStartup);
+                LogSceneMetadata(merged.HasNativeSceneType
+                    ? "refreshed-native"
+                    : "refreshed-partial");
+            }
+
+            if (merged.HasNativeSceneType)
+                _nextSceneMetadataRefresh = 0f;
+            else
+            {
+                _nextSceneMetadataRefresh = Time.realtimeSinceStartup +
+                    (Time.realtimeSinceStartup < _sceneMetadataRefreshUntil ? 0.25f : 2f);
+            }
         }
 
         _session?.Update(Time.realtimeSinceStartup);
+        FishSpawnSeedCoordinator.Update(Role, _session);
         if (Role == SessionRole.Client && _session != null && _session.TryTakePeerLoss(out var peerLoss))
         {
             ReturnToOnlineRoom(peerLoss);
             return;
         }
         TitleOnlineMenu.Tick(this);
-        _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
+        _remoteCatchLedger?.Update(
+            Role, _session, _scene, _sceneMetadata.SceneType == SceneType.lobby,
+            Time.realtimeSinceStartup);
         _managerEventReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
-        _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+        _npcInteractionCoordinator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
+        _missionProgressReplicator?.Update(
+            Role, _session, Time.realtimeSinceStartup, Role == SessionRole.Client && IsDiveScene());
         _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
@@ -181,6 +235,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
         _pickupReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
+        if (_hostAuthorityRefreshAt > 0f && Time.realtimeSinceStartup >= _hostAuthorityRefreshAt)
+        {
+            _hostAuthorityRefreshAt = 0f;
+            _missionProgressReplicator?.ForceHostKeyframe();
+            _managerEventReplicator?.ForceHostKeyframe();
+            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=lobby-settled missions=1 story=1 day=1");
+        }
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
         {
@@ -225,6 +286,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             flipped ^= visualScale.x < 0f;
             _session.SendSnapshot(new PlayerSnapshot(
                 _sceneId,
+                _session.LocalSceneEpoch,
                 position.x,
                 position.y,
                 position.z,
@@ -333,8 +395,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             SetLobbyVisible(false);
         else
             ReleaseLobbyInputLock();
-        if (Instance == this)
-            Instance = null;
+        _npcInteractionCoordinator?.Clear(Role, _session);
         _session?.Dispose();
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
@@ -349,6 +410,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
         _sessionTrace?.Dispose();
+        if (Instance == this)
+            Instance = null;
     }
 
     private void DrawLobbyPanel()
@@ -426,7 +489,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var disposedPrevious = previous != null && (!previousRunning ||
             Role == SessionRole.Host && role == SessionRole.Host && Port == port);
         if (disposedPrevious)
+        {
+            _npcInteractionCoordinator?.Clear(Role, previous);
             previous.Dispose();
+        }
 
         var replacement = new UdpSession(Logger);
         replacement.Start(role, address, port, localName, _buildId);
@@ -439,6 +505,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 return false;
             }
 
+            _npcInteractionCoordinator?.Clear(Role, previous);
             previous?.Dispose();
             ClearReplicationState(SessionRole.Offline);
             _session = new UdpSession(Logger);
@@ -455,7 +522,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
 
         if (!disposedPrevious)
+        {
+            _npcInteractionCoordinator?.Clear(Role, previous);
             previous?.Dispose();
+        }
         ClearReplicationState(role);
         _session = replacement;
         _localName = localName;
@@ -473,6 +543,26 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal string TitlePlayerName => _localName;
     internal string TitleLanAddress => LobbyInput.FindLanAddress();
+    internal bool IsApplyingRemoteMission => _remoteMissionApplyDepth > 0;
+    internal bool IsCompletingClientPresentation => _clientPresentationLifecycleDepth > 0;
+    internal bool IsApplyingNpcGrant => _npcInteractionCoordinator?.IsApplyingGrant == true;
+    internal bool HasActiveNpcLease => _npcInteractionCoordinator?.HasActiveLease == true;
+
+    internal void BeginRemoteMissionApply() => _remoteMissionApplyDepth++;
+
+    internal void EndRemoteMissionApply()
+    {
+        if (_remoteMissionApplyDepth > 0)
+            _remoteMissionApplyDepth--;
+    }
+
+    internal void BeginClientPresentationLifecycle() => _clientPresentationLifecycleDepth++;
+
+    internal void EndClientPresentationLifecycle()
+    {
+        if (_clientPresentationLifecycleDepth > 0)
+            _clientPresentationLifecycleDepth--;
+    }
 
     internal bool SwitchTitleSession(
         SessionRole role,
@@ -517,8 +607,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
+        _diveCoordinator?.Reset();
         _missionProgressReplicator?.Clear();
-        _managerEventReplicator?.Clear();
+        _managerEventReplicator?.Clear(Role == SessionRole.Host && nextRole == SessionRole.Host);
         _worldStateReplicator?.Clear();
         _bossReplicator?.Clear();
         _ingredientsReplicator?.Clear();
@@ -591,8 +682,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void OnPickupDestroyed(PickupInstanceItem item)
     {
-        if (Role == SessionRole.Host)
-            _pickupReplicator?.OnHostDestroyed(_session, _sceneId, item);
+        if (Role is SessionRole.Host or SessionRole.Client)
+            _pickupReplicator?.OnDestroyed(_session, _sceneId, item);
     }
 
     internal void RegisterProjectile(Component projectile) =>
@@ -668,21 +759,21 @@ public sealed class ProbeBehaviour : MonoBehaviour
         JDLC.FastTravelPanelController panel,
         string sceneName,
         SceneType sceneType,
-        object location,
+        SceneConnectLocationID location,
         SceneTransitionType transitionType) =>
         _travelCoordinator?.Request(
             Role, _session,
-            TravelTargets.JungleFastTravel(sceneName, sceneType, Convert.ToInt32(location)),
+            TravelTargets.JungleFastTravel(sceneName, sceneType, (int)location),
             () => TravelCoordinator.ChangeJungleScene(panel, sceneName, sceneType, location, transitionType),
             _diveCoordinator?.AnyPlayerDead ?? false,
             _diveCoordinator?.HostDead ?? false,
             null,
             new TravelRoute(
-                sceneName, (int)sceneType, Convert.ToInt32(location), (int)transitionType)) ?? true;
+                sceneName, (int)sceneType, (int)location, (int)transitionType)) ?? true;
 
     internal bool AllowSceneTransition(string sceneName)
     {
-        if (_sceneReplicator?.AllowTransition(Role) ?? true)
+        if (_sceneReplicator?.AllowTransition(Role, sceneName, Time.realtimeSinceStartup) ?? true)
             return true;
         if (_travelCoordinator?.AllowClientSceneTransition() ?? false)
             return true;
@@ -714,17 +805,142 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void EndManagerEvent(bool suppressNested) =>
         _managerEventReplicator?.EndIntercept(suppressNested);
 
+    internal bool AllowScenarioControl() =>
+        _managerEventReplicator?.AllowScenarioControl(Role, _session) ?? true;
+
+    internal bool AllowDialogueAdvance() =>
+        _managerEventReplicator?.AllowDialogueAdvance(Role, _session) ?? true;
+
+    internal bool AllowDialogueChoice() =>
+        _managerEventReplicator?.AllowDialogueChoice(Role, _session) ?? true;
+
+    internal bool TryRestoreClientOriginals()
+    {
+        if (_restoringClientOriginals)
+            return true;
+        _restoringClientOriginals = true;
+        try
+        {
+            return (_managerEventReplicator?.TryRestoreClientOriginals() ?? true) &
+                (_missionProgressReplicator?.TryRestoreClientOriginals() ?? true);
+        }
+        finally
+        {
+            _restoringClientOriginals = false;
+        }
+    }
+
+    internal bool InterceptPhoneCall(int tid, Il2CppSystem.Action<bool> callback) =>
+        _managerEventReplicator?.InterceptPhoneCall(Role, _session, tid, callback) ?? true;
+
+    internal bool InterceptPhoneAnswer() =>
+        _managerEventReplicator?.InterceptPhoneAnswer(Role, _session) ?? true;
+
+    internal bool AllowScenarioTerminal() =>
+        _managerEventReplicator?.AllowScenarioTerminal(Role, _session) ?? true;
+
+    internal bool AllowDialogueTerminal() =>
+        _managerEventReplicator?.AllowDialogueTerminal(Role, _session) ?? true;
+
+    internal bool InterceptScenarioStart(
+        string bundleId,
+        bool isBranch,
+        ScenarioBranchData branchData,
+        Il2CppSystem.Collections.Generic.List<string> arguments,
+        Il2CppSystem.Action<bool> callback,
+        bool useButton,
+        bool showCurtain,
+        bool ignorePlaying) =>
+        _managerEventReplicator?.InterceptScenarioStart(
+            Role, _session, bundleId, isBranch, branchData, arguments, callback,
+            useButton, showCurtain, ignorePlaying) ?? true;
+
+    internal bool InterceptDialogueStart(
+        string bundleId,
+        ManagerEventReplicator.DialogueStartKind kind,
+        Il2CppSystem.Collections.Generic.List<string> arguments,
+        Il2CppSystem.Collections.Generic.List<DR.GameData.DialogueEntry> entries,
+        ScenarioButtonInfo buttonInfo,
+        Il2CppSystem.Action<bool> callback,
+        Il2CppSystem.Action<int> choiceCallback,
+        bool useButton,
+        bool showCurtain) =>
+        _managerEventReplicator?.InterceptDialogueStart(
+            Role, _session, bundleId, kind, arguments, entries, buttonInfo,
+            callback, choiceCallback, useButton, showCurtain) ?? true;
+
+    internal bool InterceptScenarioNode(ScenarioManager manager, DRSequence sequence) =>
+        _managerEventReplicator?.InterceptScenarioNode(
+            Role, _session, manager, sequence) ?? true;
+
+    internal void ObserveScenarioStarted(ScenarioManager manager, string bundleId) =>
+        _managerEventReplicator?.ObserveScenarioStarted(
+            Role, _session, manager, bundleId);
+
+    internal void ObserveScenarioFinished() =>
+        _managerEventReplicator?.ObserveScenarioFinished(Role, _session);
+
+    internal void ObserveScenarioFinished(bool result) =>
+        _managerEventReplicator?.ObserveScenarioFinished(Role, _session, result);
+
+    internal Il2CppSystem.Action<bool> WrapScenarioFinish(
+        string bundleId, Il2CppSystem.Action<bool> callback) =>
+        _managerEventReplicator?.WrapScenarioFinish(
+            Role, _session, bundleId, callback) ?? callback;
+
+    internal void ObserveDialogueStarted(string bundleId) =>
+        _managerEventReplicator?.ObserveDialogueStarted(Role, _session, bundleId);
+
+    internal void ObserveDialogueNode(DialogueManager manager, DialogueInfo info) =>
+        _managerEventReplicator?.ObserveDialogueNode(Role, _session, manager, info);
+
+    internal void ObserveDialogueFinished()
+    {
+        _managerEventReplicator?.ObserveDialogueFinished(Role, _session);
+        _npcInteractionCoordinator?.Release(Role, _session);
+    }
+
+    internal Il2CppSystem.Action<bool> WrapDialogueFinish(
+        string bundleId, Il2CppSystem.Action<bool> callback) =>
+        _managerEventReplicator?.WrapDialogueFinish(
+            Role, _session, bundleId, callback) ?? callback;
+
     internal void PublishSushiResult() =>
         _managerEventReplicator?.PublishSushiResult(Role, _session);
 
-    internal void ObserveTimeline(TimelineManager.TPlayState state, int tid, bool success)
-    {
-        if (success)
-            _managerEventReplicator?.ObserveTimeline(Role, _session, state, tid);
-    }
+    internal bool InterceptTimelinePlay(
+        int tid,
+        Il2CppSystem.Action onStart,
+        Il2CppSystem.Action<bool> onFinished,
+        bool applyOffset,
+        Il2CppSystem.Nullable<Vector3> customPos) =>
+        _managerEventReplicator?.InterceptTimelinePlay(
+            Role, _session, tid, onStart, onFinished, applyOffset, customPos) ?? true;
 
-    internal bool AllowTimelineControl() =>
-        _managerEventReplicator?.AllowTimelineControl(Role, _session) ?? true;
+    internal bool InterceptTimelineController(
+        TimelineController controller,
+        Il2CppSystem.Action onStart,
+        Il2CppSystem.Action<bool> onFinished,
+        int id) =>
+        _managerEventReplicator?.InterceptTimelineController(
+            Role, _session, controller, onStart, onFinished, id) ?? true;
+
+    internal void ObserveTimeline(TimelineManager.TPlayState state, int tid, bool success) =>
+        _managerEventReplicator?.ObserveTimeline(Role, _session, state, tid, success);
+
+    internal bool AllowTimelineTerminalControl() =>
+        _managerEventReplicator?.AllowTimelineTerminalControl(Role, _session) ?? true;
+
+    internal bool RequestNpcTalk(Common.Contents.TalkTarget target) =>
+        _npcInteractionCoordinator?.RequestTalk(Role, _session, _sceneId, target) ?? true;
+
+    internal bool RequestNpcTalkMenu(Common.Contents.TalkNPCMenu menu) =>
+        _npcInteractionCoordinator?.RequestTalkMenu(
+            Role, _session, _sceneId, menu) ?? true;
+
+    internal bool RequestMissionNpcTalk(MissionTargetNPCController npc) =>
+        _npcInteractionCoordinator?.RequestMissionTalk(
+            Role, _session, _sceneId, npc) ?? true;
 
     private void ReturnToOnlineRoom(string reason)
     {
@@ -734,7 +950,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         var name = ConfiguredName;
         SwitchSession(SessionRole.Offline, address, port, name, false, out _);
         TitleOnlineMenu.RequestHostDisconnect();
-        if (_scene == "DR_Title")
+        if (_sceneMetadata.SceneType == SceneType.title)
             return;
         var loader = UnityEngine.Object.FindFirstObjectByType<SceneLoader>();
         if (loader != null)
@@ -786,12 +1002,18 @@ public sealed class ProbeBehaviour : MonoBehaviour
         LootBox.AutoLiftedType liftType,
         bool updateMission)
     {
-        if (Role == SessionRole.Client && IsDiveScene())
+        if (Role is SessionRole.Host or SessionRole.Client && IsDiveScene())
             _remoteCatchLedger?.ReportClientLoot(
                 _session, itemId, count, bonusGrade, liftType, updateMission);
     }
 
-    internal void ClearRemoteCatch(string reason) => _remoteCatchLedger?.Clear(reason);
+    internal void ClearRemoteCatch(string reason)
+    {
+        if (Role == SessionRole.Host && reason == "dive aborted" &&
+            (_diveCoordinator?.HostDead ?? false) && !(_diveCoordinator?.ClientDead ?? false))
+            return;
+        _remoteCatchLedger?.Clear(reason);
+    }
 
     internal void ClearCompletedRemoteCatch()
     {
@@ -803,25 +1025,24 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role != SessionRole.Client)
             return true;
+        _remoteCatchLedger?.BeginClientPickupSource(
+            _sceneId, PickupReplicator.WorldId(_sceneId, item));
         return _pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false;
+    }
+
+    internal void EndClientLootSource() => _remoteCatchLedger?.EndClientLootSource();
+
+    internal void BeginClientFishLootSource()
+    {
+        if (Role == SessionRole.Client)
+            _remoteCatchLedger?.BeginClientFishSource();
     }
 
     internal bool AllowFishDamage(
         FishAISystem fish,
         int damage,
         EElement element,
-        AttackType attackType)
-    {
-        if (Role != SessionRole.Client || _session == null ||
-            !_session.SceneMatches(_sceneId) ||
-            !FishReplicator.IsPlayerAttack(attackType))
-            return true;
-        if (_fishReplicator?.IsClientDamageScoped(fish) ?? false)
-            return false;
-        _fishReplicator?.RequestDamage(
-            _session, _sceneId, fish, damage, element, attackType);
-        return false;
-    }
+        AttackType attackType) => true;
 
     internal bool BeginFishDamage(
         FishAISystem fish,
@@ -829,56 +1050,86 @@ public sealed class ProbeBehaviour : MonoBehaviour
         out bool scoped)
     {
         scoped = false;
-        if (Role != SessionRole.Client || _session == null ||
-            !_session.SceneMatches(_sceneId))
-            return true;
-        scoped = _fishReplicator?.BeginClientDamage(
-            _session, _sceneId, fish, attackData) ?? false;
-        return scoped;
+        return true;
     }
 
-    internal void EndFishDamage(FishAISystem fish, bool scoped)
-    {
-        if (scoped)
-            _fishReplicator?.EndClientDamage(fish);
-    }
+    internal void EndFishDamage(FishAISystem fish, bool scoped) { }
 
-    internal bool AllowFishTrueDamage(FishAISystem fish) =>
-        Role != SessionRole.Client || _session == null ||
-        !_session.SceneMatches(_sceneId) || fish == null;
+    internal bool AllowFishTrueDamage(FishAISystem fish) => true;
 
     internal void OnFishCaptureWon(FishAISystem fish)
     {
-        if (Role == SessionRole.Client && _session != null &&
-            _session.SceneMatches(_sceneId))
-            _fishReplicator?.RequestCapture(_session, _sceneId, fish);
     }
 
-    internal bool AllowFishSimulation(FishAISystem fish) =>
-        Role != SessionRole.Client || !(_fishReplicator?.IsClientProxy(fish) ?? false);
+    internal bool AllowFishSimulation(FishAISystem fish) => true;
 
-    internal bool AllowFishInteraction(FishInteractionBody body)
+    internal bool AllowFishInteraction(FishInteractionBody body, bool nativeAvailable) => nativeAvailable;
+
+    internal bool AllowFishPickup(FishInteractionBody body, BaseCharacter character) => true;
+
+    internal void TraceFishPickup(string stage, FishAISystem fish, FishInteractionBody body, bool? result = null)
     {
-        if (Role != SessionRole.Client || _session == null ||
-            !_session.SceneMatches(_sceneId) || body == null)
-            return true;
-        var fish = body.GetComponentInParent<FishAISystem>();
-        return fish != null && (_fishReplicator?.IsClientProxy(fish) ?? false);
+        if (!IsDiveScene())
+            return;
+        fish ??= body?.GetComponentInParent<FishAISystem>();
+        body ??= fish?.GetInteractionBody;
+        _sessionTrace?.Write("FISH-PICKUP",
+            $"stage={stage} role={Role} type={fish?.FishDataTID ?? 0} " +
+            $"hp={fish?.HP ?? -1f:F1} corpse={fish?.IsCorpse ?? false} " +
+            $"captured={fish?.IsFishCaptured ?? false} body={body != null} " +
+            $"enabled={body?.IsEnableInteraction ?? false} interaction={body?.InteractionType} " +
+            $"result={(result.HasValue ? result.Value.ToString() : "-")}");
     }
 
-    internal bool AllowFishPickup(FishInteractionBody body, BaseCharacter character)
+    internal void TracePlayerInteraction(string stage, PlayerCharacter player)
     {
-        if (Role != SessionRole.Client || _session == null ||
-            !_session.SceneMatches(_sceneId) || body == null)
-            return true;
-        var fish = body.GetComponentInParent<FishAISystem>();
-        if (fish == null)
-            return true;
-        if (_fishReplicator?.ApplyingClientPickup ?? false)
-            return true;
-        if (!(_fishReplicator?.RequestPickup(_session, _sceneId, fish) ?? false))
-            character?.SuccessInteraction();
-        return false;
+        if (!IsDiveScene())
+            return;
+        var current = player?.CurrentInteractionObject;
+        _sessionTrace?.Write("PLAYER-INTERACT",
+            $"stage={stage} role={Role} current={current?.GetType().FullName ?? "null"} " +
+            $"isAnim={player?.IsInteractionAnim ?? false}");
+    }
+
+    internal void TraceLootEntry(string source, int itemId, int count, LootBox.AutoLiftedType liftType, bool result)
+    {
+        if (!IsDiveScene())
+            return;
+        var lootBox = LootBox.Instance;
+        _sessionTrace?.Write("LOOT-ENTRY",
+            $"source={source} role={Role} item={itemId} count={count} lift={liftType} " +
+            $"result={result} weight={lootBox?.weight ?? -1f:F2} " +
+            $"max={lootBox?.weightMax ?? -1f:F2} overweight={lootBox?.isOverweightState ?? false}");
+    }
+
+    internal void TraceOverload(int itemId, bool nativeResult, bool correctedResult)
+    {
+        if (!IsDiveScene())
+            return;
+        var lootBox = LootBox.Instance;
+        _sessionTrace?.Write("OVERLOAD-CHECK",
+            $"role={Role} item={itemId} native={nativeResult} result={correctedResult} " +
+            $"weight={lootBox?.weight ?? -1f:F2} max={lootBox?.weightMax ?? -1f:F2} " +
+            $"overweight={lootBox?.isOverweightState ?? false}");
+    }
+
+    internal void ApplyClientCargoState(LootBox lootBox)
+    {
+        if (Role == SessionRole.Client && IsDiveScene())
+            _remoteCatchLedger?.ApplyClientCargoState(lootBox);
+    }
+
+    internal void TraceHarpoon(string stage, HarpoonWeaponHandler handler, bool? success = null)
+    {
+        if (!IsDiveScene())
+            return;
+        var projectile = handler?.harpoonProjectile;
+        _sessionTrace?.Write("HARPOON",
+            $"stage={stage} role={Role} state={handler?.GetActionState} " +
+            $"success={(success.HasValue ? success.Value.ToString() : "-")} " +
+            $"projectile={projectile != null} active={projectile?.gameObject.activeInHierarchy ?? false} " +
+            $"hooked={projectile?.IsHookedSomeThing ?? false} " +
+            $"hookedObject={projectile?.HookedObject?.GetType().FullName ?? "null"}");
     }
 
     internal void OnFishPickupSucceeded(FishAISystem fish)
@@ -902,7 +1153,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role != SessionRole.Host)
             return;
-        if (IsDiveScene() && sceneName.StartsWith("DR_Lobby", StringComparison.Ordinal))
+        if (IsDiveScene() && SceneMetadataResolver.Resolve(sceneName).SceneType == SceneType.lobby)
             PrepareDiveExitResult();
         _sceneReplicator?.OnHostTransition(
             _session,
@@ -925,6 +1176,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void ObserveDivePanel(LobbyStartGamePanelUI panel) =>
         _diveCoordinator?.ObserveDivePanel(panel);
 
+    internal void BeginClientNativeDiveTransition(string sceneName) =>
+        _sceneReplicator?.BeginClientNativeDiveTransition(sceneName, Time.realtimeSinceStartup);
+
+    internal void CancelClientNativeDiveTransition() =>
+        _sceneReplicator?.CancelClientNativeDiveTransition();
+
     internal bool RequestDiveExit(Common.SceneExitTrigger trigger)
     {
         if (!IsSharedActionScene())
@@ -945,15 +1202,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
             manager, color, playerDead) ?? true;
     }
 
+    internal bool RequestEscapePod(PlayerCharacter player) =>
+        _diveCoordinator?.RequestEscapePod(Role, _session, player) ?? true;
+
     internal void ReportDiveLife(bool dead)
     {
         if (IsSharedActionScene())
             _diveCoordinator?.ReportLocalLife(Role, _session, dead);
     }
-
-    internal bool ShouldSuppressClientDeathPopup() =>
-        Role == SessionRole.Client && IsSharedActionScene() &&
-        (_diveCoordinator?.IsClientSpectating ?? false);
 
     internal bool RequestDiveDeathReturn()
     {
@@ -963,29 +1219,18 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Role, _session, Time.realtimeSinceStartup, _player, null) ?? true;
     }
 
-    private bool IsDiveScene() => IsDiveSceneName(_scene);
+    private bool IsDiveScene() => _sceneMetadata.CanDive;
 
-    private bool IsSharedActionScene() => IsSharedActionSceneName(_scene);
+    private bool IsSharedActionScene() => _sceneMetadata.IsSharedAction;
 
-    private static bool IsDiveSceneName(string sceneName) =>
-        HasPrefix(sceneName,
-            "A0", "B0", "C0", "Boss_", "ControlCenter_", "GlacialArea_",
-            "GlacialPassage_", "MermanWarehouse", "SecretRoom_", "C00_",
-            "Godzilla_Boss_", "Godzilla_underwater_", "DR_Jungle_Lake");
-
-    private static bool IsSharedActionSceneName(string sceneName) =>
-        IsDiveSceneName(sceneName) || HasPrefix(sceneName,
-            "DR_Jungle_HollowEarth", "DR_Jungle_RPG_", "DR_Jungle_MiniGames_",
-            "DR_Jungle_DaiMuDaimu", "DR_Jungle_Basilo_Inside",
-            "Godzilla_Lobby_Fight");
-
-    private static bool HasPrefix(string value, params string[] prefixes)
+    private void LogSceneMetadata(string stage)
     {
-        if (string.IsNullOrEmpty(value))
-            return false;
-        foreach (var prefix in prefixes)
-            if (value.StartsWith(prefix, StringComparison.Ordinal))
-                return true;
-        return false;
+        var details =
+            $"stage={stage} name={_scene} id={_sceneId:X8} type={_sceneMetadata.SceneType} " +
+            $"dive={_sceneMetadata.CanDive} shared={_sceneMetadata.IsSharedAction} " +
+            $"additive={_sceneMetadata.IsAdditive} route={_sceneMetadata.RouteIdentity} " +
+            $"source={_sceneMetadata.Source}";
+        Logger.LogInfo($"Scene metadata: {details}");
+        _sessionTrace?.Write("SCENE", details);
     }
 }

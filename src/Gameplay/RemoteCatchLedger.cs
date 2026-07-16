@@ -29,6 +29,7 @@ internal sealed class RemoteCatchLedger
     private const int MaxStacks = 4_096;
     private const int MaxCountPerAdd = 9_999;
     private readonly ManualLogSource _log;
+    private readonly SessionTrace _trace;
     private readonly List<LootEntry> _entries = new();
     private readonly HashSet<ulong> _acceptedSources = new();
     private Capture _capture;
@@ -36,6 +37,7 @@ internal sealed class RemoteCatchLedger
     private bool _materializing;
     private bool _hostResultSent;
     private bool _applyingClientResult;
+    private bool _applyingRemoteLoot;
     private ulong _clientResultTransfer;
     private ushort _clientResultTotal;
     private readonly Dictionary<ushort, DiveResultEntry> _clientResultEntries = new();
@@ -44,8 +46,43 @@ internal sealed class RemoteCatchLedger
     private float _clientResultReceivedAt;
     private bool _inDiveSession;
     private float _clientAcceptResultsAt;
+    private int _lastClientLootFrame = -1;
+    private LootEntry _lastClientLoot;
+    private Func<DiveLootRequest, bool> _remoteLootEvidence;
+    private ulong _clientLootSource;
+    private ulong _pendingClientLootSource;
+    private float _pendingClientLootSourceUntil;
+    private ulong _nextClientLootSource;
+    private CargoState _clientCargoState;
+    private CargoState _lastHostCargoState;
+    private bool _hasHostCargoState;
+    private float _nextHostCargoSend;
 
-    internal RemoteCatchLedger(ManualLogSource log) => _log = log;
+    internal RemoteCatchLedger(ManualLogSource log, SessionTrace trace)
+    {
+        _log = log;
+        _trace = trace;
+    }
+
+    internal static void SelfTest()
+    {
+        var state = new CargoState(123, 9f, 13f, 0f);
+        if (!ShouldApplyCargoState(SessionRole.Client, true, 123, state) ||
+            ShouldApplyCargoState(SessionRole.Host, true, 123, state) ||
+            ShouldApplyCargoState(SessionRole.Client, false, 123, state) ||
+            ShouldApplyCargoState(SessionRole.Client, true, 124, state))
+            throw new InvalidOperationException("Cargo state apply decision failed");
+
+        var accepted = new HashSet<ulong>();
+        if (TryAcceptEvidence(accepted, 7, false) ||
+            !TryAcceptEvidence(accepted, 7, true) ||
+            TryAcceptEvidence(accepted, 7, true))
+            throw new InvalidOperationException("Remote loot evidence must be present and exactly once");
+        if (SelectClientLootSource(0, 7, 1f, 2f) != 7 ||
+            SelectClientLootSource(0, 7, 3f, 2f) != 0 ||
+            SelectClientLootSource(8, 7, 3f, 2f) != 8)
+            throw new InvalidOperationException("Delayed client loot evidence selection failed");
+    }
 
     internal string Status => _entries.Count == 0
         ? "remote carry: empty"
@@ -53,12 +90,48 @@ internal sealed class RemoteCatchLedger
 
     internal bool ApplyingClientResult => _applyingClientResult;
 
-    internal void Update(SessionRole role, UdpSession session, string sceneName, float now)
+    internal bool ApplyingRemoteLoot => _applyingRemoteLoot;
+
+    internal void SetRemoteLootEvidence(Func<DiveLootRequest, bool> evidence) =>
+        _remoteLootEvidence = evidence;
+
+    internal void BeginClientPickupSource(uint sceneId, uint worldId)
+    {
+        _pendingClientLootSource = 0;
+        _clientLootSource = PickupSource(sceneId, worldId);
+    }
+
+    internal void BeginClientFishSource()
+    {
+        _pendingClientLootSource = 0;
+        _nextClientLootSource = (_nextClientLootSource + 1) & 0x0fffffffffffffffUL;
+        if (_nextClientLootSource == 0)
+            _nextClientLootSource = 1;
+        _clientLootSource = 0x6000000000000000UL | _nextClientLootSource;
+    }
+
+    internal void EndClientLootSource()
+    {
+        if (_clientLootSource != 0)
+        {
+            _pendingClientLootSource = _clientLootSource;
+            _pendingClientLootSourceUntil = Time.realtimeSinceStartup + 0.5f;
+        }
+        _clientLootSource = 0;
+    }
+
+    internal void Update(
+        SessionRole role,
+        UdpSession session,
+        string sceneName,
+        bool isLobby,
+        float now)
     {
         if (session == null)
             return;
         if (role == SessionRole.Host)
         {
+            UpdateHostCargoState(session, sceneName, now);
             while (session.TryTakeDiveLootRequest(out var request))
                 AcceptRemoteLoot(request);
             while (session.TryTakeDiveResultEntry(out _))
@@ -69,22 +142,47 @@ internal sealed class RemoteCatchLedger
             }
             return;
         }
-        while (session.TryTakeDiveLootRequest(out _))
-        {
-        }
         if (role != SessionRole.Client)
+        {
+            while (session.TryTakeDiveLootRequest(out _))
+            {
+            }
             return;
+        }
+        while (session.TryTakeCargoState(out var cargoState))
+            if (ShouldApplyCargoState(
+                    role, _inDiveSession, Protocol.SceneId(sceneName), cargoState))
+            {
+                _clientCargoState = cargoState;
+                ApplyClientCargoState(LootBox.Instance);
+                _trace?.Write("CARGO-APPLY",
+                    $"max={cargoState.WeightMax:F2} threshold={cargoState.OverloadedThreshold:F2} " +
+                    $"parameter={cargoState.WeightParameter:F2}");
+            }
+        while (session.TryTakeDiveLootRequest(out var request))
+            ApplyRemoteLoot(request);
         while (session.TryTakeDiveResultEntry(out var entry))
         {
             if (now < _clientAcceptResultsAt)
                 continue;
+            _log.LogInfo(
+                $"Client result entry received: transfer={entry.TransferId}; " +
+                $"index={entry.Index}/{entry.Total}; item={entry.ItemId}; count={entry.Count}");
+            _trace?.Write("RESULT-ENTRY",
+                $"transfer={entry.TransferId} index={entry.Index}/{entry.Total} " +
+                $"item={entry.ItemId} count={entry.Count}");
             BeginClientResult(entry.TransferId, entry.Total);
             if (entry.TransferId == _clientResultTransfer && entry.Total == _clientResultTotal)
                 _clientResultEntries[entry.Index] = entry;
         }
         while (session.TryTakeDiveResultState(out var state))
             if (now >= _clientAcceptResultsAt)
+            {
+                _log.LogInfo(
+                    $"Client result state received: transfer={state.TransferId}; total={state.Total}");
+                _trace?.Write("RESULT-STATE", $"transfer={state.TransferId} total={state.Total}");
                 BeginClientResult(state.TransferId, state.Total);
+            }
         if (!_inDiveSession)
         {
             _clientResultEntries.Clear();
@@ -92,11 +190,11 @@ internal sealed class RemoteCatchLedger
             _clientResultTotal = 0;
             return;
         }
-        if (_clientResultEntries.Count != _clientResultTotal)
+        if (_clientResultTransfer == 0 || _clientResultEntries.Count != _clientResultTotal)
             return;
         if (!_clientResultApplied)
             ApplyClientResult(now);
-        if (!_clientResultShown && sceneName == "DR_Lobby" &&
+        if (!_clientResultShown && isLobby &&
             now >= _clientResultReceivedAt + 0.35f)
             OpenClientResultFallback();
     }
@@ -105,6 +203,9 @@ internal sealed class RemoteCatchLedger
     {
         _entries.Clear();
         _acceptedSources.Clear();
+        _clientLootSource = 0;
+        _pendingClientLootSource = 0;
+        _pendingClientLootSourceUntil = 0f;
         _capture = null;
         _carriedWeight = 0f;
         _materializing = false;
@@ -118,6 +219,10 @@ internal sealed class RemoteCatchLedger
         _clientResultReceivedAt = 0f;
         _inDiveSession = true;
         _clientAcceptResultsAt = now + 2f;
+        _clientCargoState = default;
+        _lastHostCargoState = default;
+        _hasHostCargoState = false;
+        _nextHostCargoSend = 0f;
         if (session != null)
         {
             while (session.TryTakeDiveResultEntry(out _))
@@ -138,11 +243,49 @@ internal sealed class RemoteCatchLedger
         LootBox.AutoLiftedType liftType,
         bool updateMission)
     {
-        if (_applyingClientResult || session == null || !session.Connected ||
-            itemId <= 0 || count <= 0)
+        var sourceId = SelectClientLootSource(
+            _clientLootSource, _pendingClientLootSource,
+            Time.realtimeSinceStartup, _pendingClientLootSourceUntil);
+        if (_materializing || _capture != null || _applyingClientResult || _applyingRemoteLoot ||
+            session == null || !session.Connected ||
+            sourceId == 0 || itemId <= 0 || count <= 0)
+        {
+            _log.LogInfo(
+                $"Client loot ignored: item={itemId}; count={count}; " +
+                $"connected={session?.Connected ?? false}; applying={_applyingClientResult}; " +
+                $"remote={_applyingRemoteLoot}");
+            _trace?.Write("LOOT-IGNORE",
+                $"item={itemId} count={count} connected={session?.Connected ?? false} " +
+                $"applying={_applyingClientResult} remote={_applyingRemoteLoot}");
             return;
+        }
+        var frame = Time.frameCount;
+        if (frame == _lastClientLootFrame && _lastClientLoot != null &&
+            _lastClientLoot.ItemId == itemId && _lastClientLoot.Count == count &&
+            _lastClientLoot.BonusGrade == bonusGrade && _lastClientLoot.LiftType == liftType &&
+            _lastClientLoot.UpdateMission == updateMission)
+        {
+            _trace?.Write("LOOT-DUPE", $"item={itemId} count={count} frame={frame}");
+            return;
+        }
+        _lastClientLootFrame = frame;
+        _lastClientLoot = new LootEntry
+        {
+            ItemId = itemId,
+            Count = count,
+            BonusGrade = bonusGrade,
+            LiftType = liftType,
+            UpdateMission = updateMission
+        };
+        _log.LogInfo($"Client loot send: source={sourceId:X16}; item={itemId}; count={count}");
+        _trace?.Write("LOOT-SEND", $"source={sourceId:X16} item={itemId} count={count}");
         session.SendDiveLootRequest(new DiveLootRequest(
-            itemId, count, Math.Max(0, bonusGrade), (int)liftType, updateMission));
+            sourceId, itemId, count, Math.Max(0, bonusGrade), (int)liftType,
+            updateMission));
+        if (_clientLootSource == sourceId)
+            _clientLootSource = 0;
+        if (_pendingClientLootSource == sourceId)
+            _pendingClientLootSource = 0;
     }
 
     internal void PrepareResult(UdpSession session, bool sendSnapshot)
@@ -207,7 +350,8 @@ internal sealed class RemoteCatchLedger
             nativeCompleted = true;
             return true;
         }
-        if (_capture != null || _acceptedSources.Count >= MaxSources || nativePickup == null ||
+        if (sourceId == 0 || _capture != null || _acceptedSources.Count >= MaxSources ||
+            nativePickup == null ||
             expectedItemId <= 0 || expectedCount is < 1 or > MaxCountPerAdd ||
             _entries.Count > MaxStacks - 8 ||
             !HasCarryCapacity())
@@ -241,10 +385,11 @@ internal sealed class RemoteCatchLedger
             return false;
         }
 
+        if (!TryAcceptEvidence(_acceptedSources, sourceId, true))
+            return false;
         UpdateAcceptedMissions(capture.Entries);
         _entries.AddRange(capture.Entries);
         AddWeight(capture.Entries);
-        _acceptedSources.Add(sourceId);
         if (failure != null)
             _log.LogWarning($"Remote pickup kept partial loot: {failure.Message}");
         return true;
@@ -359,6 +504,7 @@ internal sealed class RemoteCatchLedger
         _materializing = false;
         _hostResultSent = false;
         _applyingClientResult = false;
+        _applyingRemoteLoot = false;
         _clientResultTransfer = 0;
         _clientResultTotal = 0;
         _clientResultEntries.Clear();
@@ -367,6 +513,15 @@ internal sealed class RemoteCatchLedger
         _clientResultReceivedAt = 0f;
         _inDiveSession = false;
         _clientAcceptResultsAt = 0f;
+        _lastClientLootFrame = -1;
+        _lastClientLoot = null;
+        _clientCargoState = default;
+        _lastHostCargoState = default;
+        _hasHostCargoState = false;
+        _nextHostCargoSend = 0f;
+        _clientLootSource = 0;
+        _pendingClientLootSource = 0;
+        _pendingClientLootSourceUntil = 0f;
     }
 
     internal void ClearCompleted()
@@ -381,6 +536,44 @@ internal sealed class RemoteCatchLedger
 
     internal static ulong PickupSource(uint sceneId, uint worldId) =>
         0x5000000000000000UL ^ ((ulong)sceneId << 32) ^ worldId;
+
+    internal void ApplyClientCargoState(LootBox lootBox)
+    {
+        if (lootBox == null || _clientCargoState.SceneId == 0)
+            return;
+        lootBox.WeightParameter = _clientCargoState.WeightParameter;
+        lootBox.m_WeightMax = _clientCargoState.WeightMax;
+        lootBox.overloadedThreshold = _clientCargoState.OverloadedThreshold;
+    }
+
+    private void UpdateHostCargoState(UdpSession session, string sceneName, float now)
+    {
+        if (!_inDiveSession)
+            return;
+        var lootBox = LootBox.Instance;
+        var sceneId = Protocol.SceneId(sceneName);
+        if (lootBox == null || sceneId == 0 || lootBox.weightMax <= 0f ||
+            lootBox.overloadedThreshold <= 0f)
+            return;
+        var state = new CargoState(
+            sceneId, lootBox.weightMax, lootBox.overloadedThreshold, lootBox.WeightParameter);
+        if (_hasHostCargoState && state == _lastHostCargoState && now < _nextHostCargoSend)
+            return;
+        session.SendCargoState(state);
+        _lastHostCargoState = state;
+        _hasHostCargoState = true;
+        _nextHostCargoSend = now + 5f;
+        _trace?.Write("CARGO-SEND",
+            $"max={state.WeightMax:F2} threshold={state.OverloadedThreshold:F2} " +
+            $"parameter={state.WeightParameter:F2}");
+    }
+
+    private static bool ShouldApplyCargoState(
+        SessionRole role,
+        bool inDive,
+        uint sceneId,
+        CargoState state) =>
+        role == SessionRole.Client && inDive && sceneId != 0 && sceneId == state.SceneId;
 
     // Matching the native inventory, the pickup that crosses the limit is
     // accepted and makes the diver overloaded; later pickups stop.
@@ -431,26 +624,63 @@ internal sealed class RemoteCatchLedger
 
     private void AcceptRemoteLoot(DiveLootRequest request)
     {
-        if (_entries.Count >= MaxStacks || request.ItemId <= 0 ||
-            request.Count is < 1 or > MaxCountPerAdd)
+        if (_entries.Count >= MaxStacks || request.SourceId == 0 ||
+            _acceptedSources.Contains(request.SourceId) ||
+            _remoteLootEvidence == null || !_remoteLootEvidence(request))
         {
             _log.LogWarning(
-                $"Remote loot rejected: item={request.ItemId}; count={request.Count}");
+                $"Remote loot rejected: source={request.SourceId:X16}; " +
+                $"item={request.ItemId}; count={request.Count}");
             return;
         }
-        var entry = new LootEntry
+        _log.LogInfo($"Remote loot evidence accepted: source={request.SourceId:X16}");
+        _trace?.Write("LOOT-ACCEPT", $"source={request.SourceId:X16}");
+    }
+
+    private static bool TryAcceptEvidence(HashSet<ulong> accepted, ulong sourceId, bool hasEvidence) =>
+        sourceId != 0 && hasEvidence && accepted.Add(sourceId);
+
+    private static ulong SelectClientLootSource(
+        ulong active,
+        ulong pending,
+        float now,
+        float pendingUntil) => active != 0 ? active : now <= pendingUntil ? pending : 0;
+
+    private void ApplyRemoteLoot(DiveLootRequest request)
+    {
+        if (request.ItemId <= 0 || request.Count is < 1 or > MaxCountPerAdd)
+            return;
+        var lootBox = LootBox.Instance;
+        if (lootBox == null)
+            return;
+        _applyingRemoteLoot = true;
+        try
         {
-            ItemId = request.ItemId,
-            Count = request.Count,
-            BonusGrade = request.BonusGrade,
-            LiftType = (LootBox.AutoLiftedType)request.LiftType,
-            GetTimes = null,
-            UpdateMission = request.UpdateMission
-        };
-        UpdateAcceptedMissions(new[] { entry });
-        _entries.Add(entry);
-        AddWeight(new List<LootEntry> { entry });
-        _log.LogInfo($"Remote loot accepted: item={request.ItemId}; count={request.Count}");
+            if (lootBox.AddIgnoreOverloaded(
+                    request.ItemId,
+                    request.Count,
+                    request.BonusGrade,
+                    (LootBox.AutoLiftedType)request.LiftType,
+                    null,
+                    request.UpdateMission))
+            {
+                _log.LogInfo($"Remote loot applied: item={request.ItemId}; count={request.Count}");
+                _trace?.Write("LOOT-APPLY", $"item={request.ItemId} count={request.Count}");
+            }
+            else
+                _trace?.Write("LOOT-APPLY-REJECT", $"item={request.ItemId} count={request.Count}");
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning(
+                $"Remote loot apply failed: item={request.ItemId}; {exception.Message}");
+            _trace?.Write("LOOT-APPLY-ERROR",
+                $"item={request.ItemId} error={exception.GetType().Name}:{exception.Message}");
+        }
+        finally
+        {
+            _applyingRemoteLoot = false;
+        }
     }
 
     private void UpdateAcceptedMissions(IEnumerable<LootEntry> entries)
@@ -584,9 +814,32 @@ internal static class ClientDiveLootPatch
         int __2,
         LootBox.AutoLiftedType __3,
         Il2CppSystem.Collections.Generic.List<string> __4,
-        bool __5) =>
+        bool __5)
+    {
+        ProbeBehaviour.Instance?.TraceLootEntry("add-impl", __0?.TID ?? 0, __1, __3, true);
         ProbeBehaviour.Instance?.ReportClientLoot(
             __0?.TID ?? 0, __1, __2, __3, __5);
+    }
+}
+
+[HarmonyPatch(typeof(LootBox), nameof(LootBox.CheckOverloadedState))]
+internal static class LootBoxOverloadTracePatch
+{
+    private static void Postfix(int tid, ref bool __result)
+    {
+        var nativeResult = __result;
+        ProbeBehaviour.Instance?.TraceOverload(tid, nativeResult, __result);
+    }
+}
+
+[HarmonyPatch(
+    typeof(LootBox),
+    nameof(LootBox.RefreshOverweight),
+    new[] { typeof(float) })]
+internal static class LootBoxCargoRefreshPatch
+{
+    private static void Postfix(LootBox __instance) =>
+        ProbeBehaviour.Instance?.ApplyClientCargoState(__instance);
 }
 
 [HarmonyPatch(typeof(LootBox), nameof(LootBox.Add),
@@ -606,11 +859,24 @@ internal static class RemoteCatchLootAddPatch
         bool bUpdateMissionCnt,
         ref bool __result)
     {
+        ProbeBehaviour.Instance?.TraceLootEntry("add-prefix", id, count, liftType, false);
         if (!RemoteCatchPatchBridge.TryCapture(
                 id, count, bonusGrade, liftType, getTimes, bUpdateMissionCnt))
             return true;
         __result = true;
         return false;
+    }
+
+    private static void Postfix(
+        int id,
+        int count,
+        int bonusGrade,
+        LootBox.AutoLiftedType liftType,
+        Il2CppSystem.Collections.Generic.List<string> getTimes,
+        bool bUpdateMissionCnt,
+        bool __result)
+    {
+        ProbeBehaviour.Instance?.TraceLootEntry("add-postfix", id, count, liftType, __result);
     }
 }
 
@@ -631,11 +897,24 @@ internal static class RemoteCatchLootAddIgnorePatch
         bool bUpdateMissionCnt,
         ref bool __result)
     {
+        ProbeBehaviour.Instance?.TraceLootEntry("add-ignore-prefix", id, count, liftType, false);
         if (!RemoteCatchPatchBridge.TryCapture(
                 id, count, bonusGrade, liftType, getTimes, bUpdateMissionCnt))
             return true;
         __result = true;
         return false;
+    }
+
+    private static void Postfix(
+        int id,
+        int count,
+        int bonusGrade,
+        LootBox.AutoLiftedType liftType,
+        Il2CppSystem.Collections.Generic.List<string> getTimes,
+        bool bUpdateMissionCnt,
+        bool __result)
+    {
+        ProbeBehaviour.Instance?.TraceLootEntry("add-ignore-postfix", id, count, liftType, __result);
     }
 }
 
@@ -650,16 +929,6 @@ internal static class RemoteCatchResultStartPatch
 internal static class RemoteCatchResultPanelPatch
 {
     private static void Prefix() => RemoteCatchPatchBridge.PrepareResult();
-}
-
-[HarmonyPatch(typeof(PlayerDiePopupMenu), nameof(PlayerDiePopupMenu.OnPopup))]
-internal static class RemoteCatchDeathPopupPatch
-{
-    private static bool Prefix()
-    {
-        RemoteCatchPatchBridge.PrepareResult();
-        return !(ProbeBehaviour.Instance?.ShouldSuppressClientDeathPopup() ?? false);
-    }
 }
 
 [HarmonyPatch(typeof(LootBox), nameof(LootBox.Clear))]

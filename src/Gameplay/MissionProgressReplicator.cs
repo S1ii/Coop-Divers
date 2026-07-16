@@ -33,11 +33,33 @@ internal sealed class MissionProgressReplicator
         _trace = trace;
     }
 
-    internal void Update(SessionRole role, UdpSession session, float now)
+    internal static void SelfTest()
+    {
+        var conditions = new[] { new MissionConditionState(100, 3) };
+        var local = new MissionState(1, 10, 2, 2, 20, conditions);
+        var keyframe = new MissionState(2, 10, 2, 2, 20, conditions);
+        var changed = new MissionState(3, 10, 2, 2, 20,
+            new[] { new MissionConditionState(100, 4) });
+        if (ShouldApplyClientState(local, keyframe) || !ShouldApplyClientState(local, changed))
+            throw new InvalidOperationException("Mission client apply decision failed");
+        if (ShouldApplyTerminalState(true, (byte)global::MissionState.Clear) ||
+            !ShouldApplyTerminalState(false, (byte)global::MissionState.Clear) ||
+            !ShouldApplyTerminalState(true, (byte)global::MissionState.InProgress))
+            throw new InvalidOperationException("Mission terminal deferral failed");
+        if (ResolveConditionCount(Array.Empty<MissionConditionState>(), 100) != 0 ||
+            ResolveConditionCount(conditions, 100) != 3 ||
+            ResolveConditionCount(conditions, 200) != 0)
+            throw new InvalidOperationException("Mission condition snapshot merge failed");
+        if (!ShouldRetainUnrestoredOriginal(true) || !ShouldRetainUnrestoredOriginal(false))
+            throw new InvalidOperationException("Mission original restore retry policy failed");
+    }
+
+    internal void Update(SessionRole role, UdpSession session, float now, bool deferTerminalStates)
     {
         var connected = session != null && session.Connected;
         if (!connected)
         {
+            RestoreClientOriginals();
             if (_wasConnected)
                 ClearNetworkState();
             _wasConnected = false;
@@ -45,6 +67,7 @@ internal sealed class MissionProgressReplicator
         }
         if (!_wasConnected)
         {
+            RestoreClientOriginals();
             _hostStates.Clear();
             _clientRevisions.Clear();
             _pendingClientStates.Clear();
@@ -113,20 +136,43 @@ internal sealed class MissionProgressReplicator
         }
         var changed = false;
         foreach (var pair in new List<KeyValuePair<int, MissionState>>(_pendingClientStates))
-            if (ApplyClientState(pair.Value, preserveOriginal: true))
+        {
+            if (!ShouldApplyTerminalState(deferTerminalStates, pair.Value.State))
+                continue;
+            var mission = MissionManager.Instance?.GetMissionData(pair.Key);
+            if (mission == null)
+                continue;
+            if (!ShouldApplyClientState(Capture(mission, pair.Value.Revision), pair.Value))
             {
                 _clientRevisions[pair.Key] = pair.Value.Revision;
                 _pendingClientStates.Remove(pair.Key);
-                changed = true;
+                _trace?.Write("MISSION-SKIP",
+                    $"mission={pair.Key} revision={pair.Value.Revision} reason=identical");
+                continue;
             }
+            if (!ApplyClientState(pair.Value, preserveOriginal: true))
+                continue;
+            _clientRevisions[pair.Key] = pair.Value.Revision;
+            _pendingClientStates.Remove(pair.Key);
+            changed = true;
+        }
         if (changed)
             RefreshClientMissionUI("state");
     }
 
     internal void Clear()
     {
+        RestoreClientOriginals();
         ClearNetworkState();
         _wasConnected = false;
+    }
+
+    internal void ForceHostKeyframe()
+    {
+        _hostRosterQueued = false;
+        _nextHostScan = 0f;
+        _nextHostKeyframe = 0f;
+        _nextHostFullKeyframe = 0f;
     }
 
     private void PublishHostChanges(UdpSession session, bool keyframe, bool fullKeyframe)
@@ -153,6 +199,10 @@ internal sealed class MissionProgressReplicator
                 current = current with { Revision = NextRevision(previous.Revision) };
                 _hostStates[mission.TID] = current;
                 session.SendMissionState(current);
+                _trace?.Write("MISSION-SEND",
+                    $"mission={current.MissionId} revision={current.Revision} " +
+                    $"state={current.State} progress={current.Progress} " +
+                    $"conditions={FormatConditions(current.Conditions)}");
             }
             roster.Sort();
             PublishHostRoster(session, roster.ToArray());
@@ -268,30 +318,38 @@ internal sealed class MissionProgressReplicator
             if (preserveOriginal && !_clientOriginals.ContainsKey(state.MissionId))
                 _clientOriginals[state.MissionId] = Capture(mission, 1);
 
-            mission.State = (global::MissionState)state.State;
-            mission.Progress = state.Progress;
-            mission.ForceUpdateCurrenTask();
-            SelectTask(mission, state.CurrentTaskId);
-            var task = mission.CurrentTask;
-            if (task != null && (state.CurrentTaskId == 0 || task.TID == state.CurrentTaskId))
+            var probe = ProbeBehaviour.Instance;
+            probe?.BeginRemoteMissionApply();
+            try
             {
-                var values = new Dictionary<int, int>(state.Conditions.Length);
-                foreach (var condition in state.Conditions)
-                    values[condition.Id] = condition.Count;
-                foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
-                    if (condition != null)
-                        condition.NowCount = values.TryGetValue(condition.TID, out var count)
-                            ? count
-                            : 0;
+                mission.State = (global::MissionState)state.State;
+                mission.Progress = state.Progress;
+                mission.ForceUpdateCurrenTask();
+                SelectTask(mission, state.CurrentTaskId);
+                var task = mission.CurrentTask;
+                if (task != null && (state.CurrentTaskId == 0 || task.TID == state.CurrentTaskId))
+                {
+                    foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
+                        if (condition != null)
+                            condition.NowCount = ResolveConditionCount(state.Conditions, condition.TID);
+                }
+                SetMembership(manager.InProgressList, mission,
+                    mission.State == global::MissionState.InProgress);
+                SetMembership(manager.NewMissionList, mission,
+                    mission.State == global::MissionState.Accept);
+                if (mission.State is global::MissionState.Clear or global::MissionState.Done)
+                    manager.ClearedSet.Add(mission.TID);
+                else
+                    manager.ClearedSet.Remove(mission.TID);
             }
-            SetMembership(manager.InProgressList, mission,
-                mission.State == global::MissionState.InProgress);
-            SetMembership(manager.NewMissionList, mission,
-                mission.State == global::MissionState.Accept);
-            if (mission.State is global::MissionState.Clear or global::MissionState.Done)
-                manager.ClearedSet.Add(mission.TID);
-            else
-                manager.ClearedSet.Remove(mission.TID);
+            finally
+            {
+                probe?.EndRemoteMissionApply();
+            }
+            _trace?.Write("MISSION-APPLY",
+                $"mission={state.MissionId} revision={state.Revision} " +
+                $"state={state.State} progress={state.Progress} " +
+                $"conditions={FormatConditions(state.Conditions)}");
             return true;
         }
         catch (Exception exception)
@@ -301,11 +359,27 @@ internal sealed class MissionProgressReplicator
         }
     }
 
-    private void RestoreClientState()
+    internal bool TryRestoreClientOriginals()
     {
-        foreach (var state in _clientOriginals.Values)
-            ApplyClientState(state, preserveOriginal: false);
-        _clientOriginals.Clear();
+        RestoreClientOriginals();
+        return _clientOriginals.Count == 0;
+    }
+
+    private void RestoreClientOriginals()
+    {
+        if (_clientOriginals.Count == 0)
+            return;
+        var restored = new List<int>();
+        if (MissionManager.Instance != null)
+        {
+            foreach (var pair in _clientOriginals)
+                if (ApplyClientState(pair.Value, preserveOriginal: false))
+                    restored.Add(pair.Key);
+        }
+        foreach (var missionId in restored)
+            _clientOriginals.Remove(missionId);
+        if (restored.Count > 0)
+            RefreshClientMissionUI("restore");
     }
 
     private void RefreshClientMissionUI(string source)
@@ -330,7 +404,6 @@ internal sealed class MissionProgressReplicator
 
     private void ClearNetworkState()
     {
-        RestoreClientState();
         _hostStates.Clear();
         _clientRevisions.Clear();
         _pendingClientStates.Clear();
@@ -389,6 +462,23 @@ internal sealed class MissionProgressReplicator
         return true;
     }
 
+    private static bool ShouldApplyClientState(MissionState local, MissionState remote) =>
+        !SameContent(local, remote);
+
+    private static bool ShouldApplyTerminalState(bool deferTerminalStates, byte state) =>
+        !deferTerminalStates || !IsTerminal(state);
+
+    private static bool ShouldRetainUnrestoredOriginal(bool _) => true;
+
+    private static int ResolveConditionCount(MissionConditionState[] conditions, int id)
+    {
+        // Snapshots cap at 64 conditions; index if that limit grows.
+        foreach (var condition in conditions)
+            if (condition.Id == id)
+                return condition.Count;
+        return 0;
+    }
+
     private static bool SameIds(int[] left, int[] right) =>
         left.AsSpan().SequenceEqual(right);
 
@@ -399,4 +489,14 @@ internal sealed class MissionProgressReplicator
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;
+
+    private static string FormatConditions(MissionConditionState[] conditions)
+    {
+        if (conditions == null || conditions.Length == 0)
+            return "none";
+        var parts = new string[Math.Min(conditions.Length, 8)];
+        for (var index = 0; index < parts.Length; index++)
+            parts[index] = $"{conditions[index].Id}:{conditions[index].Count}";
+        return string.Join(',', parts);
+    }
 }

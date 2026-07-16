@@ -21,7 +21,19 @@ public sealed class Plugin : BasePlugin
     public override void Load()
     {
         Protocol.SelfTest();
+        UdpSession.SelfTest();
         LobbyInput.SelfTest();
+        FishReplicator.SelfTest();
+        DiveCoordinator.SelfTest();
+        SceneReplicator.SelfTest();
+        FishSpawnSeedCoordinator.SelfTest();
+        HostAuthorityPolicy.SelfTest();
+        MissionProgressReplicator.SelfTest();
+        PickupReplicator.SelfTest();
+        RemoteCatchLedger.SelfTest();
+        RemoteAvatar.SelfTest();
+        ManagerEventReplicator.SelfTest();
+        NpcInteractionCoordinator.SelfTest();
 
         _config = Config;
         _roleConfig = Config.Bind("Network", "Role", SessionRole.Offline,

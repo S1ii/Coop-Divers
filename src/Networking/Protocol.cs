@@ -47,11 +47,18 @@ internal enum PacketType : byte
     ManagerEvent = 41,
     SushiResultState = 42,
     MissionRoster = 43,
-    FishPickupResult = 44
+    FishPickupResult = 44,
+    SceneSeed = 45,
+    CargoState = 46,
+    NpcInteraction = 47,
+    FishLifecycle = 48,
+    FishActionRequest = 49,
+    FishActionAck = 50
 }
 
 internal readonly record struct PlayerSnapshot(
     uint SceneId,
+    uint SceneEpoch,
     float X,
     float Y,
     float Z,
@@ -101,8 +108,10 @@ internal readonly record struct ProjectileVisualState(
 
 internal readonly record struct FishSnapshot(
     uint SceneId,
+    uint SceneEpoch,
     uint Tick,
     int Id,
+    uint Revision,
     int FishDataTID,
     float X,
     float Y,
@@ -115,19 +124,26 @@ internal readonly record struct FishSnapshot(
 
 internal readonly record struct FishDamageRequest(
     uint SceneId,
+    uint SceneEpoch,
     int Id,
+    uint KnownRevision,
     int Damage,
     int Element,
     int AttackType);
 
-internal readonly record struct FishPickupRequest(uint SceneId, int Id);
-internal readonly record struct FishPickupResult(uint SceneId, int Id, bool Accepted);
-internal readonly record struct FishRemoved(uint SceneId, int Id);
+internal readonly record struct FishPickupRequest(
+    uint SceneId, uint SceneEpoch, int Id, uint KnownRevision);
+internal readonly record struct FishPickupResult(
+    uint SceneId, uint SceneEpoch, int Id, uint Revision, bool Accepted);
+internal readonly record struct FishRemoved(
+    uint SceneId, uint SceneEpoch, int Id, uint Revision);
 
 internal readonly record struct FishManifest(
     uint SceneId,
+    uint SceneEpoch,
     uint Revision,
     int Id,
+    uint FishRevision,
     string AllocatorUid,
     int FishDataTID,
     float X,
@@ -139,8 +155,88 @@ internal readonly record struct FishManifest(
 
 internal readonly record struct FishManifestState(
     uint SceneId,
+    uint SceneEpoch,
     uint Revision,
     ushort EntryCount);
+
+internal enum FishLifecycleKind : byte
+{
+    Spawn = 1,
+    Despawn = 2,
+    Phase = 3
+}
+
+internal enum FishPhase : byte
+{
+    None,
+    Alive,
+    Hooked,
+    Qte,
+    Captured,
+    Corpse
+}
+
+internal enum FishAction : byte
+{
+    Damage = 1,
+    Qte = 2,
+    Hook = 3,
+    Release = 4,
+    Capture = 5,
+    CorpsePickup = 6
+}
+
+internal enum FishActionResult : byte
+{
+    Accepted = 1,
+    Rejected = 2
+}
+
+internal enum FishActionRejectReason : byte
+{
+    None,
+    SceneMismatch,
+    MissingFish,
+    StaleRevision,
+    InvalidAction,
+    InvalidState,
+    OutOfRange,
+    Duplicate,
+    InternalError
+}
+
+internal readonly record struct FishLifecycle(
+    uint SceneId,
+    uint SceneEpoch,
+    int Id,
+    uint Revision,
+    FishLifecycleKind Kind,
+    int FishDataTID,
+    FishPhase Phase,
+    float Hp);
+
+internal readonly record struct FishActionRequest(
+    ulong RequestId,
+    uint SceneId,
+    uint SceneEpoch,
+    int Id,
+    uint KnownRevision,
+    FishAction Action,
+    int Damage,
+    int Element,
+    int AttackType);
+
+internal readonly record struct FishActionAck(
+    ulong RequestId,
+    uint SceneId,
+    uint SceneEpoch,
+    int Id,
+    uint Revision,
+    FishAction Action,
+    FishActionResult Result,
+    FishActionRejectReason RejectReason,
+    float Hp,
+    FishPhase Phase);
 
 internal readonly record struct PickupRemoved(
     uint SceneId,
@@ -150,7 +246,9 @@ internal readonly record struct PickupRemoved(
 internal readonly record struct SceneTransitionCommand(
     string SceneName,
     int TransitionType,
-    ushort Options);
+    ushort Options,
+    uint SceneId,
+    int Seed);
 
 internal readonly record struct IngredientCount(
     int IngredientId,
@@ -176,7 +274,44 @@ internal readonly record struct IngredientsDelta(
 internal readonly record struct RoomReady(uint RoomId, uint Revision, bool Ready);
 internal readonly record struct RoomState(uint RoomId, uint Revision, bool ClientReady);
 internal readonly record struct DiveReady(uint Revision, bool Ready);
-internal readonly record struct DiveState(uint Revision, bool HostReady, bool ClientReady);
+internal readonly record struct DiveState(
+    uint Revision,
+    bool HostReady,
+    bool ClientReady,
+    uint SceneId,
+    int Seed);
+internal readonly record struct SceneSeed(uint SceneId, int Seed);
+internal readonly record struct CargoState(
+    uint SceneId,
+    float WeightMax,
+    float OverloadedThreshold,
+    float WeightParameter);
+internal enum NpcInteractionAction : byte
+{
+    Request = 1,
+    Granted = 2,
+    Released = 3
+}
+internal enum NpcInteractionResult : byte
+{
+    Pending,
+    Accepted,
+    Busy,
+    Invalid,
+    MissionOwned,
+    TooFar
+}
+internal readonly record struct NpcInteraction(
+    ulong Token,
+    uint SceneId,
+    uint SceneEpoch,
+    uint TargetId,
+    uint Revision,
+    NpcInteractionAction Action,
+    int NpcId,
+    int MissionId,
+    int TaskId,
+    NpcInteractionResult Result);
 internal readonly record struct BoatDecoState(int Id);
 internal readonly record struct DiverLifeState(uint Revision, bool IsDead);
 internal readonly record struct DiveExitRequest(uint Revision);
@@ -199,6 +334,7 @@ internal readonly record struct TravelState(
     bool SoloAllowed,
     bool HostDead);
 internal readonly record struct DiveLootRequest(
+    ulong SourceId,
     int ItemId,
     int Count,
     int BonusGrade,
@@ -262,25 +398,28 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 29;
+    private const byte Version = 34;
     internal const int HeaderSize = 18;
-    private const int SnapshotSize = HeaderSize + 41;
+    private const int SnapshotSize = HeaderSize + 45;
     private const int VisualStateFixedSize = HeaderSize + 5;
     private const int VisualSpriteSize = 38;
     private const int ProjectileVisualStateSize = HeaderSize + 70;
     internal const int MaxVisualSprites = 16;
-    private const int FishSnapshotBatchFixedSize = HeaderSize + 9;
-    private const int FishSnapshotEntrySize = 37;
-    private const int FishDamageRequestSize = HeaderSize + 20;
+    private const int FishSnapshotBatchFixedSize = HeaderSize + 13;
+    private const int FishSnapshotEntrySize = 41;
+    private const int FishDamageRequestSize = HeaderSize + 28;
     private const int BossDamageRequestSize = HeaderSize + 20;
     private const int BossStateSize = HeaderSize + 45;
     private const int ManagerEventSize = HeaderSize + 22;
     private const int SushiResultStateSize = HeaderSize + 28;
-    private const int FishPickupRequestSize = HeaderSize + 8;
-    private const int FishPickupResultSize = HeaderSize + 9;
-    private const int FishRemovedSize = HeaderSize + 8;
-    private const int FishManifestFixedSize = HeaderSize + 38;
-    private const int FishManifestStateSize = HeaderSize + 10;
+    private const int FishPickupRequestSize = HeaderSize + 16;
+    private const int FishPickupResultSize = HeaderSize + 17;
+    private const int FishRemovedSize = HeaderSize + 16;
+    private const int FishManifestFixedSize = HeaderSize + 46;
+    private const int FishManifestStateSize = HeaderSize + 14;
+    private const int FishLifecycleSize = HeaderSize + 26;
+    private const int FishActionRequestSize = HeaderSize + 37;
+    private const int FishActionAckSize = HeaderSize + 32;
     private const int PickupRemovedSize = HeaderSize + 12;
     private const int IngredientsSyncRequestSize = HeaderSize + 8;
     private const int IngredientsSnapshotChunkFixedSize = HeaderSize + 26;
@@ -288,13 +427,16 @@ internal static class Protocol
     private const int IngredientCountSize = 12;
     private const int RoomPacketSize = HeaderSize + 9;
     private const int DiveReadyPacketSize = HeaderSize + 5;
-    private const int DiveStatePacketSize = HeaderSize + 6;
+    private const int DiveStatePacketSize = HeaderSize + 14;
+    private const int SceneSeedPacketSize = HeaderSize + 8;
+    private const int CargoStatePacketSize = HeaderSize + 16;
+    private const int NpcInteractionPacketSize = HeaderSize + 38;
     private const int BoatDecoStatePacketSize = HeaderSize + 4;
     private const int DiverLifeStatePacketSize = HeaderSize + 5;
     private const int DiveExitRequestPacketSize = HeaderSize + 4;
     private const int TravelReadyFixedSize = HeaderSize + 24;
     private const int TravelStatePacketSize = HeaderSize + 12;
-    private const int DiveLootRequestPacketSize = HeaderSize + 17;
+    private const int DiveLootRequestPacketSize = HeaderSize + 25;
     private const int DiveResultEntryPacketSize = HeaderSize + 28;
     private const int DiveResultStatePacketSize = HeaderSize + 10;
     private const int MissionStateFixedSize = HeaderSize + 18;
@@ -367,16 +509,17 @@ internal static class Protocol
         var packet = new byte[SnapshotSize];
         WriteHeader(packet, PacketType.PlayerSnapshot, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), snapshot.SceneId);
-        WriteSingle(packet.AsSpan(HeaderSize + 4), snapshot.X);
-        WriteSingle(packet.AsSpan(HeaderSize + 8), snapshot.Y);
-        WriteSingle(packet.AsSpan(HeaderSize + 12), snapshot.Z);
-        WriteSingle(packet.AsSpan(HeaderSize + 16), snapshot.Rotation);
-        WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.VelocityX);
-        WriteSingle(packet.AsSpan(HeaderSize + 24), snapshot.VelocityY);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 28), snapshot.SpriteId);
-        WriteSingle(packet.AsSpan(HeaderSize + 32), snapshot.ScaleX);
-        WriteSingle(packet.AsSpan(HeaderSize + 36), snapshot.ScaleY);
-        packet[HeaderSize + 40] = snapshot.Flipped ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), snapshot.SceneEpoch);
+        WriteSingle(packet.AsSpan(HeaderSize + 8), snapshot.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 12), snapshot.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 16), snapshot.Z);
+        WriteSingle(packet.AsSpan(HeaderSize + 20), snapshot.Rotation);
+        WriteSingle(packet.AsSpan(HeaderSize + 24), snapshot.VelocityX);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), snapshot.VelocityY);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 32), snapshot.SpriteId);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), snapshot.ScaleX);
+        WriteSingle(packet.AsSpan(HeaderSize + 40), snapshot.ScaleY);
+        packet[HeaderSize + 44] = snapshot.Flipped ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -389,14 +532,15 @@ internal static class Protocol
             type != PacketType.PlayerSnapshot)
             return false;
 
-        var x = ReadSingle(packet.Slice(HeaderSize + 4));
-        var y = ReadSingle(packet.Slice(HeaderSize + 8));
-        var z = ReadSingle(packet.Slice(HeaderSize + 12));
-        var rotation = ReadSingle(packet.Slice(HeaderSize + 16));
-        var velocityX = ReadSingle(packet.Slice(HeaderSize + 20));
-        var velocityY = ReadSingle(packet.Slice(HeaderSize + 24));
-        var scaleX = ReadSingle(packet.Slice(HeaderSize + 32));
-        var scaleY = ReadSingle(packet.Slice(HeaderSize + 36));
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var x = ReadSingle(packet.Slice(HeaderSize + 8));
+        var y = ReadSingle(packet.Slice(HeaderSize + 12));
+        var z = ReadSingle(packet.Slice(HeaderSize + 16));
+        var rotation = ReadSingle(packet.Slice(HeaderSize + 20));
+        var velocityX = ReadSingle(packet.Slice(HeaderSize + 24));
+        var velocityY = ReadSingle(packet.Slice(HeaderSize + 28));
+        var scaleX = ReadSingle(packet.Slice(HeaderSize + 36));
+        var scaleY = ReadSingle(packet.Slice(HeaderSize + 40));
         if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z) ||
             !float.IsFinite(rotation) || !float.IsFinite(velocityX) || !float.IsFinite(velocityY) ||
             !float.IsFinite(scaleX) || !float.IsFinite(scaleY) ||
@@ -404,14 +548,15 @@ internal static class Protocol
             MathF.Abs(x) > 1_000_000f || MathF.Abs(y) > 1_000_000f || MathF.Abs(z) > 1_000_000f ||
             MathF.Abs(velocityX) > 10_000f || MathF.Abs(velocityY) > 10_000f ||
             MathF.Abs(scaleX) > 100f || MathF.Abs(scaleY) > 100f ||
-            packet[HeaderSize + 40] > 1)
+            sceneEpoch == 0 || packet[HeaderSize + 44] > 1)
             return false;
 
         snapshot = new PlayerSnapshot(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            sceneEpoch,
             x, y, z, rotation, velocityX, velocityY,
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 28)),
-            scaleX, scaleY, packet[HeaderSize + 40] == 1);
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 32)),
+            scaleX, scaleY, packet[HeaderSize + 44] == 1);
         return true;
     }
 
@@ -594,58 +739,191 @@ internal static class Protocol
         }
     }
 
-    internal static byte[] EncodeSceneState(uint sequence, uint sceneId)
+    internal static byte[] EncodeSceneState(uint sequence, uint sceneId, uint sceneEpoch)
     {
-        var packet = new byte[HeaderSize + 4];
+        if (sceneEpoch == 0)
+            throw new ArgumentOutOfRangeException(nameof(sceneEpoch));
+        var packet = new byte[HeaderSize + 8];
         WriteHeader(packet, PacketType.SceneState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), sceneEpoch);
         return packet;
     }
 
-    internal static bool TryDecodeSceneState(ReadOnlySpan<byte> packet, out uint sequence, out uint sceneId)
+    internal static bool TryDecodeSceneState(
+        ReadOnlySpan<byte> packet, out uint sequence, out uint sceneId, out uint sceneEpoch)
     {
         sequence = 0;
         sceneId = 0;
-        if (packet.Length != HeaderSize + 4 ||
+        sceneEpoch = 0;
+        if (packet.Length != HeaderSize + 8 ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.SceneState)
             return false;
         sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        return sceneEpoch != 0;
+    }
+
+    internal static byte[] EncodeSceneSeed(uint sequence, SceneSeed seed)
+    {
+        if (seed.SceneId == 0 || seed.Seed == 0)
+            throw new ArgumentOutOfRangeException(nameof(seed));
+        var packet = new byte[SceneSeedPacketSize];
+        WriteHeader(packet, PacketType.SceneSeed, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), seed.SceneId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), seed.Seed);
+        return packet;
+    }
+
+    internal static bool TryDecodeSceneSeed(ReadOnlySpan<byte> packet, out uint sequence, out SceneSeed seed)
+    {
+        sequence = 0;
+        seed = default;
+        if (packet.Length != SceneSeedPacketSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.SceneSeed)
+            return false;
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var value = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        if (sceneId == 0 || value == 0)
+            return false;
+        seed = new SceneSeed(sceneId, value);
         return true;
     }
+
+    internal static byte[] EncodeCargoState(uint sequence, CargoState state)
+    {
+        if (state.SceneId == 0 || state.WeightMax <= 0f || state.OverloadedThreshold <= 0f ||
+            !float.IsFinite(state.WeightMax) || !float.IsFinite(state.OverloadedThreshold) ||
+            !float.IsFinite(state.WeightParameter))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[CargoStatePacketSize];
+        WriteHeader(packet, PacketType.CargoState, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
+        WriteSingle(packet.AsSpan(HeaderSize + 4), state.WeightMax);
+        WriteSingle(packet.AsSpan(HeaderSize + 8), state.OverloadedThreshold);
+        WriteSingle(packet.AsSpan(HeaderSize + 12), state.WeightParameter);
+        return packet;
+    }
+
+    internal static bool TryDecodeCargoState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out CargoState state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != CargoStatePacketSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.CargoState)
+            return false;
+        state = new CargoState(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            ReadSingle(packet.Slice(HeaderSize + 4)),
+            ReadSingle(packet.Slice(HeaderSize + 8)),
+            ReadSingle(packet.Slice(HeaderSize + 12)));
+        return state.SceneId != 0 && state.WeightMax > 0f && state.OverloadedThreshold > 0f &&
+               float.IsFinite(state.WeightMax) && float.IsFinite(state.OverloadedThreshold) &&
+               float.IsFinite(state.WeightParameter);
+    }
+
+    internal static byte[] EncodeNpcInteraction(uint sequence, NpcInteraction state)
+    {
+        if (!IsValidNpcInteraction(state))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[NpcInteractionPacketSize];
+        WriteHeader(packet, PacketType.NpcInteraction, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), state.Token);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), state.TargetId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 20), state.Revision);
+        packet[HeaderSize + 24] = (byte)state.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 25), state.NpcId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 29), state.MissionId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 33), state.TaskId);
+        packet[HeaderSize + 37] = (byte)state.Result;
+        return packet;
+    }
+
+    internal static bool TryDecodeNpcInteraction(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out NpcInteraction state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != NpcInteractionPacketSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.NpcInteraction)
+            return false;
+        state = new NpcInteraction(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            (NpcInteractionAction)packet[HeaderSize + 24],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 25)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 29)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 33)),
+            (NpcInteractionResult)packet[HeaderSize + 37]);
+        if (IsValidNpcInteraction(state))
+            return true;
+        state = default;
+        return false;
+    }
+
+    private static bool IsValidNpcInteraction(NpcInteraction state) =>
+        state.Token != 0 && state.SceneId != 0 && state.SceneEpoch != 0 &&
+        state.TargetId != 0 && state.NpcId > 0 &&
+        state.MissionId >= 0 && state.TaskId >= 0 &&
+        state.Action switch
+        {
+            NpcInteractionAction.Request =>
+                state.Revision == 0 && state.Result == NpcInteractionResult.Pending,
+            NpcInteractionAction.Granted =>
+                state.Revision != 0 &&
+                state.Result is >= NpcInteractionResult.Accepted and <= NpcInteractionResult.TooFar,
+            NpcInteractionAction.Released =>
+                state.Result == NpcInteractionResult.Accepted,
+            _ => false
+        };
 
     internal static byte[] EncodeFishSnapshotBatch(
         uint sequence,
         uint sceneId,
+        uint sceneEpoch,
         uint tick,
         IReadOnlyList<FishSnapshot> snapshots,
         int offset,
         int count)
     {
-        if (sceneId == 0 || tick == 0 || snapshots == null || offset < 0 || count < 1 ||
+        if (sceneId == 0 || sceneEpoch == 0 || tick == 0 || snapshots == null || offset < 0 || count < 1 ||
             count > MaxFishSnapshotsPerPacket || offset > snapshots.Count - count)
             throw new ArgumentOutOfRangeException(nameof(count));
 
         var packet = new byte[FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize];
         WriteHeader(packet, PacketType.FishSnapshotBatch, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), tick);
-        packet[HeaderSize + 8] = (byte)count;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), sceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), tick);
+        packet[HeaderSize + 12] = (byte)count;
         for (var index = 0; index < count; index++)
         {
             var snapshot = snapshots[offset + index];
-            if (snapshot.SceneId != sceneId || snapshot.Tick != tick || !IsValidFishSnapshot(snapshot))
+            if (snapshot.SceneId != sceneId || snapshot.SceneEpoch != sceneEpoch ||
+                snapshot.Tick != tick || !IsValidFishSnapshot(snapshot))
                 throw new ArgumentOutOfRangeException(nameof(snapshots));
             var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset), snapshot.Id);
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset + 4), snapshot.FishDataTID);
-            WriteSingle(packet.AsSpan(entryOffset + 8), snapshot.X);
-            WriteSingle(packet.AsSpan(entryOffset + 12), snapshot.Y);
-            WriteSingle(packet.AsSpan(entryOffset + 16), snapshot.Z);
-            WriteSingle(packet.AsSpan(entryOffset + 20), snapshot.Rotation);
-            WriteSingle(packet.AsSpan(entryOffset + 24), snapshot.VelocityX);
-            WriteSingle(packet.AsSpan(entryOffset + 28), snapshot.VelocityY);
-            WriteSingle(packet.AsSpan(entryOffset + 32), snapshot.Hp);
-            packet[entryOffset + 36] = snapshot.Flags;
+            BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(entryOffset + 4), snapshot.Revision);
+            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset + 8), snapshot.FishDataTID);
+            WriteSingle(packet.AsSpan(entryOffset + 12), snapshot.X);
+            WriteSingle(packet.AsSpan(entryOffset + 16), snapshot.Y);
+            WriteSingle(packet.AsSpan(entryOffset + 20), snapshot.Z);
+            WriteSingle(packet.AsSpan(entryOffset + 24), snapshot.Rotation);
+            WriteSingle(packet.AsSpan(entryOffset + 28), snapshot.VelocityX);
+            WriteSingle(packet.AsSpan(entryOffset + 32), snapshot.VelocityY);
+            WriteSingle(packet.AsSpan(entryOffset + 36), snapshot.Hp);
+            packet[entryOffset + 40] = snapshot.Flags;
         }
         return packet;
     }
@@ -662,9 +940,10 @@ internal static class Protocol
             return false;
 
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var tick = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        var count = packet[HeaderSize + 8];
-        if (sceneId == 0 || tick == 0 || count is < 1 || count > MaxFishSnapshotsPerPacket ||
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var tick = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var count = packet[HeaderSize + 12];
+        if (sceneId == 0 || sceneEpoch == 0 || tick == 0 || count is < 1 || count > MaxFishSnapshotsPerPacket ||
             packet.Length != FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize)
             return false;
 
@@ -674,17 +953,19 @@ internal static class Protocol
             var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
             var snapshot = new FishSnapshot(
                 sceneId,
+                sceneEpoch,
                 tick,
                 BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset)),
-                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset + 4)),
-                ReadSingle(packet.Slice(entryOffset + 8)),
+                BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(entryOffset + 4)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset + 8)),
                 ReadSingle(packet.Slice(entryOffset + 12)),
                 ReadSingle(packet.Slice(entryOffset + 16)),
                 ReadSingle(packet.Slice(entryOffset + 20)),
                 ReadSingle(packet.Slice(entryOffset + 24)),
                 ReadSingle(packet.Slice(entryOffset + 28)),
                 ReadSingle(packet.Slice(entryOffset + 32)),
-                packet[entryOffset + 36]);
+                ReadSingle(packet.Slice(entryOffset + 36)),
+                packet[entryOffset + 40]);
             if (!IsValidFishSnapshot(snapshot))
             {
                 snapshots = Array.Empty<FishSnapshot>();
@@ -696,7 +977,8 @@ internal static class Protocol
     }
 
     private static bool IsValidFishSnapshot(FishSnapshot snapshot) =>
-        snapshot.Id > 0 && snapshot.FishDataTID > 0 &&
+        snapshot.SceneId != 0 && snapshot.SceneEpoch != 0 && snapshot.Tick != 0 &&
+        snapshot.Id > 0 && snapshot.Revision != 0 && snapshot.FishDataTID > 0 &&
         float.IsFinite(snapshot.X) && float.IsFinite(snapshot.Y) && float.IsFinite(snapshot.Z) &&
         float.IsFinite(snapshot.Rotation) && float.IsFinite(snapshot.VelocityX) &&
         float.IsFinite(snapshot.VelocityY) && float.IsFinite(snapshot.Hp) &&
@@ -707,16 +989,19 @@ internal static class Protocol
 
     internal static byte[] EncodeFishDamageRequest(uint sequence, FishDamageRequest request)
     {
-        if (request.Damage is < 1 or > 10_000 || request.Element is < 0 or > 32 ||
+        if (request.SceneId == 0 || request.SceneEpoch == 0 || request.Id <= 0 ||
+            request.Damage is < 1 or > 10_000 || request.Element is < 0 or > 32 ||
             request.AttackType is < 0 or > 64)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[FishDamageRequestSize];
         WriteHeader(packet, PacketType.FishDamageRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Id);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Damage);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Element);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.AttackType);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.KnownRevision);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 24), request.AttackType);
         return packet;
     }
 
@@ -730,14 +1015,18 @@ internal static class Protocol
         if (packet.Length != FishDamageRequestSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishDamageRequest)
             return false;
-        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
-        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
-        if (damage is < 1 or > 10_000 || element is < 0 or > 32 || attackType is < 0 or > 64)
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
+        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20));
+        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 24));
+        if (sceneId == 0 || sceneEpoch == 0 || id <= 0 || damage is < 1 or > 10_000 ||
+            element is < 0 or > 32 || attackType is < 0 or > 64)
             return false;
         request = new FishDamageRequest(
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            sceneId, sceneEpoch, id,
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
             damage, element, attackType);
         return true;
     }
@@ -843,7 +1132,7 @@ internal static class Protocol
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
-        if (state.Domain == 0 || state.Domain > 16 || state.Action == 0 || state.Action > 32)
+        if (state.Domain == 0 || state.Domain > 16 || state.Action == 0 || state.Action > 39)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[ManagerEventSize];
         WriteHeader(packet, PacketType.ManagerEvent, sequence);
@@ -883,7 +1172,7 @@ internal static class Protocol
         var pairIsValid = state.Domain switch
         {
             1 or 2 => state.Action is 1 or 2 or 3,
-            3 => state.Action is 4 or 5 or 6 or 7,
+            3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39,
             4 or 5 or 6 or 7 or 9 => state.Action == 8,
             8 => state.Action is 9 or 10 or 11,
             10 => state.Action == 12,
@@ -892,9 +1181,18 @@ internal static class Protocol
             13 => state.Action is 24 or 25 or 31,
             14 => state.Action == 26,
             15 => state.Action == 27,
+            16 => state.Action is 32 or 33 or 34,
             _ => false
         };
         if (!pairIsValid)
+            return false;
+        if (state.Domain is 3 or 16 && state.SceneId != 0)
+            return false;
+        if (state.Action is 32 or 35 or 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
+            state.Action == 33 && (state.Value == 0 || state.Context == 0) ||
+            state.Action == 36 && (state.Value == 0 || state.Context < 0) ||
+            (state.Action is 34 or 37) &&
+                (state.Value == 0 || state.Context is not 0 and not 1))
             return false;
         if (state.Domain is 4 or 5 or 10 && state.Value is not 0 and not 1)
             return false;
@@ -967,14 +1265,194 @@ internal static class Protocol
         state.StaffTips >= 0 && state.TotalVisits >= 0 && state.LikeCount >= 0 &&
         float.IsFinite(state.Rating) && state.Rating is >= 0f and <= 5f;
 
+    internal static byte[] EncodeFishLifecycle(uint sequence, FishLifecycle state)
+    {
+        if (!IsValidFishLifecycle(state))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[FishLifecycleSize];
+        WriteHeader(packet, PacketType.FishLifecycle, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.Revision);
+        packet[HeaderSize + 16] = (byte)state.Kind;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 17), state.FishDataTID);
+        packet[HeaderSize + 21] = (byte)state.Phase;
+        WriteSingle(packet.AsSpan(HeaderSize + 22), state.Hp);
+        return packet;
+    }
+
+    internal static bool TryDecodeFishLifecycle(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishLifecycle state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != FishLifecycleSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishLifecycle)
+            return false;
+        state = new FishLifecycle(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            (FishLifecycleKind)packet[HeaderSize + 16],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 17)),
+            (FishPhase)packet[HeaderSize + 21],
+            ReadSingle(packet.Slice(HeaderSize + 22)));
+        if (IsValidFishLifecycle(state))
+            return true;
+        state = default;
+        return false;
+    }
+
+    internal static byte[] EncodeFishActionRequest(uint sequence, FishActionRequest request)
+    {
+        if (!IsValidFishActionRequest(request))
+            throw new ArgumentOutOfRangeException(nameof(request));
+        var packet = new byte[FishActionRequestSize];
+        WriteHeader(packet, PacketType.FishActionRequest, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), request.RequestId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.KnownRevision);
+        packet[HeaderSize + 24] = (byte)request.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 25), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 29), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 33), request.AttackType);
+        return packet;
+    }
+
+    internal static bool TryDecodeFishActionRequest(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishActionRequest request)
+    {
+        sequence = 0;
+        request = default;
+        if (packet.Length != FishActionRequestSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishActionRequest)
+            return false;
+        request = new FishActionRequest(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            (FishAction)packet[HeaderSize + 24],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 25)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 29)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 33)));
+        if (IsValidFishActionRequest(request))
+            return true;
+        request = default;
+        return false;
+    }
+
+    internal static byte[] EncodeFishActionAck(uint sequence, FishActionAck ack)
+    {
+        if (!IsValidFishActionAck(ack))
+            throw new ArgumentOutOfRangeException(nameof(ack));
+        var packet = new byte[FishActionAckSize];
+        WriteHeader(packet, PacketType.FishActionAck, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), ack.RequestId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), ack.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), ack.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), ack.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 20), ack.Revision);
+        packet[HeaderSize + 24] = (byte)ack.Action;
+        packet[HeaderSize + 25] = (byte)ack.Result;
+        packet[HeaderSize + 26] = (byte)ack.RejectReason;
+        WriteSingle(packet.AsSpan(HeaderSize + 27), ack.Hp);
+        packet[HeaderSize + 31] = (byte)ack.Phase;
+        return packet;
+    }
+
+    internal static bool TryDecodeFishActionAck(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishActionAck ack)
+    {
+        sequence = 0;
+        ack = default;
+        if (packet.Length != FishActionAckSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishActionAck)
+            return false;
+        ack = new FishActionAck(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            (FishAction)packet[HeaderSize + 24],
+            (FishActionResult)packet[HeaderSize + 25],
+            (FishActionRejectReason)packet[HeaderSize + 26],
+            ReadSingle(packet.Slice(HeaderSize + 27)),
+            (FishPhase)packet[HeaderSize + 31]);
+        if (IsValidFishActionAck(ack))
+            return true;
+        ack = default;
+        return false;
+    }
+
+    private static bool IsValidFishLifecycle(FishLifecycle state)
+    {
+        if (state.SceneId == 0 || state.SceneEpoch == 0 || state.Id <= 0 || state.Revision == 0 ||
+            !float.IsFinite(state.Hp) || state.Hp is < 0f or > 1_000_000_000f)
+            return false;
+        return state.Kind switch
+        {
+            FishLifecycleKind.Spawn => state.FishDataTID > 0 && state.Phase != FishPhase.None &&
+                Enum.IsDefined(typeof(FishPhase), state.Phase),
+            FishLifecycleKind.Despawn => state.FishDataTID == 0 && state.Phase == FishPhase.None &&
+                state.Hp == 0f,
+            FishLifecycleKind.Phase => state.FishDataTID == 0 && state.Phase != FishPhase.None &&
+                Enum.IsDefined(typeof(FishPhase), state.Phase),
+            _ => false
+        };
+    }
+
+    private static bool IsValidFishActionRequest(FishActionRequest request)
+    {
+        if (request.RequestId == 0 || request.SceneId == 0 || request.SceneEpoch == 0 || request.Id <= 0)
+            return false;
+        return request.Action switch
+        {
+            FishAction.Damage => request.Damage is >= 1 and <= 10_000 &&
+                request.Element is >= 0 and <= 32 && request.AttackType is >= 0 and <= 64,
+            FishAction.Qte => request.Damage is >= 1 and <= 10_000 &&
+                request.Element is >= 0 and <= 32 && request.AttackType == 0,
+            FishAction.Hook or FishAction.Release or FishAction.Capture or FishAction.CorpsePickup =>
+                request.Damage == 0 && request.Element == 0 && request.AttackType == 0,
+            _ => false
+        };
+    }
+
+    private static bool IsValidFishActionAck(FishActionAck ack)
+    {
+        if (ack.RequestId == 0 || ack.SceneId == 0 || ack.SceneEpoch == 0 || ack.Id <= 0 ||
+            !Enum.IsDefined(typeof(FishAction), ack.Action) ||
+            !Enum.IsDefined(typeof(FishPhase), ack.Phase) ||
+            !float.IsFinite(ack.Hp) || ack.Hp is < 0f or > 1_000_000_000f)
+            return false;
+        return ack.Result switch
+        {
+            FishActionResult.Accepted => ack.Revision != 0 && ack.RejectReason == FishActionRejectReason.None &&
+                ack.Phase != FishPhase.None,
+            FishActionResult.Rejected when ack.RejectReason == FishActionRejectReason.MissingFish =>
+                ack.Revision == 0 && ack.Hp == 0f && ack.Phase == FishPhase.None,
+            FishActionResult.Rejected => ack.Revision != 0 &&
+                ack.RejectReason is >= FishActionRejectReason.SceneMismatch and <= FishActionRejectReason.InternalError,
+            _ => false
+        };
+    }
+
     internal static byte[] EncodeFishPickupRequest(uint sequence, FishPickupRequest request)
     {
-        if (request.SceneId == 0 || request.Id <= 0)
+        if (request.SceneId == 0 || request.SceneEpoch == 0 || request.Id <= 0)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[FishPickupRequestSize];
         WriteHeader(packet, PacketType.FishPickupRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.KnownRevision);
         return packet;
     }
 
@@ -989,22 +1467,27 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishPickupRequest)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        if (sceneId == 0 || id <= 0)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        if (sceneId == 0 || sceneEpoch == 0 || id <= 0)
             return false;
-        request = new FishPickupRequest(sceneId, id);
+        request = new FishPickupRequest(
+            sceneId, sceneEpoch, id,
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)));
         return true;
     }
 
     internal static byte[] EncodeFishPickupResult(uint sequence, FishPickupResult result)
     {
-        if (result.SceneId == 0 || result.Id <= 0)
+        if (result.SceneId == 0 || result.SceneEpoch == 0 || result.Id <= 0 || result.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(result));
         var packet = new byte[FishPickupResultSize];
         WriteHeader(packet, PacketType.FishPickupResult, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), result.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), result.Id);
-        packet[HeaderSize + 8] = result.Accepted ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), result.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), result.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), result.Revision);
+        packet[HeaderSize + 16] = result.Accepted ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -1019,20 +1502,26 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishPickupResult)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        var accepted = packet[HeaderSize + 8];
-        if (sceneId == 0 || id <= 0 || accepted > 1)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var id = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12));
+        var accepted = packet[HeaderSize + 16];
+        if (sceneId == 0 || sceneEpoch == 0 || id <= 0 || revision == 0 || accepted > 1)
             return false;
-        result = new FishPickupResult(sceneId, id, accepted != 0);
+        result = new FishPickupResult(sceneId, sceneEpoch, id, revision, accepted != 0);
         return true;
     }
 
     internal static byte[] EncodeFishRemoved(uint sequence, FishRemoved removed)
     {
+        if (removed.SceneId == 0 || removed.SceneEpoch == 0 || removed.Id <= 0 || removed.Revision == 0)
+            throw new ArgumentOutOfRangeException(nameof(removed));
         var packet = new byte[FishRemovedSize];
         WriteHeader(packet, PacketType.FishRemoved, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), removed.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), removed.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), removed.Revision);
         return packet;
     }
 
@@ -1048,8 +1537,11 @@ internal static class Protocol
             return false;
         removed = new FishRemoved(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)));
-        return true;
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)));
+        return removed.SceneId != 0 && removed.SceneEpoch != 0 &&
+            removed.Id > 0 && removed.Revision != 0;
     }
 
     internal static byte[] EncodeFishManifest(uint sequence, FishManifest manifest)
@@ -1061,16 +1553,18 @@ internal static class Protocol
         var packet = new byte[FishManifestFixedSize + uid.Length];
         WriteHeader(packet, PacketType.FishManifest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), manifest.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), manifest.Revision);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), manifest.Id);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), manifest.FishDataTID);
-        WriteSingle(packet.AsSpan(HeaderSize + 16), manifest.X);
-        WriteSingle(packet.AsSpan(HeaderSize + 20), manifest.Y);
-        WriteSingle(packet.AsSpan(HeaderSize + 24), manifest.Z);
-        WriteSingle(packet.AsSpan(HeaderSize + 28), manifest.Rotation);
-        WriteSingle(packet.AsSpan(HeaderSize + 32), manifest.Hp);
-        packet[HeaderSize + 36] = manifest.Flags;
-        packet[HeaderSize + 37] = (byte)uid.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), manifest.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), manifest.Revision);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), manifest.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), manifest.FishRevision);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), manifest.FishDataTID);
+        WriteSingle(packet.AsSpan(HeaderSize + 24), manifest.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), manifest.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), manifest.Z);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), manifest.Rotation);
+        WriteSingle(packet.AsSpan(HeaderSize + 40), manifest.Hp);
+        packet[HeaderSize + 44] = manifest.Flags;
+        packet[HeaderSize + 45] = (byte)uid.Length;
         uid.CopyTo(packet, FishManifestFixedSize);
         return packet;
     }
@@ -1086,7 +1580,7 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishManifest)
             return false;
 
-        var uidLength = packet[HeaderSize + 37];
+        var uidLength = packet[HeaderSize + 45];
         if (uidLength == 0 || uidLength > MaxFishAllocatorUidBytes ||
             packet.Length != FishManifestFixedSize + uidLength)
             return false;
@@ -1096,15 +1590,17 @@ internal static class Protocol
             var candidate = new FishManifest(
                 BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
                 BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
-                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
-                StrictUtf8.GetString(packet.Slice(FishManifestFixedSize, uidLength)),
+                BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
                 BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
-                ReadSingle(packet.Slice(HeaderSize + 16)),
-                ReadSingle(packet.Slice(HeaderSize + 20)),
+                BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+                StrictUtf8.GetString(packet.Slice(FishManifestFixedSize, uidLength)),
+                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
                 ReadSingle(packet.Slice(HeaderSize + 24)),
                 ReadSingle(packet.Slice(HeaderSize + 28)),
                 ReadSingle(packet.Slice(HeaderSize + 32)),
-                packet[HeaderSize + 36]);
+                ReadSingle(packet.Slice(HeaderSize + 36)),
+                ReadSingle(packet.Slice(HeaderSize + 40)),
+                packet[HeaderSize + 44]);
             if (!IsValidFishManifest(candidate, uidLength))
                 return false;
             manifest = candidate;
@@ -1118,13 +1614,14 @@ internal static class Protocol
 
     internal static byte[] EncodeFishManifestState(uint sequence, FishManifestState state)
     {
-        if (state.SceneId == 0 || state.Revision == 0)
+        if (state.SceneId == 0 || state.SceneEpoch == 0 || state.Revision == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[FishManifestStateSize];
         WriteHeader(packet, PacketType.FishManifestState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Revision);
-        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 8), state.EntryCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Revision);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 12), state.EntryCount);
         return packet;
     }
 
@@ -1139,12 +1636,13 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.FishManifestState)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        if (sceneId == 0 || revision == 0)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        if (sceneId == 0 || sceneEpoch == 0 || revision == 0)
             return false;
         state = new FishManifestState(
-            sceneId, revision,
-            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 8)));
+            sceneId, sceneEpoch, revision,
+            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 12)));
         return true;
     }
 
@@ -1203,14 +1701,17 @@ internal static class Protocol
     {
         var sceneName = command.SceneName ?? string.Empty;
         var encodedName = StrictUtf8.GetBytes(sceneName);
-        if (encodedName.Length is < 1 or > 128 || (command.Options & 0x7e00) != 0)
+        if (encodedName.Length is < 1 or > 128 || (command.Options & 0x7e00) != 0 ||
+            command.SceneId != SceneId(sceneName) || command.Seed == 0)
             throw new ArgumentOutOfRangeException(nameof(command));
-        var packet = new byte[HeaderSize + 7 + encodedName.Length];
+        var packet = new byte[HeaderSize + 15 + encodedName.Length];
         WriteHeader(packet, PacketType.SceneTransition, sequence);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), command.TransitionType);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 4), command.Options);
-        packet[HeaderSize + 6] = (byte)encodedName.Length;
-        encodedName.CopyTo(packet, HeaderSize + 7);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 6), command.SceneId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), command.Seed);
+        packet[HeaderSize + 14] = (byte)encodedName.Length;
+        encodedName.CopyTo(packet, HeaderSize + 15);
         return packet;
     }
 
@@ -1222,21 +1723,25 @@ internal static class Protocol
         sequence = 0;
         command = default;
         if (!TryDecode(packet, out var type, out sequence) || type != PacketType.SceneTransition ||
-            packet.Length < HeaderSize + 8 || packet[HeaderSize + 6] is < 1 or > 128 ||
-            packet.Length != HeaderSize + 7 + packet[HeaderSize + 6])
+            packet.Length < HeaderSize + 16 || packet[HeaderSize + 14] is < 1 or > 128 ||
+            packet.Length != HeaderSize + 15 + packet[HeaderSize + 14])
             return false;
         var options = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 4));
         if ((options & 0x7e00) != 0)
             return false;
         try
         {
-            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 7));
-            if (string.IsNullOrWhiteSpace(sceneName))
+            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 15));
+            var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 6));
+            var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10));
+            if (string.IsNullOrWhiteSpace(sceneName) || sceneId != SceneId(sceneName) || seed == 0)
                 return false;
             command = new SceneTransitionCommand(
                 sceneName,
                 BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize)),
-                options);
+                options,
+                sceneId,
+                seed);
             return true;
         }
         catch (DecoderFallbackException)
@@ -1315,13 +1820,15 @@ internal static class Protocol
 
     internal static byte[] EncodeDiveState(uint sequence, DiveState state)
     {
-        if (state.Revision == 0)
+        if (state.Revision == 0 || state.SceneId == 0 || state.Seed == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[DiveStatePacketSize];
         WriteHeader(packet, PacketType.DiveState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
         packet[HeaderSize + 4] = state.HostReady ? (byte)1 : (byte)0;
         packet[HeaderSize + 5] = state.ClientReady ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 6), state.SceneId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), state.Seed);
         return packet;
     }
 
@@ -1334,9 +1841,13 @@ internal static class Protocol
             packet[HeaderSize + 4] > 1 || packet[HeaderSize + 5] > 1)
             return false;
         var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        if (revision == 0)
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 6));
+        var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10));
+        if (revision == 0 || sceneId == 0 || seed == 0)
             return false;
-        state = new DiveState(revision, packet[HeaderSize + 4] == 1, packet[HeaderSize + 5] == 1);
+        state = new DiveState(
+            revision, packet[HeaderSize + 4] == 1, packet[HeaderSize + 5] == 1,
+            sceneId, seed);
         return true;
     }
 
@@ -1525,11 +2036,14 @@ internal static class Protocol
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[DiveLootRequestPacketSize];
         WriteHeader(packet, PacketType.DiveLootRequest, sequence);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), request.ItemId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.Count);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.BonusGrade);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.LiftType);
-        packet[HeaderSize + 16] = request.UpdateMission ? (byte)1 : (byte)0;
+        if (request.SourceId == 0)
+            throw new ArgumentOutOfRangeException(nameof(request));
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), request.SourceId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.ItemId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Count);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.BonusGrade);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.LiftType);
+        packet[HeaderSize + 24] = request.UpdateMission ? (byte)1 : (byte)0;
         return packet;
     }
 
@@ -1542,15 +2056,17 @@ internal static class Protocol
         request = default;
         if (packet.Length != DiveLootRequestPacketSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.DiveLootRequest ||
-            packet[HeaderSize + 16] > 1)
+            packet[HeaderSize + 24] > 1)
             return false;
         request = new DiveLootRequest(
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
-            packet[HeaderSize + 16] == 1);
-        return IsValidLoot(request.ItemId, request.Count, request.BonusGrade, request.LiftType);
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            packet[HeaderSize + 24] == 1);
+        return request.SourceId != 0 &&
+            IsValidLoot(request.ItemId, request.Count, request.BonusGrade, request.LiftType);
     }
 
     internal static byte[] EncodeDiveResultEntry(uint sequence, DiveResultEntry entry)
@@ -1960,7 +2476,8 @@ internal static class Protocol
     }
 
     private static bool IsValidFishManifest(FishManifest manifest, int uidByteLength) =>
-        manifest.SceneId != 0 && manifest.Revision > 0 && manifest.Id > 0 && manifest.FishDataTID > 0 &&
+        manifest.SceneId != 0 && manifest.SceneEpoch != 0 && manifest.Revision > 0 &&
+        manifest.Id > 0 && manifest.FishRevision > 0 && manifest.FishDataTID > 0 &&
         uidByteLength is > 0 and <= MaxFishAllocatorUidBytes &&
         !string.IsNullOrWhiteSpace(manifest.AllocatorUid) &&
         manifest.AllocatorUid.IndexOf('\0') < 0 &&
@@ -2108,6 +2625,10 @@ internal static class Protocol
         packet[0] ^= 0xff;
         if (TryDecode(packet, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid magic");
+        packet = Encode(PacketType.Hello, 42);
+        packet[4] = 33;
+        if (TryDecode(packet, out _, out _))
+            throw new InvalidOperationException("Protocol accepted version 33 packet");
 
         var identityPacket = EncodeIdentity(PacketType.Hello, 43, 0x12345678, "Дайвер");
         if (!TryDecodeIdentity(identityPacket, PacketType.Hello, out sequence, out var buildId, out var playerName) ||
@@ -2117,34 +2638,122 @@ internal static class Protocol
         if (TryDecodeIdentity(identityPacket, PacketType.Hello, out _, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid UTF-8 identity");
 
-        var scenePacket = EncodeSceneState(44, SceneId("A02_01_01"));
-        if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId) ||
-            sequence != 44 || sceneId != SceneId("A02_01_01"))
+        var scenePacket = EncodeSceneState(44, SceneId("A02_01_01"), 3);
+        if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId, out var sceneEpoch) ||
+            sequence != 44 || sceneId != SceneId("A02_01_01") || sceneEpoch != 3)
             throw new InvalidOperationException("Scene state round-trip failed");
+        var sceneSeed = new SceneSeed(SceneId("A02_01_01"), 1234567);
+        var sceneSeedPacket = EncodeSceneSeed(45, sceneSeed);
+        if (!TryDecodeSceneSeed(sceneSeedPacket, out sequence, out var actualSceneSeed) ||
+            sequence != 45 || actualSceneSeed != sceneSeed)
+            throw new InvalidOperationException("Scene seed round-trip failed");
+        BinaryPrimitives.WriteInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeSceneSeed(sceneSeedPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted a zero scene seed");
+        var cargoState = new CargoState(SceneId("A02_01_01"), 9f, 13f, 0f);
+        var cargoPacket = EncodeCargoState(46, cargoState);
+        if (!TryDecodeCargoState(cargoPacket, out sequence, out var actualCargoState) ||
+            sequence != 46 || actualCargoState != cargoState)
+            throw new InvalidOperationException("Cargo state round-trip failed");
+        WriteSingle(cargoPacket.AsSpan(HeaderSize + 8), 0f);
+        if (TryDecodeCargoState(cargoPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid cargo state");
+
+        var expectedInteraction = new NpcInteraction(
+            0x123456789abcdef0, SceneId("DR_Lobby"), 4, 0x10203040, 7,
+            NpcInteractionAction.Granted, 101, 0, 0, NpcInteractionResult.Accepted);
+        var interactionPacket = EncodeNpcInteraction(47, expectedInteraction);
+        if (!TryDecodeNpcInteraction(
+                interactionPacket, out sequence, out var actualInteraction) ||
+            sequence != 47 || actualInteraction != expectedInteraction)
+            throw new InvalidOperationException("NPC interaction round-trip failed");
+        interactionPacket[HeaderSize + 24] = byte.MaxValue;
+        if (TryDecodeNpcInteraction(interactionPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid NPC interaction action");
+        var releasePacket = EncodeNpcInteraction(48, expectedInteraction with
+        {
+            Revision = 0,
+            Action = NpcInteractionAction.Released
+        });
+        if (!TryDecodeNpcInteraction(releasePacket, out sequence, out var release) ||
+            sequence != 48 || release.Action != NpcInteractionAction.Released)
+            throw new InvalidOperationException("NPC interaction cancellation round-trip failed");
 
         var fishSceneId = SceneId("A02_01_01");
         var expectedFish = new[]
         {
-            new FishSnapshot(fishSceneId, 9, 17, 2501, 1.25f, -2.5f, -0.1f, 183f, 2f, -1f, 42.5f, 5),
-            new FishSnapshot(fishSceneId, 9, 18, 2502, 3f, 4f, 0f, 10f, 0f, 0f, 8f, 0)
+            new FishSnapshot(fishSceneId, 7, 9, 17, 3, 2501, 1.25f, -2.5f, -0.1f, 183f, 2f, -1f, 42.5f, 5),
+            new FishSnapshot(fishSceneId, 7, 9, 18, 4, 2502, 3f, 4f, 0f, 10f, 0f, 0f, 8f, 0)
         };
-        var fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 9, expectedFish, 0, expectedFish.Length);
+        var fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 7, 9, expectedFish, 0, expectedFish.Length);
         if (!TryDecodeFishSnapshotBatch(fishPacket, out sequence, out var actualFish) ||
-            sequence != 45 || actualFish.Length != 2 ||
+            sequence != 45 || fishPacket.Length != 113 || actualFish.Length != 2 ||
             actualFish[0] != expectedFish[0] || actualFish[1] != expectedFish[1])
             throw new InvalidOperationException("Fish snapshot batch round-trip failed");
         fishPacket[^1] = 8;
         if (TryDecodeFishSnapshotBatch(fishPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish flags");
+        fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 7, 9, expectedFish, 0, expectedFish.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(fishPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeFishSnapshotBatch(fishPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish snapshot without scene epoch");
 
-        var expectedDamage = new FishDamageRequest(SceneId("A02_01_01"), 17, 23, 2, 4);
+        var expectedDamage = new FishDamageRequest(SceneId("A02_01_01"), 7, 17, 3, 23, 2, 4);
         var damagePacket = EncodeFishDamageRequest(46, expectedDamage);
         if (!TryDecodeFishDamageRequest(damagePacket, out sequence, out var actualDamage) ||
             sequence != 46 || actualDamage != expectedDamage)
             throw new InvalidOperationException("Fish damage request round-trip failed");
-        BinaryPrimitives.WriteInt32LittleEndian(damagePacket.AsSpan(HeaderSize + 8), -1);
+        BinaryPrimitives.WriteInt32LittleEndian(damagePacket.AsSpan(HeaderSize + 16), -1);
         if (TryDecodeFishDamageRequest(damagePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish damage");
+        damagePacket = EncodeFishDamageRequest(46, expectedDamage);
+        BinaryPrimitives.WriteUInt32LittleEndian(damagePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeFishDamageRequest(damagePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish damage without scene epoch");
+
+        var lifecycle = new FishLifecycle(
+            fishSceneId, 7, 17, 4, FishLifecycleKind.Spawn, 2501, FishPhase.Alive, 42.5f);
+        var lifecyclePacket = EncodeFishLifecycle(47, lifecycle);
+        if (!TryDecodeFishLifecycle(lifecyclePacket, out sequence, out var actualLifecycle) ||
+            sequence != 47 || lifecyclePacket.Length != 44 || actualLifecycle != lifecycle)
+            throw new InvalidOperationException("Fish lifecycle round-trip failed");
+        lifecyclePacket[HeaderSize + 16] = byte.MaxValue;
+        if (TryDecodeFishLifecycle(lifecyclePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish lifecycle kind");
+        lifecyclePacket = EncodeFishLifecycle(47, lifecycle);
+        WriteSingle(lifecyclePacket.AsSpan(HeaderSize + 22), float.NaN);
+        if (TryDecodeFishLifecycle(lifecyclePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid lifecycle HP");
+
+        var actionRequest = new FishActionRequest(
+            0x0102030405060708, fishSceneId, 7, 17, 4,
+            FishAction.Damage, 23, 2, 4);
+        var actionRequestPacket = EncodeFishActionRequest(48, actionRequest);
+        if (!TryDecodeFishActionRequest(actionRequestPacket, out sequence, out var actualActionRequest) ||
+            sequence != 48 || actionRequestPacket.Length != 55 || actualActionRequest != actionRequest)
+            throw new InvalidOperationException("Fish action request round-trip failed");
+        actionRequestPacket[HeaderSize + 24] = (byte)FishAction.Release;
+        if (TryDecodeFishActionRequest(actionRequestPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted payload for payload-free fish action");
+        actionRequestPacket = EncodeFishActionRequest(48, actionRequest);
+        BinaryPrimitives.WriteUInt64LittleEndian(actionRequestPacket.AsSpan(HeaderSize), 0);
+        if (TryDecodeFishActionRequest(actionRequestPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted zero fish action request ID");
+
+        var actionAck = new FishActionAck(
+            actionRequest.RequestId, fishSceneId, 7, 17, 5, FishAction.Damage,
+            FishActionResult.Accepted, FishActionRejectReason.None, 19.5f, FishPhase.Alive);
+        var actionAckPacket = EncodeFishActionAck(49, actionAck);
+        if (!TryDecodeFishActionAck(actionAckPacket, out sequence, out var actualActionAck) ||
+            sequence != 49 || actionAckPacket.Length != 50 || actualActionAck != actionAck)
+            throw new InvalidOperationException("Fish action acknowledgement round-trip failed");
+        actionAckPacket[HeaderSize + 26] = (byte)FishActionRejectReason.StaleRevision;
+        if (TryDecodeFishActionAck(actionAckPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted reject reason for accepted fish action");
+        actionAckPacket = EncodeFishActionAck(49, actionAck);
+        WriteSingle(actionAckPacket.AsSpan(HeaderSize + 27), float.NaN);
+        if (TryDecodeFishActionAck(actionAckPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid authoritative fish HP");
 
         var expectedBossDamage = new BossDamageRequest(fishSceneId, 0x11223344, 37, 2, 4);
         var bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
@@ -2172,7 +2781,7 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted invalid boss animation time");
 
         var expectedManagerEvent = new ManagerEvent(
-            3, fishSceneId, 1234, 3, 4, 1, 0x12345678);
+            3, 0, 1234, 3, 4, 1, 0x12345678);
         var managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
         if (!TryDecodeManagerEvent(managerEventPacket, out sequence, out var managerEvent) ||
             sequence != 47 || managerEvent != expectedManagerEvent)
@@ -2189,6 +2798,32 @@ internal static class Protocol
                 unchecked((int)0x7fc00000)));
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid race time");
+        var sessionEvents = new[]
+        {
+            new ManagerEvent(4, 0, 1235, 16, 32, 12345, 0),
+            new ManagerEvent(5, 0, 1236, 16, 33, 12345, 67),
+            new ManagerEvent(6, 0, 1237, 16, 34, 12345, 1),
+            new ManagerEvent(7, 0, 1238, 3, 35, 23456, 0),
+            new ManagerEvent(8, 0, 1239, 3, 36, 23456, 3),
+            new ManagerEvent(9, 0, 1240, 3, 37, 23456, 1),
+            new ManagerEvent(10, 0, 1241, 3, 38, 71, 0),
+            new ManagerEvent(11, 0, 1242, 3, 39, 71, 0)
+        };
+        for (var index = 0; index < sessionEvents.Length; index++)
+        {
+            managerEventPacket = EncodeManagerEvent((uint)(48 + index), sessionEvents[index]);
+            if (!TryDecodeManagerEvent(managerEventPacket, out sequence, out managerEvent) ||
+                sequence != 48 + index || managerEvent != sessionEvents[index])
+                throw new InvalidOperationException("Manager session event round-trip failed");
+        }
+        managerEventPacket[HeaderSize + 4] = 1;
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted scene-bound dialogue state");
+        managerEventPacket = EncodeManagerEvent(60,
+            new ManagerEvent(10, 0, 1241, 3, 37, 23456, 1));
+        BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 14), 0);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted identity-free dialogue finish");
 
         var expectedSushiResult = new SushiResultState(5, 1200, 300, 80, 21, 19, 4.5f);
         var sushiResultPacket = EncodeSushiResultState(48, expectedSushiResult);
@@ -2199,44 +2834,53 @@ internal static class Protocol
         if (TryDecodeSushiResultState(sushiResultPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid sushi rating");
 
-        var expectedFishPickup = new FishPickupRequest(SceneId("A02_01_01"), 17);
+        var expectedFishPickup = new FishPickupRequest(SceneId("A02_01_01"), 7, 17, 4);
         var fishPickupPacket = EncodeFishPickupRequest(47, expectedFishPickup);
         if (!TryDecodeFishPickupRequest(fishPickupPacket, out sequence, out var actualFishPickup) ||
             sequence != 47 || actualFishPickup != expectedFishPickup)
             throw new InvalidOperationException("Fish pickup request round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(fishPickupPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeFishPickupRequest(fishPickupPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish pickup without scene epoch");
 
-        var expectedFishPickupResult = new FishPickupResult(SceneId("A02_01_01"), 17, true);
+        var expectedFishPickupResult = new FishPickupResult(SceneId("A02_01_01"), 7, 17, 5, true);
         var fishPickupResultPacket = EncodeFishPickupResult(48, expectedFishPickupResult);
         if (!TryDecodeFishPickupResult(
                 fishPickupResultPacket, out sequence, out var actualFishPickupResult) ||
             sequence != 48 || actualFishPickupResult != expectedFishPickupResult)
             throw new InvalidOperationException("Fish pickup result round-trip failed");
-        fishPickupResultPacket[HeaderSize + 8] = 2;
+        fishPickupResultPacket[HeaderSize + 16] = 2;
         if (TryDecodeFishPickupResult(fishPickupResultPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish pickup result");
 
-        var expectedFishRemoved = new FishRemoved(SceneId("A02_01_01"), 17);
+        var expectedFishRemoved = new FishRemoved(SceneId("A02_01_01"), 7, 17, 5);
         var fishRemovedPacket = EncodeFishRemoved(48, expectedFishRemoved);
         if (!TryDecodeFishRemoved(fishRemovedPacket, out sequence, out var actualFishRemoved) ||
             sequence != 48 || actualFishRemoved != expectedFishRemoved)
             throw new InvalidOperationException("Fish removal round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(fishRemovedPacket.AsSpan(HeaderSize + 12), 0);
+        if (TryDecodeFishRemoved(fishRemovedPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish removal without revision");
 
         var expectedFishManifest = new FishManifest(
-            SceneId("A02_01_01"), 3, 17, "A02/FishAllocator/3", 2501,
+            SceneId("A02_01_01"), 7, 3, 17, 4, "A02/FishAllocator/3", 2501,
             1.25f, -2.5f, -0.1f, 183f, 42.5f, 5);
         var fishManifestPacket = EncodeFishManifest(49, expectedFishManifest);
         if (!TryDecodeFishManifest(fishManifestPacket, out sequence, out var actualFishManifest) ||
             sequence != 49 || actualFishManifest != expectedFishManifest)
             throw new InvalidOperationException("Fish manifest round-trip failed");
-        fishManifestPacket[HeaderSize + 37] = 0;
+        fishManifestPacket[HeaderSize + 45] = 0;
         if (TryDecodeFishManifest(fishManifestPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted an empty fish allocator UID");
 
-        var expectedManifestState = new FishManifestState(SceneId("A02_01_01"), 3, 17);
+        var expectedManifestState = new FishManifestState(SceneId("A02_01_01"), 7, 3, 17);
         var manifestStatePacket = EncodeFishManifestState(50, expectedManifestState);
         if (!TryDecodeFishManifestState(manifestStatePacket, out sequence, out var actualManifestState) ||
             sequence != 50 || actualManifestState != expectedManifestState)
             throw new InvalidOperationException("Fish manifest state round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(manifestStatePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeFishManifestState(manifestStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish manifest state without scene epoch");
 
         var expectedPickup = new PickupRemoved(SceneId("A02_01_01"), 0xCAFEBABE, 1001);
         var pickupPacket = EncodePickupRemoved(50, expectedPickup);
@@ -2248,7 +2892,8 @@ internal static class Protocol
             sequence != 50 || actualPickup != expectedPickup)
             throw new InvalidOperationException("Pickup request round-trip failed");
 
-        var expectedTransition = new SceneTransitionCommand("A02_02_01", 3, 0x8155);
+        var expectedTransition = new SceneTransitionCommand(
+            "A02_02_01", 3, 0x8155, SceneId("A02_02_01"), 4567);
         var transitionPacket = EncodeSceneTransition(51, expectedTransition);
         if (!TryDecodeSceneTransition(transitionPacket, out sequence, out var actualTransition) ||
             sequence != 51 || actualTransition != expectedTransition)
@@ -2284,9 +2929,11 @@ internal static class Protocol
         if (TryDecodeDiveReady(diveReadyPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid dive ready state");
 
-        var diveStatePacket = EncodeDiveState(62, new DiveState(5, true, false));
+        var diveStatePacket = EncodeDiveState(
+            62, new DiveState(5, true, false, SceneId("A02_01_01"), 3456));
         if (!TryDecodeDiveState(diveStatePacket, out sequence, out var diveState) ||
-            sequence != 62 || diveState != new DiveState(5, true, false))
+            sequence != 62 || diveState != new DiveState(
+                5, true, false, SceneId("A02_01_01"), 3456))
             throw new InvalidOperationException("Dive state round-trip failed");
         diveStatePacket[HeaderSize + 5] = 2;
         if (TryDecodeDiveState(diveStatePacket, out _, out _))
@@ -2333,11 +2980,12 @@ internal static class Protocol
             throw new InvalidOperationException("Travel state round-trip failed");
 
         var lootRequestPacket = EncodeDiveLootRequest(
-            68, new DiveLootRequest(101, 2, 1, 0, true));
+            68, new DiveLootRequest(0x6000000000000042, 101, 2, 1, 0, true));
         if (!TryDecodeDiveLootRequest(lootRequestPacket, out sequence, out var lootRequest) ||
-            sequence != 68 || lootRequest != new DiveLootRequest(101, 2, 1, 0, true))
+            sequence != 68 ||
+            lootRequest != new DiveLootRequest(0x6000000000000042, 101, 2, 1, 0, true))
             throw new InvalidOperationException("Dive loot request round-trip failed");
-        BinaryPrimitives.WriteInt32LittleEndian(lootRequestPacket.AsSpan(HeaderSize + 4), -1);
+        BinaryPrimitives.WriteInt32LittleEndian(lootRequestPacket.AsSpan(HeaderSize + 12), -1);
         if (TryDecodeDiveLootRequest(lootRequestPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid dive loot count");
 
@@ -2449,12 +3097,15 @@ internal static class Protocol
             throw new InvalidOperationException("Ingredients revision wrap-around failed");
 
         var expected = new PlayerSnapshot(
-            SceneId("A02_01_01"), -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,
+            SceneId("A02_01_01"), 3, -12.5f, 3.25f, -0.05f, 91.5f, 2.25f, -0.75f,
             SceneId("Dave_Swim_0042"), -1.25f, 1.25f, true);
         var snapshotPacket = EncodeSnapshot(43, expected);
         if (!TryDecodeSnapshot(snapshotPacket, out sequence, out var actual) ||
             sequence != 43 || actual != expected)
             throw new InvalidOperationException("Snapshot round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(snapshotPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeSnapshot(snapshotPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted snapshot without scene epoch");
 
         var expectedVisualState = new PlayerVisualState(
             SceneId("A02_01_01"),
@@ -2480,11 +3131,11 @@ internal static class Protocol
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid movement data");
         snapshotPacket = EncodeSnapshot(44, expected);
-        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 32), 0f);
+        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 36), 0f);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid visual scale");
         snapshotPacket = EncodeSnapshot(45, expected);
-        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 4), float.MaxValue);
+        WriteSingle(snapshotPacket.AsSpan(HeaderSize + 8), float.MaxValue);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted unsafe transform data");
     }

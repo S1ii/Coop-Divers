@@ -10,25 +10,38 @@ namespace DaveTheDiverMP;
 internal sealed class PickupReplicator
 {
     private readonly ManualLogSource _log;
-    private readonly RemoteCatchLedger _remoteCatch;
     private readonly SessionTrace _trace;
+    private readonly RemoteCatchLedger _ledger;
     private readonly Dictionary<uint, PickupInstanceItem> _items = new();
     private readonly Dictionary<uint, PickupRemoved> _pending = new();
     private readonly Dictionary<uint, PickupRemoved> _hostPending = new();
-    private readonly HashSet<uint> _approvedClientPickups = new();
+    private readonly HashSet<uint> _applyingRemoteRemovals = new();
     private float _nextScan;
     private int _lastItemCount = -1;
     private int _lastDuplicateCount = -1;
-    private PlayerCharacter _clientPlayer;
 
     internal PickupReplicator(
         ManualLogSource log,
-        RemoteCatchLedger remoteCatch,
-        SessionTrace trace)
+        SessionTrace trace,
+        RemoteCatchLedger ledger)
     {
         _log = log;
-        _remoteCatch = remoteCatch;
         _trace = trace;
+        _ledger = ledger;
+    }
+
+    internal static void SelfTest()
+    {
+        var patchFlags = BindingFlags.NonPublic | BindingFlags.Static;
+        var finalizer = typeof(PickupInteractPatch).GetMethod("Finalizer", patchFlags);
+        if (!MatchesRemotePickup(42, 42, 2f, 2f) ||
+            MatchesRemotePickup(42, 43, 0f, 0f) ||
+            MatchesRemotePickup(42, 42, 5f, 0f) ||
+            finalizer == null || finalizer.ReturnType != typeof(Exception) ||
+            finalizer.GetParameters().Length != 1 ||
+            finalizer.GetParameters()[0].ParameterType != typeof(Exception) ||
+            typeof(PickupInteractPatch).GetMethod("Postfix", patchFlags) != null)
+            throw new InvalidOperationException("Remote pickup matching failed");
     }
 
     internal void Update(
@@ -49,12 +62,8 @@ internal sealed class PickupReplicator
             _items.Clear();
             _pending.Clear();
             _hostPending.Clear();
-            _approvedClientPickups.Clear();
-            _clientPlayer = null;
             return;
         }
-        if (role == SessionRole.Client)
-            _clientPlayer = hostPlayer;
 
         if (now >= _nextScan)
             Refresh(sceneId, now);
@@ -62,11 +71,11 @@ internal sealed class PickupReplicator
         if (role == SessionRole.Host)
         {
             FlushHostPending(session);
-            while (session.TryTakePickupRemoved(out _))
+            while (session.TryTakePickupRemoved(out var removed))
+                ApplyHostRemoval(session, sceneId, now, hostPlayer, removed);
+            while (session.TryTakePickupRequest(out _))
             {
             }
-            while (session.TryTakePickupRequest(out var request))
-                ApplyHostRequest(session, sceneId, now, hostPlayer, request);
             return;
         }
 
@@ -78,30 +87,26 @@ internal sealed class PickupReplicator
         {
             if (removed.SceneId != sceneId)
                 continue;
-            if (!TryApply(removed, _clientPlayer))
+            if (!TryApply(removed))
                 _pending[removed.WorldId] = removed;
         }
     }
 
     internal bool RequestPickup(UdpSession session, uint sceneId, PickupInstanceItem item)
-    {
-        if (item == null)
-            return false;
-        var worldId = WorldId(sceneId, item);
-        if (_approvedClientPickups.Contains(worldId))
-            return true;
-        session.SendPickupRequest(new PickupRemoved(sceneId, worldId, item.GetItemID()));
-        _trace?.Write("ITEM-SEND", $"world={worldId:X8} item={item.GetItemID()}");
-        return false;
-    }
+        => item != null;
 
-    internal void OnHostDestroyed(UdpSession session, uint sceneId, PickupInstanceItem item)
+    internal void OnDestroyed(UdpSession session, uint sceneId, PickupInstanceItem item)
     {
         if (item == null)
             return;
+        var itemId = ItemId(item);
+        if (itemId <= 0)
+            return;
         var worldId = WorldId(sceneId, item);
+        if (_applyingRemoteRemovals.Contains(worldId))
+            return;
         _items.Remove(worldId);
-        var removed = new PickupRemoved(sceneId, worldId, item.GetItemID());
+        var removed = new PickupRemoved(sceneId, worldId, itemId);
         if (!session.SendPickupRemoved(removed))
             _hostPending[worldId] = removed;
     }
@@ -111,11 +116,10 @@ internal sealed class PickupReplicator
         _items.Clear();
         _pending.Clear();
         _hostPending.Clear();
-        _approvedClientPickups.Clear();
+        _applyingRemoteRemovals.Clear();
         _nextScan = 0f;
         _lastItemCount = -1;
         _lastDuplicateCount = -1;
-        _clientPlayer = null;
     }
 
     private void Refresh(uint sceneId, float now)
@@ -126,6 +130,8 @@ internal sealed class PickupReplicator
         foreach (var item in UnityEngine.Object.FindObjectsByType<PickupInstanceItem>(FindObjectsSortMode.None))
         {
             if (item == null)
+                continue;
+            if (ItemId(item) <= 0)
                 continue;
             var worldId = WorldId(sceneId, item);
             if (!_items.TryAdd(worldId, item))
@@ -146,7 +152,7 @@ internal sealed class PickupReplicator
         var applied = new List<uint>();
         foreach (var pair in _pending)
         {
-            if (TryApply(pair.Value, _clientPlayer))
+            if (TryApply(pair.Value))
                 applied.Add(pair.Key);
         }
         foreach (var worldId in applied)
@@ -168,139 +174,122 @@ internal sealed class PickupReplicator
             _hostPending.Remove(worldId);
     }
 
-    private bool TryApply(PickupRemoved removed, PlayerCharacter player)
+    private bool TryApply(PickupRemoved removed)
     {
         if (!_items.TryGetValue(removed.WorldId, out var item) ||
-            item == null || item.GetItemID() != removed.ItemId)
+            item == null || ItemId(item) != removed.ItemId)
             return false;
         _items.Remove(removed.WorldId);
-        if (IsPersonalEquipment(item))
+        _applyingRemoteRemovals.Add(removed.WorldId);
+        try
         {
-            if (player == null)
-                return false;
-            _approvedClientPickups.Add(removed.WorldId);
-            try
-            {
-                item.SuccessInteract(player);
-                return true;
-            }
-            catch (Exception exception)
-            {
-                _log.LogWarning($"Network equipment apply failed: {exception.Message}");
-                return false;
-            }
-            finally
-            {
-                _approvedClientPickups.Remove(removed.WorldId);
-            }
+            item.DestroyItem();
         }
-        item.DestroyItem();
-        player?.SuccessInteraction();
+        finally
+        {
+            _applyingRemoteRemovals.Remove(removed.WorldId);
+        }
         _trace?.Write("ITEM-APPLY",
-            $"world={removed.WorldId:X8} item={removed.ItemId} interaction=completed");
+            $"world={removed.WorldId:X8} item={removed.ItemId}");
         return true;
     }
 
-    private void ApplyHostRequest(
+    private void ApplyHostRemoval(
         UdpSession session,
         uint sceneId,
         float now,
         PlayerCharacter hostPlayer,
-        PickupRemoved request)
+        PickupRemoved removed)
     {
-        if (request.SceneId != sceneId || hostPlayer == null ||
+        if (removed.SceneId != sceneId ||
             !session.TryGetFreshRemotePlayerSnapshot(now, 0.75f, out var remotePlayer) ||
             remotePlayer.SceneId != sceneId)
         {
-            _trace?.Write("ITEM-REJECT", $"world={request.WorldId:X8} reason=player-or-scene");
+            _trace?.Write("ITEM-REJECT", $"world={removed.WorldId:X8} reason=player-or-scene");
             return;
         }
 
-        if (!_items.TryGetValue(request.WorldId, out var item))
+        if (!_items.TryGetValue(removed.WorldId, out var item) || ItemId(item) != removed.ItemId)
         {
             Refresh(sceneId, now);
-            _items.TryGetValue(request.WorldId, out item);
+            _items.TryGetValue(removed.WorldId, out item);
         }
-        if (item == null || item.GetItemID() != request.ItemId)
+        if (item == null || ItemId(item) != removed.ItemId)
         {
-            _trace?.Write("ITEM-REJECT", $"world={request.WorldId:X8} reason=missing-or-id");
+            item = null;
+            var nearestDistance = 16f;
+            foreach (var candidate in UnityEngine.Object.FindObjectsByType<PickupInstanceItem>(
+                         FindObjectsSortMode.None))
+            {
+                if (candidate == null || ItemId(candidate) != removed.ItemId)
+                    continue;
+                var position = candidate.transform.position;
+                var candidateDx = position.x - remotePlayer.X;
+                var candidateDy = position.y - remotePlayer.Y;
+                var distance = candidateDx * candidateDx + candidateDy * candidateDy;
+                if (distance >= nearestDistance)
+                    continue;
+                nearestDistance = distance;
+                item = candidate;
+            }
+        }
+        if (item == null)
+        {
+            _trace?.Write("ITEM-REJECT", $"world={removed.WorldId:X8} reason=missing-or-id");
             return;
         }
+
         var itemPosition = item.transform.position;
         var dx = itemPosition.x - remotePlayer.X;
         var dy = itemPosition.y - remotePlayer.Y;
-        if (dx * dx + dy * dy > 16f)
+        if (!MatchesRemotePickup(removed.ItemId, ItemId(item), dx, dy))
         {
-            _log.LogWarning($"Network pickup rejected: {request.WorldId:X8} is out of range");
+            _log.LogWarning($"Network pickup rejected: {removed.WorldId:X8} is out of range");
             return;
         }
 
-        var itemId = item.GetItemID();
-        var integrated = DataManager.Instance.GetIntegratedItem(itemId);
-        if (integrated == null)
+        var worldId = WorldId(sceneId, item);
+        _applyingRemoteRemovals.Add(worldId);
+        try
         {
-            _log.LogWarning($"Network pickup rejected: unknown item {itemId}");
-            return;
+            if (hostPlayer == null || !_ledger.CapturePickup(
+                    RemoteCatchLedger.PickupSource(sceneId, worldId), removed.ItemId, 1,
+                    () => item.SuccessInteract(hostPlayer), out _))
+            {
+                _trace?.Write("ITEM-REJECT", $"world={worldId:X8} reason=no-loot-evidence");
+                return;
+            }
         }
-        var personalEquipment = integrated.IsEquipmentType() || item.IsUpgradeKit();
-        if (personalEquipment)
+        finally
         {
-            item.DestroyItem();
-            _items.Remove(request.WorldId);
-            _log.LogInfo($"Network personal equipment accepted: {itemId}");
-            return;
+            _applyingRemoteRemovals.Remove(worldId);
         }
-        if (item.GetType() != typeof(PickupInstanceItem))
-        {
-            _log.LogWarning(
-                $"Network pickup rejected: unsupported item type {item.GetType().Name}");
-            return;
-        }
-        if (integrated.IntegratedType != (int)IntegratedItemType.Loot)
-        {
-            _log.LogWarning($"Network pickup rejected: unsupported integrated item {itemId}");
-            return;
-        }
-
-        var raw = DataManager.Instance.GetItems(itemId);
-        if (raw == null || raw.CategoryType is not (
-                DR.ItemCategoryType.Material or
-                DR.ItemCategoryType.Ingredients or
-                DR.ItemCategoryType.IngredientFish))
-        {
-            _log.LogWarning($"Network pickup rejected: unsupported category for {itemId}");
-            return;
-        }
-        var count = Math.Max(1, item.InstanceData.Count);
-        var sourceId = RemoteCatchLedger.PickupSource(sceneId, request.WorldId);
-        var onStored = item.OnStoredItem;
-        if (!_remoteCatch.CapturePickup(
-                sourceId, itemId, count,
-                () => LootBox.Instance?.Add(
-                    itemId, count, 0, LootBox.AutoLiftedType.None, null, true),
-                out var nativeCompleted))
-        {
-            _log.LogWarning($"Network pickup rejected: remote carry is full for {itemId}");
-            return;
-        }
-        if (item != null)
-            item.DestroyItem();
-        onStored?.Invoke();
-
-        _items.Remove(request.WorldId);
-        _log.LogInfo($"Network pickup accepted into remote carry: {itemId} x{count}");
-        _trace?.Write("ITEM-ACCEPT",
-            $"world={request.WorldId:X8} item={itemId} count={count}");
+        _items.Remove(worldId);
+        _trace?.Write("ITEM-REMOTE-REMOVE",
+            $"world={worldId:X8} requested={removed.WorldId:X8} item={removed.ItemId}");
     }
 
-    private static uint WorldId(uint sceneId, PickupInstanceItem item)
-        => WorldObjectId.For(sceneId, item, item.GetItemID());
+    internal static uint WorldId(uint sceneId, PickupInstanceItem item)
+        => WorldObjectId.For(sceneId, item, ItemId(item));
 
-    private static bool IsPersonalEquipment(PickupInstanceItem item)
+    private static int ItemId(PickupInstanceItem item)
     {
-        var integrated = DataManager.Instance?.GetIntegratedItem(item.GetItemID());
-        return integrated != null && (integrated.IsEquipmentType() || item.IsUpgradeKit());
+        try
+        {
+            return item?.GetItemID() ?? 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
+
+    private static bool MatchesRemotePickup(
+        int expectedItemId,
+        int actualItemId,
+        float dx,
+        float dy) =>
+        expectedItemId > 0 && expectedItemId == actualItemId && dx * dx + dy * dy <= 16f;
 }
 
 [HarmonyPatch(typeof(PickupInstanceItem), nameof(PickupInstanceItem.DestroyItem))]
@@ -319,8 +308,11 @@ internal static class PickupInteractPatch
         {
             if (type != typeof(PickupInstanceItem) && !type.IsSubclassOf(typeof(PickupInstanceItem)))
                 continue;
-            var method = AccessTools.DeclaredMethod(
-                type, nameof(PickupInstanceItem.SuccessInteract), new[] { typeof(BaseCharacter) });
+            var method = type.GetMethod(
+                nameof(PickupInstanceItem.SuccessInteract),
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.DeclaredOnly,
+                null, new[] { typeof(BaseCharacter) }, null);
             if (method != null)
                 yield return method;
         }
@@ -328,4 +320,10 @@ internal static class PickupInteractPatch
 
     private static bool Prefix(PickupInstanceItem __instance) =>
         ProbeBehaviour.Instance?.OnPickupInteract(__instance) ?? true;
+
+    private static Exception Finalizer(Exception __exception)
+    {
+        ProbeBehaviour.Instance?.EndClientLootSource();
+        return __exception;
+    }
 }

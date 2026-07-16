@@ -196,6 +196,44 @@ internal static class HarpoonProjectileVisualPatch
         ProbeBehaviour.Instance?.RegisterProjectile(__instance);
 }
 
+[HarmonyPatch(typeof(HarpoonWeaponHandler), nameof(HarpoonWeaponHandler.ChangeState))]
+internal static class HarpoonStateTracePatch
+{
+    private static void Prefix(
+        HarpoonWeaponHandler __instance,
+        HarpoonWeaponHandler.HarpoonActionState state)
+    {
+        ProbeBehaviour.Instance?.TraceHarpoon($"state-prefix->{state}", __instance);
+    }
+
+    private static void Postfix(
+        HarpoonWeaponHandler __instance,
+        HarpoonWeaponHandler.HarpoonActionState state)
+    {
+        ProbeBehaviour.Instance?.TraceHarpoon($"state-postfix->{state}", __instance);
+    }
+}
+
+[HarmonyPatch(typeof(HarpoonWeaponHandler), nameof(HarpoonWeaponHandler.FinishRecallHarpoon))]
+internal static class HarpoonFinishRecallTracePatch
+{
+    private static void Prefix(HarpoonWeaponHandler __instance, bool isSuccess) =>
+        ProbeBehaviour.Instance?.TraceHarpoon("finish-recall-prefix", __instance, isSuccess);
+
+    private static void Postfix(HarpoonWeaponHandler __instance, bool isSuccess) =>
+        ProbeBehaviour.Instance?.TraceHarpoon("finish-recall-postfix", __instance, isSuccess);
+}
+
+[HarmonyPatch(typeof(HarpoonWeaponHandler), nameof(HarpoonWeaponHandler.ResetWeaponResources))]
+internal static class HarpoonResetTracePatch
+{
+    private static void Prefix(HarpoonWeaponHandler __instance) =>
+        ProbeBehaviour.Instance?.TraceHarpoon("reset-prefix", __instance);
+
+    private static void Postfix(HarpoonWeaponHandler __instance) =>
+        ProbeBehaviour.Instance?.TraceHarpoon("reset-postfix", __instance);
+}
+
 [HarmonyPatch(typeof(Projectile), nameof(Projectile.Launch))]
 internal static class WeaponProjectileVisualPatch
 {

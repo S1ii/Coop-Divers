@@ -344,7 +344,7 @@ internal sealed class TravelCoordinator
                     fastTravel,
                     route.SceneName,
                     (SceneType)route.SceneType,
-                    route.Location,
+                    (SceneConnectLocationID)route.Location,
                     (SceneTransitionType)route.TransitionType);
         }
 
@@ -401,20 +401,9 @@ internal sealed class TravelCoordinator
         JDLC.FastTravelPanelController panel,
         string sceneName,
         SceneType sceneType,
-        object location,
+        SceneConnectLocationID location,
         SceneTransitionType transitionType)
-    {
-        var method = Array.Find(
-            typeof(JDLC.FastTravelPanelController).GetMethods(
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic),
-            candidate =>
-                candidate.Name == nameof(JDLC.FastTravelPanelController.ChangeScene) &&
-                candidate.GetParameters().Length == 4);
-        var locationType = method?.GetParameters()[2].ParameterType;
-        if (locationType?.IsEnum == true && !locationType.IsInstanceOfType(location))
-            location = Enum.ToObject(locationType, Convert.ToInt32(location));
-        method?.Invoke(panel, new[] { sceneName, sceneType, location, transitionType });
-    }
+        => panel.ChangeScene(sceneName, sceneType, location, transitionType);
 
     private void ScanElements()
     {
@@ -569,7 +558,7 @@ internal static class JungleFastTravelPatch
         JDLC.FastTravelPanelController __instance,
         string __0,
         SceneType __1,
-        object __2,
+        SceneConnectLocationID __2,
         SceneTransitionType __3) =>
         ProbeBehaviour.Instance?.RequestJungleFastTravel(__instance, __0, __1, __2, __3) ?? true;
 }

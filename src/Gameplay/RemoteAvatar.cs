@@ -6,6 +6,12 @@ namespace DaveTheDiverMP;
 
 internal sealed class RemoteAvatar : IDisposable
 {
+    internal static void SelfTest()
+    {
+        if (ApplyDepthBias(-0.05f) >= -0.05f)
+            throw new InvalidOperationException("Remote avatar depth bias failed");
+    }
+
     private sealed class RemoteVisual
     {
         internal SpriteRenderer Renderer;
@@ -32,9 +38,9 @@ internal sealed class RemoteAvatar : IDisposable
     internal void Apply(PlayerSnapshot snapshot, SpriteRenderer localRenderer, string playerName)
     {
         if (_gameObject == null)
-            Create(localRenderer, new Vector3(snapshot.X, snapshot.Y, snapshot.Z), playerName);
+            Create(localRenderer, new Vector3(snapshot.X, snapshot.Y, ApplyDepthBias(snapshot.Z)), playerName);
 
-        _target = new Vector3(snapshot.X, snapshot.Y, snapshot.Z);
+        _target = new Vector3(snapshot.X, snapshot.Y, ApplyDepthBias(snapshot.Z));
         _velocity = new Vector3(snapshot.VelocityX, snapshot.VelocityY, 0f);
         _targetRotation = snapshot.Rotation;
         _timeSinceSnapshot = 0f;
@@ -185,6 +191,8 @@ internal sealed class RemoteAvatar : IDisposable
 
     private static bool IsUnder(Transform candidate, Transform root) =>
         root != null && (candidate == root || candidate.IsChildOf(root));
+
+    private static float ApplyDepthBias(float z) => z - 0.01f;
 
     private void Create(SpriteRenderer sourceRenderer, Vector3 position, string playerName)
     {
