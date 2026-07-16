@@ -45,7 +45,8 @@ internal enum PacketType : byte
     BossDamageRequest = 39,
     BossState = 40,
     ManagerEvent = 41,
-    SushiResultState = 42
+    SushiResultState = 42,
+    MissionRoster = 43
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -218,6 +219,7 @@ internal readonly record struct MissionState(
     byte State,
     int CurrentTaskId,
     MissionConditionState[] Conditions);
+internal readonly record struct MissionRoster(uint Revision, int[] MissionIds);
 internal readonly record struct WorldFlagRequest(string Key, bool Value);
 internal readonly record struct WorldFlagState(uint Revision, string Key, bool Value);
 internal readonly record struct BossDamageRequest(
@@ -258,7 +260,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 27;
+    private const byte Version = 28;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -294,11 +296,14 @@ internal static class Protocol
     private const int DiveResultStatePacketSize = HeaderSize + 10;
     private const int MissionStateFixedSize = HeaderSize + 18;
     private const int MissionConditionStateSize = 8;
+    private const int MissionRosterFixedSize = HeaderSize + 6;
     internal const int MaxIngredientEntriesPerPacket =
         (1200 - IngredientsSnapshotChunkFixedSize) / IngredientCountSize;
     internal const int MaxIngredientSnapshotChunks = 256;
     internal const int MaxIngredientPlaces = 32;
     internal const int MaxMissionConditions = 64;
+    internal const int MaxMissionRosterEntries =
+        (1200 - MissionRosterFixedSize) / sizeof(int);
     internal const int MaxWorldFlagKeyBytes = 128;
     internal const int MaxTravelSceneNameBytes = 128;
     internal const int MaxFishSnapshotsPerPacket =
@@ -1635,6 +1640,48 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodeMissionRoster(uint sequence, MissionRoster roster)
+    {
+        var missionIds = roster.MissionIds ?? throw new ArgumentNullException(nameof(roster));
+        if (roster.Revision == 0 || missionIds.Length > MaxMissionRosterEntries ||
+            !AreValidMissionIds(missionIds))
+            throw new ArgumentOutOfRangeException(nameof(roster));
+        var packet = new byte[MissionRosterFixedSize + missionIds.Length * sizeof(int)];
+        WriteHeader(packet, PacketType.MissionRoster, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), roster.Revision);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            packet.AsSpan(HeaderSize + 4), (ushort)missionIds.Length);
+        for (var index = 0; index < missionIds.Length; index++)
+            BinaryPrimitives.WriteInt32LittleEndian(
+                packet.AsSpan(MissionRosterFixedSize + index * sizeof(int)), missionIds[index]);
+        return packet;
+    }
+
+    internal static bool TryDecodeMissionRoster(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out MissionRoster roster)
+    {
+        sequence = 0;
+        roster = default;
+        if (packet.Length < MissionRosterFixedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.MissionRoster)
+            return false;
+        var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var count = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 4));
+        if (revision == 0 || count > MaxMissionRosterEntries ||
+            packet.Length != MissionRosterFixedSize + count * sizeof(int))
+            return false;
+        var missionIds = new int[count];
+        for (var index = 0; index < count; index++)
+            missionIds[index] = BinaryPrimitives.ReadInt32LittleEndian(
+                packet.Slice(MissionRosterFixedSize + index * sizeof(int)));
+        if (!AreValidMissionIds(missionIds))
+            return false;
+        roster = new MissionRoster(revision, missionIds);
+        return true;
+    }
+
     internal static byte[] EncodeWorldFlagRequest(uint sequence, WorldFlagRequest request) =>
         EncodeWorldFlag(PacketType.WorldFlagRequest, sequence, 0, request.Key, request.Value);
 
@@ -1997,6 +2044,14 @@ internal static class Protocol
         return true;
     }
 
+    private static bool AreValidMissionIds(int[] missionIds)
+    {
+        for (var index = 0; index < missionIds.Length; index++)
+            if (missionIds[index] <= 0 || index > 0 && missionIds[index - 1] >= missionIds[index])
+                return false;
+        return true;
+    }
+
     private static bool IsNewer(uint value, uint previous) =>
         unchecked((int)(value - previous)) > 0;
 
@@ -2260,6 +2315,17 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(missionStatePacket.AsSpan(MissionStateFixedSize), 0);
         if (TryDecodeMissionState(missionStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid mission state");
+
+        var missionRosterPacket = EncodeMissionRoster(
+            72, new MissionRoster(3, new[] { 101, 205, 999 }));
+        if (!TryDecodeMissionRoster(missionRosterPacket, out sequence, out var missionRoster) ||
+            sequence != 72 || missionRoster.Revision != 3 ||
+            !missionRoster.MissionIds.AsSpan().SequenceEqual(new[] { 101, 205, 999 }))
+            throw new InvalidOperationException("Mission roster round-trip failed");
+        BinaryPrimitives.WriteInt32LittleEndian(
+            missionRosterPacket.AsSpan(MissionRosterFixedSize + sizeof(int)), 101);
+        if (TryDecodeMissionRoster(missionRosterPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted duplicate mission IDs");
 
         var worldRequestPacket = EncodeWorldFlagRequest(
             72, new WorldFlagRequest("glacier/mirror-1", true));

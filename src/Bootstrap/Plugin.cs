@@ -9,7 +9,7 @@ using UnityEngine;
 
 namespace DaveTheDiverMP;
 
-[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.16.1")]
+[BepInPlugin("dev.davethedivermp", "Dave the Diver Multiplayer", "0.17.0")]
 public sealed class Plugin : BasePlugin
 {
     private static ConfigEntry<SessionRole> _roleConfig;

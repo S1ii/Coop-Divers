@@ -239,6 +239,7 @@ internal sealed class RemoteCatchLedger
             return false;
         }
 
+        UpdateAcceptedMissions(capture.Entries);
         _entries.AddRange(capture.Entries);
         AddWeight(capture.Entries);
         _acceptedSources.Add(sourceId);
@@ -294,6 +295,7 @@ internal sealed class RemoteCatchLedger
             return false;
         }
 
+        UpdateAcceptedMissions(capture.Entries);
         _entries.AddRange(capture.Entries);
         AddWeight(capture.Entries);
         _acceptedSources.Add(sourceId);
@@ -502,9 +504,39 @@ internal sealed class RemoteCatchLedger
             GetTimes = null,
             UpdateMission = request.UpdateMission
         };
+        UpdateAcceptedMissions(new[] { entry });
         _entries.Add(entry);
         AddWeight(new List<LootEntry> { entry });
         _log.LogInfo($"Remote loot accepted: item={request.ItemId}; count={request.Count}");
+    }
+
+    private void UpdateAcceptedMissions(IEnumerable<LootEntry> entries)
+    {
+        var manager = MissionManager.Instance;
+        var data = DataManager.Instance;
+        if (manager == null || data == null)
+            return;
+        foreach (var entry in entries)
+        {
+            if (!entry.UpdateMission)
+                continue;
+            try
+            {
+                var item = data.GetItems(entry.ItemId);
+                if (item == null)
+                    continue;
+                manager.UpdateMissionIntCondition(item, entry.BonusGrade, entry.Count);
+                entry.UpdateMission = false;
+                _log.LogDebug(
+                    $"Remote catch mission updated: item={entry.ItemId}; count={entry.Count}");
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning(
+                    $"Remote catch mission update deferred: item={entry.ItemId}; " +
+                    exception.Message);
+            }
+        }
     }
 
     private void BeginClientResult(ulong transferId, ushort total)

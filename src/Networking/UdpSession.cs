@@ -54,6 +54,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<DiveResultEntry> _diveResultEntries = new();
     private readonly ConcurrentQueue<DiveResultState> _diveResultStates = new();
     private readonly ConcurrentQueue<MissionState> _missionStates = new();
+    private readonly ConcurrentQueue<MissionRoster> _missionRosters = new();
     private readonly ConcurrentQueue<WorldFlagRequest> _worldFlagRequests = new();
     private readonly ConcurrentQueue<WorldFlagState> _worldFlagStates = new();
     private readonly ConcurrentQueue<BossDamageRequest> _bossDamageRequests = new();
@@ -401,6 +402,16 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeMissionState(out MissionState state) =>
         _missionStates.TryDequeue(out state);
+
+    internal bool SendMissionRoster(MissionRoster roster)
+    {
+        if (_role == SessionRole.Host && _connected && ReliableCapacityRemaining > 0)
+            return SendReliable(Protocol.EncodeMissionRoster(++_sequence, roster));
+        return false;
+    }
+
+    internal bool TryTakeMissionRoster(out MissionRoster roster) =>
+        _missionRosters.TryDequeue(out roster);
 
     internal void SendWorldFlagRequest(WorldFlagRequest request)
     {
@@ -1014,6 +1025,18 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 _missionStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.MissionRoster)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeMissionRoster(received.Buffer, out _, out var roster))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _missionRosters.Enqueue(roster);
             }
             return;
         }

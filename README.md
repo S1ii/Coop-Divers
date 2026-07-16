@@ -94,7 +94,7 @@ Required GitHub settings:
 - Repository secret `REFERENCE_REPOSITORY_SSH_KEY`: private half of a read-only
   deploy key installed on that repository.
 
-Push a tag such as `v0.16.1` to create a GitHub Release with the BepInEx ZIP
+Push a tag such as `v0.17.0` to create a GitHub Release with the BepInEx ZIP
 and SHA256 checksum. The same ZIP can be uploaded to Nexus Mods.
 
 ## License
