@@ -58,6 +58,8 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<WorldFlagState> _worldFlagStates = new();
     private readonly ConcurrentQueue<BossDamageRequest> _bossDamageRequests = new();
     private readonly ConcurrentQueue<BossState> _bossStates = new();
+    private readonly ConcurrentQueue<ManagerEvent> _managerEvents = new();
+    private readonly ConcurrentQueue<SushiResultState> _sushiResultStates = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
     private readonly HashSet<uint> _receivedReliable = new();
@@ -87,7 +89,6 @@ internal sealed class UdpSession : IDisposable
     private uint _lastSnapshotSequence;
     private uint _lastVisualSequence;
     private uint _lastProjectileVisualSequence;
-    private uint _lastMissionSequence;
     private uint _lastTransitionSequence;
     private uint _lastBoatDecoSequence;
     private PlayerSnapshot _snapshot;
@@ -434,6 +435,24 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeBossState(out BossState state) =>
         _bossStates.TryDequeue(out state);
+
+    internal void SendManagerEvent(ManagerEvent state)
+    {
+        if (_connected)
+            SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
+    }
+
+    internal bool TryTakeManagerEvent(out ManagerEvent state) =>
+        _managerEvents.TryDequeue(out state);
+
+    internal void SendSushiResultState(SushiResultState state)
+    {
+        if (_role == SessionRole.Host && _connected)
+            SendReliable(Protocol.EncodeSushiResultState(++_sequence, state));
+    }
+
+    internal bool TryTakeSushiResultState(out SushiResultState state) =>
+        _sushiResultStates.TryDequeue(out state);
 
     internal bool TryTakeSnapshot(out PlayerSnapshot snapshot)
     {
@@ -988,10 +1007,8 @@ internal sealed class UdpSession : IDisposable
         if (type == PacketType.MissionState)
         {
             if (_connected && _role == SessionRole.Client &&
-                Protocol.TryDecodeMissionState(received.Buffer, out _, out var state) &&
-                IsNewer(sequence, _lastMissionSequence))
+                Protocol.TryDecodeMissionState(received.Buffer, out _, out var state))
             {
-                _lastMissionSequence = sequence;
                 _lastReceive = now;
                 _missionStates.Enqueue(state);
             }
@@ -1041,6 +1058,31 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 _bossStates.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.ManagerEvent)
+        {
+            if (_connected && Protocol.TryDecodeManagerEvent(received.Buffer, out _, out var state) &&
+                (_role == SessionRole.Host && state.Revision == 0 ||
+                 _role == SessionRole.Client && state.Revision != 0))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _managerEvents.Enqueue(state);
+            }
+            return;
+        }
+
+        if (type == PacketType.SushiResultState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeSushiResultState(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence))
+                    _sushiResultStates.Enqueue(state);
             }
             return;
         }
@@ -1249,7 +1291,6 @@ internal sealed class UdpSession : IDisposable
         _lastSnapshotSequence = 0;
         _lastVisualSequence = 0;
         _lastProjectileVisualSequence = 0;
-        _lastMissionSequence = 0;
         _lastTransitionSequence = 0;
         _lastBoatDecoSequence = 0;
         _lastSentSnapshot = default;
@@ -1313,6 +1354,12 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_bossStates.TryDequeue(out _))
+        {
+        }
+        while (_managerEvents.TryDequeue(out _))
+        {
+        }
+        while (_sushiResultStates.TryDequeue(out _))
         {
         }
     }

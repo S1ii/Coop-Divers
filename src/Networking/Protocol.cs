@@ -43,7 +43,9 @@ internal enum PacketType : byte
     WorldFlagRequest = 37,
     WorldFlagState = 38,
     BossDamageRequest = 39,
-    BossState = 40
+    BossState = 40,
+    ManagerEvent = 41,
+    SushiResultState = 42
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -235,10 +237,24 @@ internal readonly record struct BossState(
     float Y,
     float Z,
     byte Flags);
+internal readonly record struct ManagerEvent(
+    uint Revision,
+    byte Domain,
+    byte Action,
+    int Value,
+    int Context);
+internal readonly record struct SushiResultState(
+    uint Revision,
+    int SalesMenu,
+    int SalesEtc,
+    int StaffTips,
+    int TotalVisits,
+    int LikeCount,
+    float Rating);
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 25;
+    private const byte Version = 26;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 41;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -250,6 +266,8 @@ internal static class Protocol
     private const int FishDamageRequestSize = HeaderSize + 20;
     private const int BossDamageRequestSize = HeaderSize + 20;
     private const int BossStateSize = HeaderSize + 37;
+    private const int ManagerEventSize = HeaderSize + 14;
+    private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 8;
     private const int FishRemovedSize = HeaderSize + 8;
     private const int FishManifestFixedSize = HeaderSize + 38;
@@ -805,6 +823,84 @@ internal static class Protocol
         float.IsFinite(state.Z) && MathF.Abs(state.X) <= 1_000_000f &&
         MathF.Abs(state.Y) <= 1_000_000f && MathF.Abs(state.Z) <= 1_000_000f &&
         state.Flags <= 1;
+
+    internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
+    {
+        if (state.Domain == 0 || state.Domain > 16 || state.Action == 0 || state.Action > 32)
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[ManagerEventSize];
+        WriteHeader(packet, PacketType.ManagerEvent, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
+        packet[HeaderSize + 4] = state.Domain;
+        packet[HeaderSize + 5] = state.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 6), state.Value);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), state.Context);
+        return packet;
+    }
+
+    internal static bool TryDecodeManagerEvent(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out ManagerEvent state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != ManagerEventSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.ManagerEvent)
+            return false;
+        state = new ManagerEvent(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            packet[HeaderSize + 4],
+            packet[HeaderSize + 5],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 6)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10)));
+        return state.Domain is > 0 and <= 16 && state.Action is > 0 and <= 32;
+    }
+
+    internal static byte[] EncodeSushiResultState(uint sequence, SushiResultState state)
+    {
+        if (!IsValidSushiResult(state))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[SushiResultStateSize];
+        WriteHeader(packet, PacketType.SushiResultState, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SalesMenu);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.SalesEtc);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.StaffTips);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), state.TotalVisits);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), state.LikeCount);
+        WriteSingle(packet.AsSpan(HeaderSize + 24), state.Rating);
+        return packet;
+    }
+
+    internal static bool TryDecodeSushiResultState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out SushiResultState state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != SushiResultStateSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.SushiResultState)
+            return false;
+        state = new SushiResultState(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            ReadSingle(packet.Slice(HeaderSize + 24)));
+        if (IsValidSushiResult(state))
+            return true;
+        state = default;
+        return false;
+    }
+
+    private static bool IsValidSushiResult(SushiResultState state) =>
+        state.Revision != 0 && state.SalesMenu >= 0 && state.SalesEtc >= 0 &&
+        state.StaffTips >= 0 && state.TotalVisits >= 0 && state.LikeCount >= 0 &&
+        float.IsFinite(state.Rating) && state.Rating is >= 0f and <= 5f;
 
     internal static byte[] EncodeFishPickupRequest(uint sequence, FishPickupRequest request)
     {
@@ -1918,6 +2014,24 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 16), 1001);
         if (TryDecodeBossState(bossStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted boss HP above maximum");
+
+        var expectedManagerEvent = new ManagerEvent(3, 2, 4, 1, 0x12345678);
+        var managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
+        if (!TryDecodeManagerEvent(managerEventPacket, out sequence, out var managerEvent) ||
+            sequence != 47 || managerEvent != expectedManagerEvent)
+            throw new InvalidOperationException("Manager event round-trip failed");
+        managerEventPacket[HeaderSize + 4] = 0;
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid manager domain");
+
+        var expectedSushiResult = new SushiResultState(5, 1200, 300, 80, 21, 19, 4.5f);
+        var sushiResultPacket = EncodeSushiResultState(48, expectedSushiResult);
+        if (!TryDecodeSushiResultState(sushiResultPacket, out sequence, out var sushiResult) ||
+            sequence != 48 || sushiResult != expectedSushiResult)
+            throw new InvalidOperationException("Sushi result round-trip failed");
+        WriteSingle(sushiResultPacket.AsSpan(HeaderSize + 24), 6f);
+        if (TryDecodeSushiResultState(sushiResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid sushi rating");
 
         var expectedFishPickup = new FishPickupRequest(SceneId("A02_01_01"), 17);
         var fishPickupPacket = EncodeFishPickupRequest(47, expectedFishPickup);

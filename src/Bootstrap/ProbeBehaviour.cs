@@ -40,6 +40,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private PickupReplicator _pickupReplicator;
     private SceneReplicator _sceneReplicator;
     private MissionProgressReplicator _missionProgressReplicator;
+    private ManagerEventReplicator _managerEventReplicator;
     private WorldStateReplicator _worldStateReplicator;
     private BossReplicator _bossReplicator;
     private IngredientsReplicator _ingredientsReplicator;
@@ -76,6 +77,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _pickupReplicator = new PickupReplicator(Logger, _remoteCatchLedger);
         _sceneReplicator = new SceneReplicator(Logger);
         _missionProgressReplicator = new MissionProgressReplicator(Logger);
+        _managerEventReplicator = new ManagerEventReplicator(Logger);
         _worldStateReplicator = new WorldStateReplicator(Logger);
         _bossReplicator = new BossReplicator(Logger);
         _ingredientsReplicator = new IngredientsReplicator(Logger);
@@ -155,6 +157,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(Role, _session, _scene, Time.realtimeSinceStartup);
+        _managerEventReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
@@ -332,6 +335,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
         _missionProgressReplicator?.Clear();
+        _managerEventReplicator?.Clear();
         _worldStateReplicator?.Clear();
         _bossReplicator?.Clear();
         _ingredientsReplicator?.Clear();
@@ -506,6 +510,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
         _missionProgressReplicator?.Clear();
+        _managerEventReplicator?.Clear();
         _worldStateReplicator?.Clear();
         _bossReplicator?.Clear();
         _ingredientsReplicator?.Clear();
@@ -676,6 +681,33 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Logger.LogInfo($"Network: client scene transition blocked: {sceneName}");
         return false;
     }
+
+    internal bool InterceptManagerEvent(
+        ManagerDomain domain,
+        ManagerAction action,
+        int value,
+        int context) =>
+        _managerEventReplicator?.Intercept(Role, _session, domain, action, value, context) ?? true;
+
+    internal bool BeginManagerEvent(
+        ManagerDomain domain,
+        ManagerAction action,
+        int value,
+        int context,
+        out bool suppressNested)
+    {
+        if (_managerEventReplicator != null)
+            return _managerEventReplicator.BeginIntercept(
+                Role, _session, domain, action, value, context, out suppressNested);
+        suppressNested = false;
+        return true;
+    }
+
+    internal void EndManagerEvent(bool suppressNested) =>
+        _managerEventReplicator?.EndIntercept(suppressNested);
+
+    internal void PublishSushiResult() =>
+        _managerEventReplicator?.PublishSushiResult(Role, _session);
 
     private void ReturnToOnlineRoom(string reason)
     {

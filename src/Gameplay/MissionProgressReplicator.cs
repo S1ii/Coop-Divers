@@ -8,12 +8,15 @@ internal sealed class MissionProgressReplicator
 {
     private const float ScanInterval = 0.25f;
     private const float KeyframeInterval = 5f;
+    private const float FullKeyframeInterval = 60f;
     private readonly ManualLogSource _log;
     private readonly Dictionary<int, MissionState> _hostStates = new();
     private readonly Dictionary<int, uint> _clientRevisions = new();
+    private readonly Dictionary<int, MissionState> _pendingClientStates = new();
     private readonly Dictionary<int, MissionState> _clientOriginals = new();
     private float _nextHostScan;
     private float _nextHostKeyframe;
+    private float _nextHostFullKeyframe;
     private bool _wasConnected;
 
     internal MissionProgressReplicator(ManualLogSource log) => _log = log;
@@ -32,8 +35,10 @@ internal sealed class MissionProgressReplicator
         {
             _hostStates.Clear();
             _clientRevisions.Clear();
+            _pendingClientStates.Clear();
             _nextHostScan = 0f;
             _nextHostKeyframe = now + KeyframeInterval;
+            _nextHostFullKeyframe = now + FullKeyframeInterval;
         }
         _wasConnected = true;
 
@@ -42,9 +47,14 @@ internal sealed class MissionProgressReplicator
             if (now >= _nextHostScan)
             {
                 _nextHostScan = now + ScanInterval;
-                PublishHostChanges(session, now >= _nextHostKeyframe);
+                PublishHostChanges(
+                    session,
+                    now >= _nextHostKeyframe,
+                    now >= _nextHostFullKeyframe);
                 if (now >= _nextHostKeyframe)
                     _nextHostKeyframe = now + KeyframeInterval;
+                if (now >= _nextHostFullKeyframe)
+                    _nextHostFullKeyframe = now + FullKeyframeInterval;
             }
             return;
         }
@@ -54,11 +64,19 @@ internal sealed class MissionProgressReplicator
         while (session.TryTakeMissionState(out var state))
         {
             _clientRevisions.TryGetValue(state.MissionId, out var previous);
+            if (_pendingClientStates.TryGetValue(state.MissionId, out var pending) &&
+                IsNewer(pending.Revision, previous))
+                previous = pending.Revision;
             if (!IsNewer(state.Revision, previous))
                 continue;
-            _clientRevisions[state.MissionId] = state.Revision;
-            ApplyClientState(state, preserveOriginal: true);
+            _pendingClientStates[state.MissionId] = state;
         }
+        foreach (var pair in new List<KeyValuePair<int, MissionState>>(_pendingClientStates))
+            if (ApplyClientState(pair.Value, preserveOriginal: true))
+            {
+                _clientRevisions[pair.Key] = pair.Value.Revision;
+                _pendingClientStates.Remove(pair.Key);
+            }
     }
 
     internal void Clear()
@@ -67,7 +85,7 @@ internal sealed class MissionProgressReplicator
         _wasConnected = false;
     }
 
-    private void PublishHostChanges(UdpSession session, bool keyframe)
+    private void PublishHostChanges(UdpSession session, bool keyframe, bool fullKeyframe)
     {
         var manager = MissionManager.Instance;
         if (manager == null)
@@ -82,7 +100,8 @@ internal sealed class MissionProgressReplicator
                 if (mission.State == global::MissionState.NotStarted && previous.MissionId == 0)
                     continue;
                 var current = Capture(mission, previous.Revision);
-                if (!keyframe && SameContent(previous, current))
+                var unchanged = SameContent(previous, current);
+                if (unchanged && (!keyframe || IsTerminal(current.State) && !fullKeyframe))
                     continue;
                 current = current with { Revision = NextRevision(previous.Revision) };
                 _hostStates[mission.TID] = current;
@@ -119,22 +138,23 @@ internal sealed class MissionProgressReplicator
             conditions.ToArray());
     }
 
-    private void ApplyClientState(MissionState state, bool preserveOriginal)
+    private bool ApplyClientState(MissionState state, bool preserveOriginal)
     {
         try
         {
             var manager = MissionManager.Instance;
             var mission = manager?.GetMissionData(state.MissionId);
             if (mission == null)
-                return;
+                return false;
             if (preserveOriginal && !_clientOriginals.ContainsKey(state.MissionId))
                 _clientOriginals[state.MissionId] = Capture(mission, 1);
 
+            mission.State = (global::MissionState)state.State;
             mission.Progress = state.Progress;
             mission.ForceUpdateCurrenTask();
-            mission.State = (global::MissionState)state.State;
+            SelectTask(mission, state.CurrentTaskId);
             var task = mission.CurrentTask;
-            if (task != null)
+            if (task != null && (state.CurrentTaskId == 0 || task.TID == state.CurrentTaskId))
             {
                 var values = new Dictionary<int, int>(state.Conditions.Length);
                 foreach (var condition in state.Conditions)
@@ -151,10 +171,12 @@ internal sealed class MissionProgressReplicator
                 manager.ClearedSet.Add(mission.TID);
             else
                 manager.ClearedSet.Remove(mission.TID);
+            return true;
         }
         catch (Exception exception)
         {
             _log.LogWarning($"Mission state apply failed: {exception.Message}");
+            return false;
         }
     }
 
@@ -170,8 +192,10 @@ internal sealed class MissionProgressReplicator
         RestoreClientState();
         _hostStates.Clear();
         _clientRevisions.Clear();
+        _pendingClientStates.Clear();
         _nextHostScan = 0f;
         _nextHostKeyframe = 0f;
+        _nextHostFullKeyframe = 0f;
     }
 
     private static void SetMembership(
@@ -188,6 +212,22 @@ internal sealed class MissionProgressReplicator
             list.Remove(mission);
     }
 
+    private static void SelectTask(MissionData mission, int taskId)
+    {
+        if (taskId == 0 || mission.CurrentTask?.TID == taskId)
+            return;
+        var node = mission.FirstTaskNode;
+        while (node != null)
+        {
+            if (node.Value?.TID == taskId)
+            {
+                mission.m_CurrentTaskNode = node;
+                return;
+            }
+            node = node.Next;
+        }
+    }
+
     private static bool SameContent(MissionState left, MissionState right)
     {
         if (left.MissionId != right.MissionId || left.Progress != right.Progress ||
@@ -202,6 +242,9 @@ internal sealed class MissionProgressReplicator
     }
 
     private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
+
+    private static bool IsTerminal(byte state) =>
+        (global::MissionState)state is global::MissionState.Clear or global::MissionState.Done;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;

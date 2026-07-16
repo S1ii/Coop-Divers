@@ -21,7 +21,9 @@ directly over UDP; there are no accounts, matchmaking servers, or launcher.
 - Host-authoritative dive and travel coordination.
 - Remote avatar state and movement replication.
 - Shared fish, pickups, projectiles, bosses, boat decor, and world objects.
-- Mission progress and catch ledger synchronization.
+- Mission/story progress, dialogue choice, and catch ledger synchronization.
+- Host-authoritative sushi lifecycle, menu, wasabi, tables, and shift results.
+- Synchronized results for mapped story and arcade minigames.
 - Release packaging for BepInEx plugin installs.
 
 ## Project Status
@@ -92,7 +94,7 @@ Required GitHub settings:
 - Repository secret `REFERENCE_REPOSITORY_SSH_KEY`: private half of a read-only
   deploy key installed on that repository.
 
-Push a tag such as `v0.14.0` to create a GitHub Release with the BepInEx ZIP
+Push a tag such as `v0.15.0` to create a GitHub Release with the BepInEx ZIP
 and SHA256 checksum. The same ZIP can be uploaded to Nexus Mods.
 
 ## License
