@@ -28,6 +28,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingFishDamageRequests = 256;
     private const int MaxPendingFishRemovals = 256;
     private const int MaxPendingFishPickupResults = 256;
+    private const int MaxPendingFishManifests = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishLootGrants = 256;
@@ -325,6 +326,7 @@ internal sealed class UdpSession : IDisposable
         TestFishDamageRequestQueueOverflow();
         TestFishRemovedQueueOverflow();
         TestFishPickupResultQueueOverflow();
+        TestFishManifestQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
         TestFishLootGrantQueueOverflow();
@@ -461,6 +463,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._fishPickupResults.IsEmpty ||
             session._peerLostReason != "fish pickup result receive queue overflow")
             throw new InvalidOperationException("Fish pickup result queue overflow self-test failed");
+    }
+
+    private static void TestFishManifestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishManifests; index++)
+            session._fishManifests.Enqueue(default);
+        session.QueueFishManifest(default);
+        if (session._connected || !session._fishManifests.IsEmpty ||
+            session._peerLostReason != "fish manifest receive queue overflow")
+            throw new InvalidOperationException("Fish manifest queue overflow self-test failed");
     }
 
     private static void TestBulkReliableControlReserve()
@@ -2596,7 +2613,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && manifest.SceneId == _remoteSceneId &&
                     manifest.SceneEpoch == _remoteSceneEpoch)
-                    _fishManifests.Enqueue(manifest);
+                    QueueFishManifest(manifest);
             }
             return;
         }
@@ -3469,6 +3486,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish removal receive queue overflow");
+    }
+
+    private void QueueFishManifest(FishManifest manifest)
+    {
+        if (HasDecodedQueueCapacity(_fishManifests.Count, MaxPendingFishManifests))
+        {
+            _fishManifests.Enqueue(manifest);
+            return;
+        }
+        FailReliableDelivery("fish manifest receive queue overflow");
     }
 
     private void QueueFishPickupResult(FishPickupResult result)
