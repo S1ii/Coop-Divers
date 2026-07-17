@@ -27,6 +27,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishDamageRequests = 256;
     private const int MaxPendingFishRemovals = 256;
+    private const int MaxPendingFishPickupResults = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishLootGrants = 256;
@@ -323,6 +324,7 @@ internal sealed class UdpSession : IDisposable
         TestSaveSnapshotAckQueueOverflow();
         TestFishDamageRequestQueueOverflow();
         TestFishRemovedQueueOverflow();
+        TestFishPickupResultQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
         TestFishLootGrantQueueOverflow();
@@ -444,6 +446,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._fishRemovals.IsEmpty ||
             session._peerLostReason != "fish removal receive queue overflow")
             throw new InvalidOperationException("Fish removal queue overflow self-test failed");
+    }
+
+    private static void TestFishPickupResultQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishPickupResults; index++)
+            session._fishPickupResults.Enqueue(default);
+        session.QueueFishPickupResult(default);
+        if (session._connected || !session._fishPickupResults.IsEmpty ||
+            session._peerLostReason != "fish pickup result receive queue overflow")
+            throw new InvalidOperationException("Fish pickup result queue overflow self-test failed");
     }
 
     private static void TestBulkReliableControlReserve()
@@ -2553,7 +2570,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && result.SceneId == _remoteSceneId &&
                     result.SceneEpoch == _remoteSceneEpoch)
-                    _fishPickupResults.Enqueue(result);
+                    QueueFishPickupResult(result);
             }
             return;
         }
@@ -3452,6 +3469,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish removal receive queue overflow");
+    }
+
+    private void QueueFishPickupResult(FishPickupResult result)
+    {
+        if (HasDecodedQueueCapacity(_fishPickupResults.Count, MaxPendingFishPickupResults))
+        {
+            _fishPickupResults.Enqueue(result);
+            return;
+        }
+        FailReliableDelivery("fish pickup result receive queue overflow");
     }
 
     private void QueueFishLifecycle(FishLifecycle state)
