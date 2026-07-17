@@ -18,6 +18,7 @@ internal sealed class RemoteAvatar : IDisposable
 
     internal static void SelfTest()
     {
+        RemoteDiverHitbox.SelfTest();
         var angle = 40f * Mathf.Deg2Rad;
         var normal = NormalizeVisibleBasis(
             new Vector2(Mathf.Cos(angle) * 2f, Mathf.Sin(angle) * 2f),
@@ -62,6 +63,7 @@ internal sealed class RemoteAvatar : IDisposable
     private bool _initialized;
     private bool _hasVisualState;
     private bool _isRemoteDead;
+    private RemoteDiverHitbox _hitbox;
 
     internal Transform Transform => _gameObject?.transform;
     internal Transform TargetTransform =>
@@ -73,10 +75,17 @@ internal sealed class RemoteAvatar : IDisposable
         PlayerSnapshot snapshot,
         SpriteRenderer localRenderer,
         string playerName,
-        bool isDive)
+        bool isDive,
+        Func<AttackData, DefenseData, bool> onProxyDamage = null,
+        bool hostProxy = false)
     {
         if (_gameObject == null)
             Create(localRenderer, new Vector3(snapshot.X, snapshot.Y, ApplyDepthBias(snapshot.Z)), playerName);
+
+        if (hostProxy)
+            EnsureHitbox(localRenderer, onProxyDamage);
+        else
+            _hitbox?.Disarm();
 
         _target = new Vector3(snapshot.X, snapshot.Y, ApplyDepthBias(snapshot.Z));
         _velocity = new Vector3(snapshot.VelocityX, snapshot.VelocityY, 0f);
@@ -151,8 +160,20 @@ internal sealed class RemoteAvatar : IDisposable
     internal void ApplyRuntime(DiverRuntimeState state)
     {
         _isRemoteDead = state.IsDead;
+        if (_isRemoteDead)
+            _hitbox?.Disarm();
         ApplyTint();
     }
+
+    internal bool ArmProxy() =>
+        _hitbox != null && _gameObject != null && _gameObject.activeSelf &&
+        !_isRemoteDead && IsFresh(_timeSinceSnapshot, SnapshotFreshSeconds) &&
+        _hitbox.Arm();
+
+    internal void DisarmProxy() => _hitbox?.Disarm();
+
+    internal void SetProxyInvulnerable(bool invulnerable) =>
+        _hitbox?.SetInvulnerable(invulnerable);
 
     internal static bool TryCaptureRuntimeState(
         uint sceneId,
@@ -219,6 +240,7 @@ internal sealed class RemoteAvatar : IDisposable
         _timeSinceVisual += deltaTime;
         if (!IsFresh(_timeSinceSnapshot, SnapshotFreshSeconds))
         {
+            _hitbox?.Disarm();
             _gameObject.SetActive(false);
             _nameObject.SetActive(false);
             return;
@@ -263,6 +285,8 @@ internal sealed class RemoteAvatar : IDisposable
 
     internal void Clear()
     {
+        _hitbox?.Dispose();
+        _hitbox = null;
         if (_gameObject != null)
             UnityEngine.Object.Destroy(_gameObject);
         if (_nameObject != null)
@@ -409,6 +433,21 @@ internal sealed class RemoteAvatar : IDisposable
         var renderer = visual.AddComponent<SpriteRenderer>();
         renderer.color = CurrentTint;
         _visualRenderers.Add(new RemoteVisual { Renderer = renderer });
+    }
+
+    private void EnsureHitbox(
+        SpriteRenderer localRenderer,
+        Func<AttackData, DefenseData, bool> onProxyDamage)
+    {
+        if (_hitbox != null)
+        {
+            _hitbox.SetCallback(onProxyDamage);
+            return;
+        }
+
+        var localPlayer = localRenderer?.GetComponentInParent<PlayerCharacter>();
+        RemoteDiverHitbox.TryCreate(
+            _gameObject.transform, localPlayer, onProxyDamage, out _hitbox);
     }
 
     private Color CurrentTint => _isRemoteDead

@@ -22,6 +22,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxDatagramsPerUpdate = 128;
     private const int MaxReliableAttempts = 12;
     private const float ReliableExpirySeconds = 15f;
+    private const int MaxPendingDiverVitalResults = 256;
 
     private sealed class ReliableReceiveWindow
     {
@@ -114,6 +115,12 @@ internal sealed class UdpSession : IDisposable
     private bool _hasClientRuntimeState;
     private uint _lastHostRuntimeRevision;
     private uint _lastClientRuntimeRevision;
+    private readonly ConcurrentQueue<DiverVitalResult> _diverVitalResults = new();
+    private readonly Dictionary<uint, DiverVitalResult> _pendingWorldDiverVitalResults = new();
+    private readonly Dictionary<uint, DiverVitalResult> _pendingDiverVitalCommits = new();
+    private readonly HashSet<ulong> _deliveredDiverVitalEvents = new();
+    private readonly Queue<ulong> _deliveredDiverVitalEventOrder = new();
+    private uint _nextDiverVitalCommitRevision = 2;
     private readonly Queue<int> _projectileVisualOrder = new();
     private readonly Dictionary<int, ProjectileVisualState> _projectileVisualStates = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
@@ -249,6 +256,7 @@ internal sealed class UdpSession : IDisposable
         TestProjectileVisualQueueLimit();
         TestPlayerVisualCoalescing();
         TestDiverRuntimeCoalescing();
+        TestDiverVitalOrdering();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -309,6 +317,68 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Diver runtime coalescing self-test failed");
     }
 
+    private static void TestDiverVitalOrdering()
+    {
+        var session = new UdpSession(null);
+        static DiverVitalResult Result(uint commit, ulong eventId, uint stateRevision) =>
+            new(commit, eventId, DiverVitalCause.Damage, DiverVitalEdges.Damaged, 1f,
+                default(DiverRuntimeState) with
+                {
+                    Owner = DiverOwner.Client,
+                    Revision = stateRevision
+                });
+
+        session.EnqueueOrderedDiverVitalResult(Result(3, 3, 3));
+        session.EnqueueOrderedDiverVitalResult(Result(2, 2, 2));
+        if (!session.TryTakeDiverVitalResult(out var second) || second.CommitRevision != 2 ||
+            !session.TryTakeDiverVitalResult(out var third) || third.CommitRevision != 3)
+            throw new InvalidOperationException("Diver vital reorder self-test failed");
+
+        session.EnqueueOrderedDiverVitalResult(Result(4, 2, 4));
+        session.EnqueueOrderedDiverVitalResult(Result(5, 5, 5));
+        if (!session.TryTakeDiverVitalResult(out var fifth) || fifth.CommitRevision != 5 ||
+            session.TryTakeDiverVitalResult(out _))
+            throw new InvalidOperationException("Diver vital duplicate self-test failed");
+
+        session._lastClientRuntimeRevision = 6;
+        session.EnqueueOrderedDiverVitalResult(Result(6, 6, 6));
+        if (!session.TryTakeDiverVitalResult(out var sixth) || sixth.CommitRevision != 6)
+            throw new InvalidOperationException("Diver vital snapshot race self-test failed");
+
+        var queuedSnapshot = new UdpSession(null);
+        queuedSnapshot.EnqueueDiverRuntimeState(default(DiverRuntimeState) with
+        {
+            Owner = DiverOwner.Client,
+            Revision = 1
+        });
+        queuedSnapshot.EnqueueOrderedDiverVitalResult(Result(2, 8, 2));
+        if (queuedSnapshot.TryTakeDiverRuntimeState(out _) ||
+            !queuedSnapshot.TryTakeDiverVitalResult(out _))
+            throw new InvalidOperationException("Diver vital stale snapshot purge self-test failed");
+
+        var future = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Client,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 19,
+            _hasRemoteScene = true
+        };
+        var futureResult = Result(2, 7, 2) with
+        {
+            State = Result(2, 7, 2).State with { SceneId = 10, SceneEpoch = 20 }
+        };
+        future.ReceiveDiverVitalResult(100, futureResult);
+        if (future.TryTakeDiverVitalResult(out _) ||
+            future._pendingWorldDiverVitalResults.Count != 1)
+            throw new InvalidOperationException("Diver vital future-world buffering self-test failed");
+        future.SetRemoteWorld(10, 20);
+        if (!future.TryTakeDiverVitalResult(out var deliveredFuture) ||
+            deliveredFuture.EventId != 7 || future._pendingWorldDiverVitalResults.Count != 0)
+            throw new InvalidOperationException("Diver vital future-world delivery self-test failed");
+    }
+
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
@@ -333,6 +403,8 @@ internal sealed class UdpSession : IDisposable
         PrepareLocalWorldChange();
         _localSceneId = sceneId;
         _localSceneEpoch = _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
+        PrunePendingWorldDiverVitalResults(sceneId);
+        DrainPendingWorldDiverVitalResults();
         if (_connected)
             SendSceneState();
     }
@@ -364,6 +436,130 @@ internal sealed class UdpSession : IDisposable
     {
         if (_role == SessionRole.Host && MatchesLocalWorld(state.SceneId, state.SceneEpoch))
             Send(Protocol.EncodeDiverRuntimeState(++_sequence, state));
+    }
+
+    internal bool SendDiverVitalResult(DiverVitalResult result) =>
+        _role == SessionRole.Host &&
+        MatchesLocalWorld(result.State.SceneId, result.State.SceneEpoch) &&
+        SendReliable(Protocol.EncodeDiverVitalResult(++_sequence, result));
+
+    internal bool TryTakeDiverVitalResult(out DiverVitalResult result) =>
+        _diverVitalResults.TryDequeue(out result);
+
+    private void ReceiveDiverVitalResult(uint sequence, DiverVitalResult result)
+    {
+        if (!MatchesRemoteWorld(result.State.SceneId, result.State.SceneEpoch))
+        {
+            if (_pendingWorldDiverVitalResults.ContainsKey(sequence))
+            {
+                AcceptReliable(sequence);
+                return;
+            }
+            if (_pendingWorldDiverVitalResults.Count >= MaxPendingDiverVitalResults)
+                return;
+            if (AcceptReliable(sequence))
+                _pendingWorldDiverVitalResults[sequence] = result;
+            return;
+        }
+        if (!DiverVitalCommitWithinWindow(result.CommitRevision))
+        {
+            FailReliableDelivery("diver vital commit gap exceeds receive window");
+            return;
+        }
+        if (AcceptReliable(sequence))
+            EnqueueOrderedDiverVitalResult(result);
+    }
+
+    private void EnqueueOrderedDiverVitalResult(DiverVitalResult result)
+    {
+        if (!DiverVitalCommitWithinWindow(result.CommitRevision))
+        {
+            FailReliableDelivery("diver vital commit gap exceeds receive window");
+            return;
+        }
+        if (result.CommitRevision == _nextDiverVitalCommitRevision)
+        {
+            DeliverDiverVitalResult(result);
+            while (_pendingDiverVitalCommits.Remove(
+                       _nextDiverVitalCommitRevision, out var pending))
+                DeliverDiverVitalResult(pending);
+            return;
+        }
+
+        var distance = unchecked(result.CommitRevision - _nextDiverVitalCommitRevision);
+        if (IsNewer(result.CommitRevision, _nextDiverVitalCommitRevision) &&
+            distance <= MaxPendingDiverVitalResults)
+            _pendingDiverVitalCommits.TryAdd(result.CommitRevision, result);
+    }
+
+    private void DeliverDiverVitalResult(DiverVitalResult result)
+    {
+        _nextDiverVitalCommitRevision = NextRevision(_nextDiverVitalCommitRevision);
+        if (result.State.Revision != _lastClientRuntimeRevision &&
+            !IsNewer(result.State.Revision, _lastClientRuntimeRevision))
+            return;
+        if (!_deliveredDiverVitalEvents.Add(result.EventId))
+            return;
+
+        _deliveredDiverVitalEventOrder.Enqueue(result.EventId);
+        if (_deliveredDiverVitalEventOrder.Count > MaxPendingDiverVitalResults)
+            _deliveredDiverVitalEvents.Remove(_deliveredDiverVitalEventOrder.Dequeue());
+        if (IsNewer(result.State.Revision, _lastClientRuntimeRevision))
+            _lastClientRuntimeRevision = result.State.Revision;
+        if (_hasClientRuntimeState &&
+            !IsNewer(_latestClientRuntimeState.Revision, result.State.Revision))
+        {
+            _latestClientRuntimeState = default;
+            _hasClientRuntimeState = false;
+        }
+        _diverVitalResults.Enqueue(result);
+    }
+
+    private bool DiverVitalCommitWithinWindow(uint commitRevision)
+    {
+        if (commitRevision == _nextDiverVitalCommitRevision ||
+            !IsNewer(commitRevision, _nextDiverVitalCommitRevision))
+            return true;
+        return unchecked(commitRevision - _nextDiverVitalCommitRevision) <=
+            MaxPendingDiverVitalResults;
+    }
+
+    private void DrainPendingWorldDiverVitalResults()
+    {
+        if (_pendingWorldDiverVitalResults.Count == 0)
+            return;
+        var ready = new List<uint>();
+        foreach (var pair in _pendingWorldDiverVitalResults)
+            if (MatchesRemoteWorld(pair.Value.State.SceneId, pair.Value.State.SceneEpoch))
+                ready.Add(pair.Key);
+        foreach (var sequence in ready)
+            if (_pendingWorldDiverVitalResults.Remove(sequence, out var result))
+                EnqueueOrderedDiverVitalResult(result);
+    }
+
+    private void PrunePendingWorldDiverVitalResults(uint localSceneId)
+    {
+        var stale = new List<uint>();
+        foreach (var pair in _pendingWorldDiverVitalResults)
+            if (pair.Value.State.SceneId != localSceneId ||
+                _hasRemoteScene && pair.Value.State.SceneId == _remoteSceneId &&
+                IsNewer(_remoteSceneEpoch, pair.Value.State.SceneEpoch))
+                stale.Add(pair.Key);
+        foreach (var sequence in stale)
+            _pendingWorldDiverVitalResults.Remove(sequence);
+    }
+
+    private void ResetDiverVitalReceiveState(bool clearPendingWorld)
+    {
+        while (_diverVitalResults.TryDequeue(out _))
+        {
+        }
+        _pendingDiverVitalCommits.Clear();
+        _deliveredDiverVitalEvents.Clear();
+        _deliveredDiverVitalEventOrder.Clear();
+        _nextDiverVitalCommitRevision = 2;
+        if (clearPendingWorld)
+            _pendingWorldDiverVitalResults.Clear();
     }
 
     internal bool TryTakeDiverRuntimeState(out DiverRuntimeState state)
@@ -1146,6 +1342,17 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.DiverVitalResult)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiverVitalResult(received.Buffer, out _, out var result))
+            {
+                _lastReceive = now;
+                ReceiveDiverVitalResult(sequence, result);
+            }
+            return;
+        }
+
         if (type == PacketType.ProjectileVisualState)
         {
             if (_connected && Protocol.TryDecodeProjectileVisualState(received.Buffer, out _, out var state) &&
@@ -1851,6 +2058,8 @@ internal sealed class UdpSession : IDisposable
         _remoteSceneId = sceneId;
         _remoteSceneEpoch = sceneEpoch;
         _hasRemoteScene = true;
+        PrunePendingWorldDiverVitalResults(_localSceneId);
+        DrainPendingWorldDiverVitalResults();
     }
 
     private void ClearRemoteWorldState()
@@ -1867,6 +2076,7 @@ internal sealed class UdpSession : IDisposable
         _hasClientRuntimeState = false;
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
+        ResetDiverVitalReceiveState(false);
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         _lastVisualSequence = 0;
@@ -2050,6 +2260,9 @@ internal sealed class UdpSession : IDisposable
     private static bool IsNewer(uint sequence, uint previous) =>
         unchecked((int)(sequence - previous)) > 0;
 
+    private static uint NextRevision(uint revision) =>
+        revision == uint.MaxValue ? 1 : revision + 1;
+
     private static bool ShouldAcceptIncoming(int queued) => queued < MaxIncomingDatagrams;
 
     private static int DatagramsToProcess(int queued) =>
@@ -2135,6 +2348,7 @@ internal sealed class UdpSession : IDisposable
         _hasClientRuntimeState = false;
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
+        ResetDiverVitalReceiveState(true);
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         while (_fishDamageRequests.TryDequeue(out _))

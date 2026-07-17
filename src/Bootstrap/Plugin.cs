@@ -27,6 +27,7 @@ public sealed class Plugin : BasePlugin
         MultiplayerSaveSync.SelfTest();
         FishReplicator.SelfTest();
         DiveCoordinator.SelfTest();
+        DiverRuntimeAuthority.SelfTest();
         SceneReplicator.SelfTest();
         FishSpawnSeedCoordinator.SelfTest();
         HostAuthorityPolicy.SelfTest();
