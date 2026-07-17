@@ -54,6 +54,8 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
     private const int MaxPendingDiveResultEntries = 256;
+    private const int MaxPendingMissionStates = 256;
+    private const int MaxPendingMissionRosters = 256;
     private const int MaxFishHookPoses = 128;
 
     private sealed class ReliableReceiveWindow
@@ -351,6 +353,8 @@ internal sealed class UdpSession : IDisposable
         TestRoomStateQueueOverflow();
         TestIngredientsDeltaQueueOverflow();
         TestDiveResultEntryQueueOverflow();
+        TestMissionStateQueueOverflow();
+        TestMissionRosterQueueOverflow();
         TestDiveReadyQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
@@ -1039,6 +1043,36 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._diveResultEntries.IsEmpty ||
             session._peerLostReason != "dive result entry receive queue overflow")
             throw new InvalidOperationException("Dive result entry queue overflow self-test failed");
+    }
+
+    private static void TestMissionStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingMissionStates; index++)
+            session._missionStates.Enqueue(default);
+        session.QueueMissionState(default);
+        if (session._connected || !session._missionStates.IsEmpty ||
+            session._peerLostReason != "mission state receive queue overflow")
+            throw new InvalidOperationException("Mission state queue overflow self-test failed");
+    }
+
+    private static void TestMissionRosterQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingMissionRosters; index++)
+            session._missionRosters.Enqueue(default);
+        session.QueueMissionRoster(default);
+        if (session._connected || !session._missionRosters.IsEmpty ||
+            session._peerLostReason != "mission roster receive queue overflow")
+            throw new InvalidOperationException("Mission roster queue overflow self-test failed");
     }
 
     private static void TestTravelReadyQueueOverflow()
@@ -3001,7 +3035,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _missionStates.Enqueue(state);
+                    QueueMissionState(state);
             }
             return;
         }
@@ -3013,7 +3047,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _missionRosters.Enqueue(roster);
+                    QueueMissionRoster(roster);
             }
             return;
         }
@@ -3768,6 +3802,26 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("dive result entry receive queue overflow");
+    }
+
+    private void QueueMissionState(MissionState state)
+    {
+        if (HasDecodedQueueCapacity(_missionStates.Count, MaxPendingMissionStates))
+        {
+            _missionStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("mission state receive queue overflow");
+    }
+
+    private void QueueMissionRoster(MissionRoster roster)
+    {
+        if (HasDecodedQueueCapacity(_missionRosters.Count, MaxPendingMissionRosters))
+        {
+            _missionRosters.Enqueue(roster);
+            return;
+        }
+        FailReliableDelivery("mission roster receive queue overflow");
     }
 
     private void QueueTravelReady(TravelReady ready)
