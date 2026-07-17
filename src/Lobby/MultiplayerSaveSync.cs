@@ -325,6 +325,7 @@ internal static class MultiplayerSaveSync
                         {
                             fullFingerprint = FullFingerprint(_hostSnapshot);
                             pending.TargetFingerprint = fullFingerprint;
+                            WriteAtomicText(MpSlotPendingPath, JsonSerializer.Serialize(pending));
                         }
                         return slotVerified;
                     },
