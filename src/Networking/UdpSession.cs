@@ -22,6 +22,8 @@ internal sealed class UdpSession : IDisposable
     private const int MaxDatagramsPerUpdate = 128;
     private const int MaxReliableAttempts = 12;
     private const float ReliableExpirySeconds = 15f;
+    private const int MaxReliableBacklog = 2048;
+    private const int ReliableReceiveWindowSize = 1024;
     private const int ReservedReliableControlSlots = 16;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
@@ -67,7 +69,7 @@ internal sealed class UdpSession : IDisposable
 
     private sealed class ReliableReceiveWindow
     {
-        private const int Size = 1024;
+        private const int Size = ReliableReceiveWindowSize;
         private readonly ulong[] _seen = new ulong[Size / 64];
         private uint _newest;
         private bool _hasNewest;
@@ -221,6 +223,7 @@ internal sealed class UdpSession : IDisposable
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
     private readonly Queue<QueuedReliable> _reliableBacklog = new();
+    private readonly Queue<QueuedReliable> _reliableBulkBacklog = new();
     private readonly ReliableReceiveWindow _receivedReliable = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -339,6 +342,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
         TestBulkReliableControlReserve();
+        TestReliableBacklogPriority();
         TestSaveTransferControlReserve();
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
@@ -575,6 +579,38 @@ internal sealed class UdpSession : IDisposable
         session._reliableBacklog.Enqueue(new QueuedReliable());
         if (session.ReliableBulkCapacityRemaining != 0)
             throw new InvalidOperationException("Reliable bulk reserve backlog self-test failed");
+    }
+
+    private static void TestReliableBacklogPriority()
+    {
+        var session = new UdpSession(null);
+        var bulkFirst = new QueuedReliable { Packet = Protocol.Encode(PacketType.SaveSnapshotChunk, 10) };
+        var bulkSecond = new QueuedReliable { Packet = Protocol.Encode(PacketType.IngredientsSnapshotChunk, 11) };
+        var controlFirst = new QueuedReliable { Packet = Protocol.Encode(PacketType.RoomState, 12) };
+        var controlSecond = new QueuedReliable { Packet = Protocol.Encode(PacketType.DiveReady, 13) };
+        session._reliableBulkBacklog.Enqueue(bulkFirst);
+        session._reliableBulkBacklog.Enqueue(bulkSecond);
+        session._reliableBacklog.Enqueue(controlFirst);
+        session._reliableBacklog.Enqueue(controlSecond);
+        if (!session.TryTakeReliableBacklog(out var queued) || !ReferenceEquals(queued, controlFirst) ||
+            !session.TryTakeReliableBacklog(out queued) || !ReferenceEquals(queued, controlSecond) ||
+            !session.TryTakeReliableBacklog(out queued) || !ReferenceEquals(queued, bulkFirst) ||
+            !session.TryTakeReliableBacklog(out queued) || !ReferenceEquals(queued, bulkSecond))
+            throw new InvalidOperationException("Reliable backlog priority self-test failed");
+
+        session._reliableBulkBacklog.Enqueue(new QueuedReliable
+        {
+            Packet = Protocol.Encode(PacketType.SaveSnapshotChunk, 1)
+        });
+        var delayedControl = new QueuedReliable
+        {
+            Packet = Protocol.Encode(PacketType.RoomState, 1u + ReliableReceiveWindowSize)
+        };
+        session._reliableBacklog.Enqueue(delayedControl);
+        if (!session.TryTakeReliableBacklog(out queued) ||
+            !Protocol.TryDecode(queued.Packet, out _, out var sequence) || sequence != 1 ||
+            !session.TryTakeReliableBacklog(out queued) || !ReferenceEquals(queued, delayedControl))
+            throw new InvalidOperationException("Reliable backlog sequence lead self-test failed");
     }
 
     private static void TestSaveTransferControlReserve()
@@ -1364,7 +1400,7 @@ internal sealed class UdpSession : IDisposable
         _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
     internal uint RemoteSceneEpoch => _remoteSceneEpoch;
     internal ulong ConnectionId => _connected ? _sessionId : 0;
-    internal int ReliableCapacityRemaining => _reliableBacklog.Count == 0
+    internal int ReliableCapacityRemaining => ReliableBacklogCount == 0
         ? Math.Max(0, 256 - _pendingReliable.Count)
         : 0;
     internal int ReliableBulkCapacityRemaining =>
@@ -2496,7 +2532,7 @@ internal sealed class UdpSession : IDisposable
             _log.LogDebug(
                 $"Network traffic: tx={_sentBytes / 10f:F0} B/s ({_sentPackets / 10f:F1} pps), " +
                 $"rx={_receivedBytes / 10f:F0} B/s ({_receivedPackets / 10f:F1} pps), " +
-                $"reliable={_pendingReliable.Count}, backlog={_reliableBacklog.Count}, " +
+                $"reliable={_pendingReliable.Count}, backlog={ReliableBacklogCount}, " +
                 $"raw={Volatile.Read(ref _incomingCount)}, drops={Interlocked.Exchange(ref _incomingDropped, 0)}, " +
                 $"capHits={Interlocked.Exchange(ref _incomingCapHits, 0)}, " +
                 $"retries={Interlocked.Exchange(ref _reliableRetries, 0)}, " +
@@ -3602,16 +3638,16 @@ internal sealed class UdpSession : IDisposable
 
     private bool SendReliable(byte[] packet)
     {
-        if (!Protocol.TryDecode(packet, out _, out var sequence))
+        if (!Protocol.TryDecode(packet, out var type, out var sequence))
             return false;
-        if (_reliableBacklog.Count > 0 || _pendingReliable.Count >= 256)
+        if (ReliableBacklogCount > 0 || _pendingReliable.Count >= 256)
         {
-            if (_reliableBacklog.Count >= 2048)
+            if (ReliableBacklogCount >= MaxReliableBacklog)
             {
                 _log.LogWarning("Network reliable backlog is full");
                 return false;
             }
-            _reliableBacklog.Enqueue(new QueuedReliable
+            (IsBulkReliablePacket(type) ? _reliableBulkBacklog : _reliableBacklog).Enqueue(new QueuedReliable
             {
                 Packet = packet,
                 EnqueuedAt = _now
@@ -3625,18 +3661,45 @@ internal sealed class UdpSession : IDisposable
     private void FlushReliableBacklog()
     {
         while (_connected && _pendingReliable.Count < 256 &&
-               _reliableBacklog.Count > 0)
+               TryTakeReliableBacklog(out var queued))
         {
-            var queued = _reliableBacklog.Peek();
             if (ShouldExpireQueuedReliable(queued.EnqueuedAt, _now))
             {
                 FailReliableDelivery("reliable backlog expired");
                 return;
             }
-            _reliableBacklog.Dequeue();
             if (Protocol.TryDecode(queued.Packet, out _, out var sequence))
                 TrackReliable(queued.Packet, sequence);
         }
+    }
+
+    private int ReliableBacklogCount => _reliableBacklog.Count + _reliableBulkBacklog.Count;
+
+    private bool TryTakeReliableBacklog(out QueuedReliable queued)
+    {
+        if (_reliableBacklog.Count == 0)
+            return _reliableBulkBacklog.TryDequeue(out queued);
+        if (_reliableBulkBacklog.Count == 0 ||
+            ShouldPrioritizeReliableControl(_reliableBacklog.Peek(), _reliableBulkBacklog.Peek()))
+        {
+            queued = _reliableBacklog.Dequeue();
+            return true;
+        }
+        queued = _reliableBulkBacklog.Dequeue();
+        return true;
+    }
+
+    private static bool IsBulkReliablePacket(PacketType type) =>
+        type is PacketType.SaveSnapshotChunk or PacketType.IngredientsSnapshotChunk;
+
+    private static bool ShouldPrioritizeReliableControl(
+        QueuedReliable control, QueuedReliable bulk)
+    {
+        if (!Protocol.TryDecode(control.Packet, out _, out var controlSequence) ||
+            !Protocol.TryDecode(bulk.Packet, out _, out var bulkSequence) ||
+            !IsNewer(controlSequence, bulkSequence))
+            return true;
+        return unchecked(controlSequence - bulkSequence) < ReliableReceiveWindowSize;
     }
 
     private void TrackReliable(byte[] packet, uint sequence)
@@ -4269,6 +4332,7 @@ internal sealed class UdpSession : IDisposable
         Interlocked.Exchange(ref _visualStatesCoalesced, 0);
         _pendingReliable.Clear();
         _reliableBacklog.Clear();
+        _reliableBulkBacklog.Clear();
         _receivedReliable.Clear();
         while (_roomReady.TryDequeue(out _))
         {
