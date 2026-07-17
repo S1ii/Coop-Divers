@@ -24,6 +24,7 @@ internal sealed class UdpSession : IDisposable
     private const float ReliableExpirySeconds = 15f;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
+    private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
@@ -301,6 +302,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverWeaponOrdering();
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
+        TestFishLifecycleQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
@@ -361,6 +363,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._saveSnapshotAcks.IsEmpty ||
             session._peerLostReason != "save snapshot acknowledgement receive queue overflow")
             throw new InvalidOperationException("Save snapshot acknowledgement overflow self-test failed");
+    }
+
+    private static void TestFishLifecycleQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishLifecycles; index++)
+            session._fishLifecycles.Enqueue(default);
+        session.QueueFishLifecycle(default);
+        if (session._connected || !session._fishLifecycles.IsEmpty ||
+            session._peerLostReason != "fish lifecycle receive queue overflow")
+            throw new InvalidOperationException("Fish lifecycle queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -2144,7 +2161,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && state.SceneId == _remoteSceneId &&
                     state.SceneEpoch == _remoteSceneEpoch)
-                    _fishLifecycles.Enqueue(state);
+                    QueueFishLifecycle(state);
             }
             return;
         }
@@ -3096,6 +3113,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish action request receive queue overflow");
+    }
+
+    private void QueueFishLifecycle(FishLifecycle state)
+    {
+        if (HasDecodedQueueCapacity(_fishLifecycles.Count, MaxPendingFishLifecycles))
+        {
+            _fishLifecycles.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("fish lifecycle receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
