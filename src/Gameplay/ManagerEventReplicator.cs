@@ -1525,6 +1525,9 @@ internal sealed class ManagerEventReplicator
     {
         if (state.Revision != 0)
             return;
+        if (state.SceneId == 0 ? state.SceneEpoch != 0 :
+            state.SceneEpoch != session.LocalSceneEpoch)
+            return;
         var domain = (ManagerDomain)state.Domain;
         if (domain == ManagerDomain.Progression &&
             (ManagerAction)state.Action == ManagerAction.Wallet)
@@ -1541,7 +1544,8 @@ internal sealed class ManagerEventReplicator
         }
         if ((domain is ManagerDomain.SushiMenu or ManagerDomain.SushiTable or
                 ManagerDomain.SushiWasabi) &&
-            state.SceneId == _sceneId && state.SceneId != 0 && session.SceneMatches(_sceneId))
+            state.SceneId == _sceneId && state.SceneId != 0 &&
+            state.SceneEpoch == session.LocalSceneEpoch && session.SceneMatches(_sceneId))
         {
             ApplySushiClientRequest(session, state);
             return;
@@ -1560,9 +1564,12 @@ internal sealed class ManagerEventReplicator
             var revision = GetRevision(_clientManagerRevisions, pair.Key);
             ApplyPendingLane(pair.Value, ref revision, state =>
             {
-                if (state.SceneId == 0 || state.SceneId == sceneId)
+                if (state.SceneId == 0)
+                    return state.SceneEpoch == 0 ? Apply(state) : true;
+                if (state.SceneId == sceneId && state.SceneEpoch == session.RemoteSceneEpoch)
                     return Apply(state);
-                return !session.SceneMatches(state.SceneId);
+                return state.SceneEpoch != session.RemoteSceneEpoch ||
+                    !session.SceneMatches(state.SceneId);
             });
             _clientManagerRevisions[pair.Key] = revision;
         }

@@ -25,12 +25,14 @@ public sealed class Plugin : BasePlugin
         LobbyInput.SelfTest();
         TitleOnlineMenu.SelfTest();
         MultiplayerSaveSync.SelfTest();
+        WorldObjectId.SelfTest();
         FishReplicator.SelfTest();
         DiveCoordinator.SelfTest();
         DiverRuntimeAuthority.SelfTest();
         DiverWeaponAuthority.SelfTest();
         DiverWeaponReplicator.SelfTest();
         SceneReplicator.SelfTest();
+        LoadedGameplaySceneTracker.SelfTest();
         FishSpawnSeedCoordinator.SelfTest();
         HostAuthorityPolicy.SelfTest();
         MissionProgressReplicator.SelfTest();

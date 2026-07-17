@@ -165,7 +165,7 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            _hostBosses[WorldObjectId.For(sceneId, boss, boss.fishID)] = boss;
+            _hostBosses[WorldObjectId.For(boss, boss.fishID)] = boss;
         }
     }
 
@@ -176,7 +176,7 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            var id = WorldObjectId.For(sceneId, boss, boss.fishID);
+            var id = WorldObjectId.For(boss, boss.fishID);
             if (_clientTargets.ContainsKey(id))
                 continue;
             _clientTargets[id] = new ClientTarget

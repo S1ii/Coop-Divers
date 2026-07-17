@@ -1577,7 +1577,7 @@ internal sealed class FishReplicator
             var fishDataTID = fish.FishDataTID;
             if (fishDataTID <= 0)
                 continue;
-            var uid = GetNetworkAllocatorUid(sceneId, allocator);
+            var uid = GetNetworkAllocatorUid(allocator);
             var active = fish.gameObject.activeInHierarchy;
 
             if (!_hostIdsByFish.TryGetValue(fish, out var id))
@@ -3779,7 +3779,7 @@ internal sealed class FishReplicator
         {
             if (allocator == null)
                 continue;
-            var uid = GetNetworkAllocatorUid(_appliedClientSceneId, allocator);
+            var uid = GetNetworkAllocatorUid(allocator);
             if (!ShouldSuppressAllocator(uid, represented))
                 continue;
             var fishs = allocator.GetInstancedFishs;
@@ -3833,7 +3833,7 @@ internal sealed class FishReplicator
         {
             if (allocator == null)
                 continue;
-            var uid = GetNetworkAllocatorUid(sceneId, allocator);
+            var uid = GetNetworkAllocatorUid(allocator);
             if (string.IsNullOrEmpty(uid))
                 continue;
             _clientAllocatorByUidScratch.TryAdd(uid, allocator);
@@ -4131,7 +4131,7 @@ internal sealed class FishReplicator
         return _nextHostId++;
     }
 
-    private static string GetNetworkAllocatorUid(uint sceneId, FishAllocator allocator)
+    private static string GetNetworkAllocatorUid(FishAllocator allocator)
     {
         try
         {
@@ -4142,7 +4142,7 @@ internal sealed class FishReplicator
         catch
         {
         }
-        return $"A{WorldObjectId.For(sceneId, allocator):X8}";
+        return $"A{WorldObjectId.For(allocator):X8}";
     }
 
     private static bool AllocatorUidMatches(string expected, string actual) =>

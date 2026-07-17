@@ -269,6 +269,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
         TestCargoEpochGate();
+        TestManagerEventEpochGate();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -469,6 +470,30 @@ internal sealed class UdpSession : IDisposable
         session.ClearRemoteWorldState();
         if (session.TryTakeCargoState(out _))
             throw new InvalidOperationException("Cargo state survived a world reset");
+    }
+
+    private static void TestManagerEventEpochGate()
+    {
+        var session = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Client,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 20,
+            _hasRemoteScene = true
+        };
+        var current = new ManagerEvent(1, 10, 1, 8, 72, 1, 0, SceneEpoch: 20);
+        var stale = current with { SceneEpoch = 19 };
+        var global = new ManagerEvent(1, 0, 1, 3, 4, 1, 0);
+        if (!session.ShouldQueueManagerEvent(current) || session.ShouldQueueManagerEvent(stale) ||
+            !session.ShouldQueueManagerEvent(global))
+            throw new InvalidOperationException("Manager event scene epoch gate self-test failed");
+        session._managerEvents.Enqueue(stale);
+        session._managerEvents.Enqueue(current);
+        if (!session.TryTakeManagerEvent(out var delivered) || delivered != current ||
+            session.TryTakeManagerEvent(out _))
+            throw new InvalidOperationException("Manager event stale queue self-test failed");
     }
 
     internal bool Connected => _connected;
@@ -1311,11 +1336,36 @@ internal sealed class UdpSession : IDisposable
 
     internal bool SendManagerEvent(ManagerEvent state)
     {
-        return _connected && SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
+        if (!_connected)
+            return false;
+        if (state.SceneId == 0)
+            return state.SceneEpoch == 0 &&
+                SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
+        state = state with
+        {
+            SceneEpoch = _role == SessionRole.Host ? _localSceneEpoch : _remoteSceneEpoch
+        };
+        return (_role == SessionRole.Host
+                ? MatchesLocalWorld(state.SceneId, state.SceneEpoch)
+                : MatchesRemoteWorld(state.SceneId, state.SceneEpoch)) &&
+            SendReliable(Protocol.EncodeManagerEvent(++_sequence, state));
     }
 
-    internal bool TryTakeManagerEvent(out ManagerEvent state) =>
-        _managerEvents.TryDequeue(out state);
+    internal bool TryTakeManagerEvent(out ManagerEvent state)
+    {
+        while (_managerEvents.TryDequeue(out state))
+            if (ShouldQueueManagerEvent(state))
+                return true;
+        state = default;
+        return false;
+    }
+
+    private bool ShouldQueueManagerEvent(ManagerEvent state) =>
+        state.SceneId == 0
+            ? state.SceneEpoch == 0
+            : _role == SessionRole.Host
+                ? MatchesLocalWorld(state.SceneId, state.SceneEpoch)
+                : MatchesRemoteWorld(state.SceneId, state.SceneEpoch);
 
     internal void SendSushiResultState(SushiResultState state)
     {
@@ -2207,7 +2257,7 @@ internal sealed class UdpSession : IDisposable
                  _role == SessionRole.Client && state.Revision != 0))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) && ShouldQueueManagerEvent(state))
                     _managerEvents.Enqueue(state);
             }
             return;

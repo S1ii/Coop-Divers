@@ -621,7 +621,8 @@ internal readonly record struct ManagerEvent(
     byte Action,
     int Value,
     int Context,
-    ManagerInvocationDescriptor? Invocation = null);
+    ManagerInvocationDescriptor? Invocation = null,
+    uint SceneEpoch = 0);
 internal readonly record struct SushiResultState(
     uint Revision,
     int SalesMenu,
@@ -633,7 +634,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 46;
+    private const byte Version = 47;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -651,7 +652,7 @@ internal static class Protocol
     private const int FishDamageRequestSize = HeaderSize + 28;
     private const int BossDamageRequestSize = HeaderSize + 24;
     private const int BossStateSize = HeaderSize + 49;
-    private const int ManagerEventSize = HeaderSize + 22;
+    private const int ManagerEventSize = HeaderSize + 26;
     private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 16;
     private const int FishPickupResultSize = HeaderSize + 17;
@@ -1621,11 +1622,12 @@ internal static class Protocol
         WriteHeader(packet, PacketType.ManagerEvent, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.HostTick);
-        packet[HeaderSize + 12] = state.Domain;
-        packet[HeaderSize + 13] = state.Action;
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), state.Value);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 18), state.Context);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.HostTick);
+        packet[HeaderSize + 16] = state.Domain;
+        packet[HeaderSize + 17] = state.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 18), state.Value);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 22), state.Context);
         if (state.Invocation is { } descriptor)
             WriteManagerInvocation(packet.AsSpan(ManagerEventSize), descriptor);
         return packet;
@@ -1644,11 +1646,12 @@ internal static class Protocol
         var candidate = new ManagerEvent(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
-            packet[HeaderSize + 12],
-            packet[HeaderSize + 13],
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 18)));
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            packet[HeaderSize + 16],
+            packet[HeaderSize + 17],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 18)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 22)),
+            SceneEpoch: BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)));
         if (!IsValidManagerEvent(candidate))
             return false;
         if (packet.Length == ManagerEventSize)
@@ -1931,7 +1934,8 @@ internal static class Protocol
         };
         if (!pairIsValid)
             return false;
-        if (state.Domain is 3 or 16 && state.SceneId != 0)
+        if ((state.SceneId == 0) != (state.SceneEpoch == 0) ||
+            state.Domain is 3 or 16 && state.SceneId != 0)
             return false;
         if (state.Action is 32 or 35 && (state.Value == 0 || state.Context != 0) ||
             state.Action is 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
@@ -4381,16 +4385,16 @@ internal static class Protocol
         if (!TryDecodeManagerEvent(managerEventPacket, out sequence, out var managerEvent) ||
             sequence != 47 || managerEvent != expectedManagerEvent)
             throw new InvalidOperationException("Manager event round-trip failed");
-        managerEventPacket[HeaderSize + 12] = 0;
+        managerEventPacket[HeaderSize + 16] = 0;
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid manager domain");
         managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
-        managerEventPacket[HeaderSize + 13] = 32;
+        managerEventPacket[HeaderSize + 17] = 32;
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid manager action");
         managerEventPacket = EncodeManagerEvent(47,
             new ManagerEvent(3, fishSceneId, 1234, 15, 27, 1,
-                unchecked((int)0x7fc00000)));
+                unchecked((int)0x7fc00000), SceneEpoch: 7));
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid race time");
         var sessionEvents = new[]
@@ -4416,7 +4420,7 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted scene-bound dialogue state");
         managerEventPacket = EncodeManagerEvent(60,
             new ManagerEvent(10, 0, 1241, 3, 37, 23456, 1));
-        BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 14), 0);
+        BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 18), 0);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted identity-free dialogue finish");
         var progressionEvents = new[]
@@ -4435,13 +4439,14 @@ internal static class Protocol
         }
         var sushiActionEvents = new[]
         {
-            new ManagerEvent(0, fishSceneId, 1247, 8, 71, 0, 0),
-            new ManagerEvent(15, fishSceneId, 1248, 8, 72, 1011001, (1 << 16) | 7),
-            new ManagerEvent(0, fishSceneId, 1249, 8, 73, 0, (1 << 16) | 7),
-            new ManagerEvent(16, fishSceneId, 1250, 8, 74, 1, (1 << 16) | 7),
-            new ManagerEvent(0, fishSceneId, 1251, 10, 75, 100, 7),
-            new ManagerEvent(16, fishSceneId, 1252, 10, 76, 100, 7),
-            new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5)
+            new ManagerEvent(0, fishSceneId, 1247, 8, 71, 0, 0, SceneEpoch: 7),
+            new ManagerEvent(15, fishSceneId, 1248, 8, 72, 1011001, (1 << 16) | 7,
+                SceneEpoch: 7),
+            new ManagerEvent(0, fishSceneId, 1249, 8, 73, 0, (1 << 16) | 7, SceneEpoch: 7),
+            new ManagerEvent(16, fishSceneId, 1250, 8, 74, 1, (1 << 16) | 7, SceneEpoch: 7),
+            new ManagerEvent(0, fishSceneId, 1251, 10, 75, 100, 7, SceneEpoch: 7),
+            new ManagerEvent(16, fishSceneId, 1252, 10, 76, 100, 7, SceneEpoch: 7),
+            new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5, SceneEpoch: 7)
         };
         foreach (var sushiActionEvent in sushiActionEvents)
         {
@@ -4450,6 +4455,13 @@ internal static class Protocol
                 managerEvent != sushiActionEvent)
                 throw new InvalidOperationException("Sushi action event round-trip failed");
         }
+        BinaryPrimitives.WriteUInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 8), 0);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted manager event without scene epoch");
+        managerEventPacket = EncodeManagerEvent(47, expectedManagerEvent);
+        BinaryPrimitives.WriteUInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 8), 7);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted global manager event with scene epoch");
 
         var scenarioBundle = "z";
         var scenarioKey = unchecked((int)SceneId(scenarioBundle));
@@ -4474,12 +4486,12 @@ internal static class Protocol
         managerEventPacket.CopyTo(trailingManagerEventPacket, 0);
         if (TryDecodeManagerEvent(trailingManagerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted trailing manager invocation data");
-        managerEventPacket[HeaderSize + 13] = 35;
+        managerEventPacket[HeaderSize + 17] = 35;
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted mismatched manager invocation action");
         managerEventPacket = EncodeManagerEvent(61, describedScenario);
         BinaryPrimitives.WriteInt32LittleEndian(
-            managerEventPacket.AsSpan(HeaderSize + 14), scenarioKey + 1);
+            managerEventPacket.AsSpan(HeaderSize + 18), scenarioKey + 1);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted mismatched invocation content hash");
         managerEventPacket = EncodeManagerEvent(61, describedScenario);
@@ -4541,7 +4553,7 @@ internal static class Protocol
             false, false, false, false, true, 1.25f, -2.5f, 3.75f);
         managerEventPacket = EncodeManagerEvent(66,
             new ManagerEvent(17, fishSceneId, 1248, 13, 24, 71,
-                2, timelineInvocation));
+                2, timelineInvocation, 7));
         if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
             managerEvent.Invocation is not { } decodedTimeline ||
             decodedTimeline.Kind != ManagerInvocationKind.TimelineByTid ||

@@ -152,7 +152,7 @@ internal sealed class PickupReplicator
         if (item == null || session == null || !session.SceneMatches(sceneId))
             return false;
         var itemId = ItemId(item);
-        var worldId = WorldId(sceneId, item);
+        var worldId = WorldId(item);
         if (itemId <= 0 || worldId == 0 || _clientPendingByWorld.ContainsKey(worldId))
             return false;
         _nextRequestId = _nextRequestId == ulong.MaxValue ? 1 : _nextRequestId + 1;
@@ -180,7 +180,7 @@ internal sealed class PickupReplicator
         var itemId = ItemId(item);
         if (itemId <= 0)
             return;
-        var worldId = WorldId(sceneId, item);
+        var worldId = WorldId(item);
         if (_applyingRemoteRemovals.Contains(worldId))
             return;
         _items.Remove(worldId);
@@ -222,7 +222,7 @@ internal sealed class PickupReplicator
                 continue;
             if (ItemId(item) <= 0)
                 continue;
-            var worldId = WorldId(sceneId, item);
+            var worldId = WorldId(item);
             if (!_items.TryAdd(worldId, item))
                 duplicates.Add(worldId);
         }
@@ -441,8 +441,8 @@ internal sealed class PickupReplicator
         result.SceneEpoch == request.SceneEpoch && result.WorldId == request.WorldId &&
         result.ItemId == request.ItemId && result.Revision == request.KnownRevision;
 
-    internal static uint WorldId(uint sceneId, PickupInstanceItem item)
-        => WorldObjectId.For(sceneId, item, ItemId(item));
+    internal static uint WorldId(PickupInstanceItem item) =>
+        WorldObjectId.For(item, ItemId(item));
 
     private static int ItemId(PickupInstanceItem item)
     {

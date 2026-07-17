@@ -5,8 +5,10 @@ using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
 using DR.AI;
 using HarmonyLib;
+using Il2CppInterop.Runtime;
 using Steamworks;
 using UnityEngine;
+using UnityEngine.Events;
 using UnityEngine.SceneManagement;
 
 namespace DaveTheDiverMP;
@@ -58,6 +60,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private DiverWeaponReplicator _diverWeaponReplicator;
     private RemoteCatchLedger _remoteCatchLedger;
     private SessionTrace _sessionTrace;
+    private readonly LoadedGameplaySceneTracker _loadedGameplayScenes = new();
+    private UnityAction<Scene, LoadSceneMode> _sceneLoadedHandler;
+    private UnityAction<Scene> _sceneUnloadedHandler;
+    private bool _unsafeWorldReplicationBlocked;
     private readonly RemoteAvatar _remoteAvatar = new();
     private bool _showLobby;
     private bool _cursorWasVisible;
@@ -108,6 +114,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _lobbyAddress = Address;
         _lobbyPort = Port.ToString();
         _lobbyName = ConfiguredName;
+        _sceneLoadedHandler = DelegateSupport.ConvertDelegate<UnityAction<Scene, LoadSceneMode>>(
+            (Action<Scene, LoadSceneMode>)OnUnitySceneLoaded);
+        _sceneUnloadedHandler = DelegateSupport.ConvertDelegate<UnityAction<Scene>>(
+            (Action<Scene>)OnUnitySceneUnloaded);
+        SceneManager.sceneLoaded += _sceneLoadedHandler;
+        SceneManager.sceneUnloaded += _sceneUnloadedHandler;
+        _loadedGameplayScenes.Reset();
         if (!SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _lobbyError))
             SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _);
     }
@@ -216,6 +229,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             ReturnToOnlineRoom(peerLoss);
             return;
         }
+        UpdateUnsafeWorldReplicationGate();
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(
             Role, _session, _scene, _sceneMetadata.SceneType == SceneType.lobby,
@@ -223,7 +237,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _managerEventReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _npcInteractionCoordinator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
-        _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+        if (!UnsafeWorldReplicationBlocked)
+            _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
@@ -240,10 +255,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
             _player, _remoteAvatar.TargetTransform);
-        _bossReplicator?.Update(
-            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
-        _pickupReplicator?.Update(
-            Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
+        if (!UnsafeWorldReplicationBlocked)
+        {
+            _bossReplicator?.Update(
+                Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
+            _pickupReplicator?.Update(
+                Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
+        }
         if (_hostAuthorityRefreshAt > 0f && Time.realtimeSinceStartup >= _hostAuthorityRefreshAt)
         {
             _hostAuthorityRefreshAt = 0f;
@@ -419,6 +437,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void OnDestroy()
     {
+        if (_sceneLoadedHandler != null)
+            SceneManager.sceneLoaded -= _sceneLoadedHandler;
+        if (_sceneUnloadedHandler != null)
+            SceneManager.sceneUnloaded -= _sceneUnloadedHandler;
         if (_showLobby)
             SetLobbyVisible(false);
         else
@@ -441,6 +463,78 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _sessionTrace?.Dispose();
         if (Instance == this)
             Instance = null;
+    }
+
+    private bool UnsafeWorldReplicationBlocked =>
+        Role != SessionRole.Offline && _session?.Connected == true &&
+        !_loadedGameplayScenes.AllowsUnsafeWorldReplication;
+
+    private void OnUnitySceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        _loadedGameplayScenes.OnSceneLoaded(scene, mode);
+        UpdateUnsafeWorldReplicationGate();
+    }
+
+    private void OnUnitySceneUnloaded(Scene scene)
+    {
+        _loadedGameplayScenes.OnSceneUnloaded(scene);
+        UpdateUnsafeWorldReplicationGate();
+    }
+
+    private void UpdateUnsafeWorldReplicationGate()
+    {
+        _loadedGameplayScenes.Refresh();
+        var blocked = UnsafeWorldReplicationBlocked;
+        if (blocked == _unsafeWorldReplicationBlocked)
+        {
+            if (blocked)
+                DrainBlockedWorldPackets();
+            return;
+        }
+
+        _unsafeWorldReplicationBlocked = blocked;
+        if (!blocked)
+        {
+            _pickupReplicator?.Clear();
+            _bossReplicator?.Clear();
+            _worldStateReplicator?.Clear();
+            Logger?.LogInfo("Network world replication restored: one gameplay scene loaded");
+            return;
+        }
+
+        _pickupReplicator?.Clear();
+        _bossReplicator?.Clear();
+        Logger?.LogWarning(
+            $"Network world replication disabled: {_loadedGameplayScenes.GameplaySceneCount} " +
+            "gameplay scenes are loaded; additive routes are unsupported");
+        DrainBlockedWorldPackets();
+    }
+
+    private void DrainBlockedWorldPackets()
+    {
+        if (_session == null)
+            return;
+        while (_session.TryTakePickupRequest(out _))
+        {
+        }
+        while (_session.TryTakePickupResult(out _))
+        {
+        }
+        while (_session.TryTakePickupRemoved(out _))
+        {
+        }
+        while (_session.TryTakeBossDamageRequest(out _))
+        {
+        }
+        while (_session.TryTakeBossState(out _))
+        {
+        }
+        while (_session.TryTakeWorldFlagRequest(out _))
+        {
+        }
+        while (_session.TryTakeWorldFlagState(out _))
+        {
+        }
     }
 
     private void DrawLobbyPanel()
@@ -735,7 +829,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void OnPickupDestroyed(PickupInstanceItem item)
     {
-        if (Role is SessionRole.Host or SessionRole.Client)
+        if (!UnsafeWorldReplicationBlocked &&
+            Role is SessionRole.Host or SessionRole.Client)
             _pickupReplicator?.OnDestroyed(Role, _session, _sceneId, item);
     }
 
@@ -1033,13 +1128,20 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     internal bool AllowPuzzleSave(PuzzleStateSaveObject saveObject, bool value) =>
-        _worldStateReplicator?.AllowLocalSave(Role, _session, saveObject, value) ?? true;
+        UnsafeWorldReplicationBlocked
+            ? false
+            : _worldStateReplicator?.AllowLocalSave(Role, _session, saveObject, value) ?? true;
 
-    internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value) =>
-        _worldStateReplicator?.ObserveHostSave(Role, _session, saveObject, value);
+    internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value)
+    {
+        if (!UnsafeWorldReplicationBlocked)
+            _worldStateReplicator?.ObserveHostSave(Role, _session, saveObject, value);
+    }
 
     internal bool AllowBossHpWrite(BossControllerBase boss, int hp) =>
-        _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
+        UnsafeWorldReplicationBlocked
+            ? false
+            : _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
 
     internal bool TryCaptureRemoteLoot(
         int itemId,
@@ -1092,6 +1194,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool OnPickupInteract(PickupInstanceItem item, BaseCharacter character)
     {
+        if (UnsafeWorldReplicationBlocked)
+            return false;
         if (Role != SessionRole.Client)
             return true;
         if (!(_pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false))
