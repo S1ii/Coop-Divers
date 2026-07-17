@@ -29,6 +29,7 @@ internal sealed class BossReplicator
     private readonly Dictionary<uint, float> _lastHostKeyframes = new();
     private readonly Dictionary<uint, BossState> _pendingClientStates = new();
     private readonly HashSet<uint> _unsupportedClientDamage = new();
+    private readonly HashSet<int> _reportedUnsupportedFamilies = new();
     private readonly HashSet<uint> _reportedAmbiguousIds = new();
     private float _nextScan;
     private float _nextSend;
@@ -52,7 +53,9 @@ internal sealed class BossReplicator
         AddUniqueId(unique, duplicates, 7, new object());
         AddUniqueId(unique, duplicates, 0, new object());
         if (unique.Count != 1 || !unique.TryGetValue(8, out var owner) ||
-            !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { 7u }))
+            !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { 7u }) ||
+            !IsSnapshotFamily("BossGiantSquidController") ||
+            IsSnapshotFamily("BossGoblinSharkController"))
             throw new InvalidOperationException("Boss unique-ID policy failed");
     }
 
@@ -166,6 +169,7 @@ internal sealed class BossReplicator
         _lastHostKeyframes.Clear();
         _pendingClientStates.Clear();
         _unsupportedClientDamage.Clear();
+        _reportedUnsupportedFamilies.Clear();
         _reportedAmbiguousIds.Clear();
         _nextScan = 0f;
         _nextSend = 0f;
@@ -184,6 +188,11 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
+            if (!IsSnapshotFamily(boss.GetType().Name))
+            {
+                ReportUnsupportedFamily(boss);
+                continue;
+            }
             AddUniqueId(unique, duplicates, WorldObjectId.For(boss, boss.fishID), boss);
         }
         foreach (var id in duplicates)
@@ -207,6 +216,11 @@ internal sealed class BossReplicator
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
+            if (!IsSnapshotFamily(boss.GetType().Name))
+            {
+                ReportUnsupportedFamily(boss);
+                continue;
+            }
             AddUniqueId(unique, duplicates, WorldObjectId.For(boss, boss.fishID), boss);
         }
         foreach (var id in duplicates)
@@ -261,6 +275,17 @@ internal sealed class BossReplicator
         if (_reportedAmbiguousIds.Add(id))
             _log.LogWarning($"Network boss replication disabled for duplicate world ID: {id:X8}");
     }
+
+    private void ReportUnsupportedFamily(BossControllerBase boss)
+    {
+        if (boss != null && _reportedUnsupportedFamilies.Add(boss.GetInstanceID()))
+            _log.LogWarning(
+                $"Network boss replication disabled for unsupported family: {boss.GetType().Name}");
+    }
+
+    private static bool IsSnapshotFamily(string typeName) =>
+        typeName is "BossGiantSquidController" or "BossHermitCrabController" or
+            "BossWolffishController";
 
     private static void AddUniqueId<T>(
         IDictionary<uint, T> unique,
