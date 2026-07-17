@@ -26,6 +26,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishDamageRequests = 256;
+    private const int MaxPendingFishPickupRequests = 256;
     private const int MaxPendingFishRemovals = 256;
     private const int MaxPendingFishPickupResults = 256;
     private const int MaxPendingPickupRemovals = 256;
@@ -187,7 +188,8 @@ internal sealed class UdpSession : IDisposable
     private uint _nextWorldSequence;
     private int _nextWorldSeed;
     private bool _hasNextWorld;
-    private readonly ConcurrentQueue<CargoState> _cargoStates = new();
+    private CargoState _latestCargoState;
+    private bool _hasCargoState;
     private readonly ConcurrentQueue<IngredientsSyncRequest> _ingredientsSyncRequests = new();
     private readonly ConcurrentQueue<IngredientsSnapshotChunk> _ingredientsSnapshotChunks = new();
     private readonly ConcurrentQueue<IngredientsDelta> _ingredientsDeltas = new();
@@ -331,6 +333,7 @@ internal sealed class UdpSession : IDisposable
         TestFishHookPoseCoalescing();
         TestPlayerVisualCoalescing();
         TestBoatDecoCoalescing();
+        TestCargoCoalescing();
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
@@ -764,6 +767,16 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Boat decoration coalescing self-test failed");
     }
 
+    private static void TestCargoCoalescing()
+    {
+        var session = new UdpSession(null);
+        session.EnqueueCargoState(new CargoState(1, 9f, 13f, 0f, 1));
+        session.EnqueueCargoState(new CargoState(1, 10f, 14f, 1f, 1));
+        if (!session.TryTakeCargoState(out var state) || state.WeightMax != 10f ||
+            session.TryTakeCargoState(out _))
+            throw new InvalidOperationException("Cargo state coalescing self-test failed");
+    }
+
     private static void TestDiverRuntimeCoalescing()
     {
         if (!IsNewer(1, uint.MaxValue) || IsNewer(uint.MaxValue, 1) || IsNewer(1, 1))
@@ -927,7 +940,7 @@ internal sealed class UdpSession : IDisposable
         var stale = current with { SceneEpoch = 19 };
         if (!session.ShouldQueueCargoState(current) || session.ShouldQueueCargoState(stale))
             throw new InvalidOperationException("Cargo scene epoch gate self-test failed");
-        session._cargoStates.Enqueue(current);
+        session.EnqueueCargoState(current);
         session.ClearRemoteWorldState();
         if (session.TryTakeCargoState(out _))
             throw new InvalidOperationException("Cargo state survived a world reset");
@@ -2024,7 +2037,24 @@ internal sealed class UdpSession : IDisposable
             SendReliable(Protocol.EncodeCargoState(++_sequence, state));
     }
 
-    internal bool TryTakeCargoState(out CargoState state) => _cargoStates.TryDequeue(out state);
+    internal bool TryTakeCargoState(out CargoState state)
+    {
+        if (!_hasCargoState)
+        {
+            state = default;
+            return false;
+        }
+        state = _latestCargoState;
+        _latestCargoState = default;
+        _hasCargoState = false;
+        return true;
+    }
+
+    private void EnqueueCargoState(CargoState state)
+    {
+        _latestCargoState = state;
+        _hasCargoState = true;
+    }
 
     private bool ShouldQueueCargoState(CargoState state) =>
         MatchesRemoteWorld(state.SceneId, state.SceneEpoch);
@@ -2703,7 +2733,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && ShouldQueueCargoState(state))
-                    _cargoStates.Enqueue(state);
+                    EnqueueCargoState(state);
             }
             return;
         }
@@ -3495,9 +3525,8 @@ internal sealed class UdpSession : IDisposable
         while (_pickupResults.TryDequeue(out _))
         {
         }
-        while (_cargoStates.TryDequeue(out _))
-        {
-        }
+        _latestCargoState = default;
+        _hasCargoState = false;
         while (_bossDamageRequests.TryDequeue(out _))
         {
         }
@@ -4151,9 +4180,8 @@ internal sealed class UdpSession : IDisposable
         {
         }
         ClearNextWorldControl();
-        while (_cargoStates.TryDequeue(out _))
-        {
-        }
+        _latestCargoState = default;
+        _hasCargoState = false;
         while (_ingredientsSyncRequests.TryDequeue(out _))
         {
         }
