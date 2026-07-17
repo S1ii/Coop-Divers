@@ -428,15 +428,16 @@ internal sealed class UdpSession : IDisposable
 
         session._lastClientRuntimeRevision = 6;
         session.EnqueueOrderedDiverWeaponResult(Result(6, 6, 5));
-        if (session.TryTakeDiverWeaponResult(out _))
-            throw new InvalidOperationException("Diver weapon stale result self-test failed");
+        if (!session.TryTakeDiverWeaponResult(out var staleStateResult) ||
+            staleStateResult.RequestId != 6)
+            throw new InvalidOperationException("Diver weapon result envelope was lost");
 
         var queuedSnapshot = ClientSession();
         queuedSnapshot.EnqueueDiverRuntimeState(Result(2, 8, 2).State with { Revision = 1 });
         queuedSnapshot.EnqueueOrderedDiverWeaponResult(Result(2, 8, 2));
-        if (queuedSnapshot.TryTakeDiverRuntimeState(out _) ||
+        if (!queuedSnapshot.TryTakeDiverRuntimeState(out _) ||
             !queuedSnapshot.TryTakeDiverWeaponResult(out _))
-            throw new InvalidOperationException("Diver weapon stale snapshot self-test failed");
+            throw new InvalidOperationException("Diver weapon result altered runtime queue");
 
         var future = ClientSession(19);
         future.ReceiveDiverWeaponResult(100, Result(2, 7, 2));
@@ -617,23 +618,12 @@ internal sealed class UdpSession : IDisposable
     private void DeliverDiverWeaponResult(DiverWeaponResult result)
     {
         _nextDiverWeaponCommitRevision = NextRevision(_nextDiverWeaponCommitRevision);
-        if (result.State.Revision != _lastClientRuntimeRevision &&
-            !IsNewer(result.State.Revision, _lastClientRuntimeRevision))
-            return;
         if (!_deliveredDiverWeaponRequests.Add(result.RequestId))
             return;
 
         _deliveredDiverWeaponRequestOrder.Enqueue(result.RequestId);
         if (_deliveredDiverWeaponRequestOrder.Count > MaxPendingDiverWeaponPackets)
             _deliveredDiverWeaponRequests.Remove(_deliveredDiverWeaponRequestOrder.Dequeue());
-        if (IsNewer(result.State.Revision, _lastClientRuntimeRevision))
-            _lastClientRuntimeRevision = result.State.Revision;
-        if (_hasClientRuntimeState &&
-            !IsNewer(_latestClientRuntimeState.Revision, result.State.Revision))
-        {
-            _latestClientRuntimeState = default;
-            _hasClientRuntimeState = false;
-        }
         while (_diverWeaponResults.Count >= MaxPendingDiverWeaponPackets &&
                _diverWeaponResults.TryDequeue(out _))
         {

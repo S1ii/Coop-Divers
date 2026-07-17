@@ -164,19 +164,12 @@ internal sealed class RemoteAvatar : IDisposable
     {
         if ((state.Fields & (DiverRuntimeFields.Health | DiverRuntimeFields.Oxygen)) != 0)
             _isRemoteDead = state.IsDead;
-        if ((state.Fields & DiverRuntimeFields.Weapon) != 0)
-            _remoteWeaponId = state.WeaponId;
-        else
-            _remoteWeaponId = 0;
-        if ((state.Fields & DiverRuntimeFields.Ammo) != 0)
+        if ((state.Fields & (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo)) ==
+            (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo))
         {
+            _remoteWeaponId = state.WeaponId;
             _remoteAmmo = state.Ammo;
             _remoteMaxAmmo = state.MaxAmmo;
-        }
-        else
-        {
-            _remoteAmmo = 0;
-            _remoteMaxAmmo = 0;
         }
         if (_isRemoteDead)
             _hitbox?.Disarm();
@@ -240,9 +233,10 @@ internal sealed class RemoteAvatar : IDisposable
             var weaponId = 0;
             var ammo = 0;
             var maxAmmo = 0;
+            fields |= DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo;
             var inventory = player.CurrentInstanceItemInventory;
             var gun = inventory?.gunHandler;
-            if (gun != null && gun.IsEnabled)
+            if (gun != null && gun.IsEnabled && gun.CurrentMetaGunSlot == null)
             {
                 var spec = gun.GunSpec;
                 if (spec == null || spec.TID <= 0)

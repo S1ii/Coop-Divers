@@ -55,6 +55,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private DiveCoordinator _diveCoordinator;
     private TravelCoordinator _travelCoordinator;
     private ProjectileVisualReplicator _projectileVisualReplicator;
+    private DiverWeaponReplicator _diverWeaponReplicator;
     private RemoteCatchLedger _remoteCatchLedger;
     private SessionTrace _sessionTrace;
     private readonly RemoteAvatar _remoteAvatar = new();
@@ -103,6 +104,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _diveCoordinator = new DiveCoordinator(Logger);
         _travelCoordinator = new TravelCoordinator(Logger);
         _projectileVisualReplicator = new ProjectileVisualReplicator();
+        _diverWeaponReplicator = new DiverWeaponReplicator();
         _lobbyAddress = Address;
         _lobbyPort = Port.ToString();
         _lobbyName = ConfiguredName;
@@ -172,6 +174,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diveCoordinator?.Reset();
             _travelCoordinator?.Reset();
             _projectileVisualReplicator?.Clear();
+            _diverWeaponReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
             if (Role == SessionRole.Host)
                 _sceneReplicator?.OnHostObservedScene(_session, _scene);
@@ -230,6 +233,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Role, _session,
             _diveCoordinator?.HostDead ?? false,
             _diveCoordinator?.ClientDead ?? false);
+        _diverWeaponReplicator?.Update(
+            Role, _session, _sceneId, _player, _remoteAvatar,
+            Role == SessionRole.Host && (_diveCoordinator?.ClientDead ?? false));
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
@@ -429,6 +435,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
+        _diverWeaponReplicator?.Clear();
         _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
         _sessionTrace?.Dispose();
@@ -660,6 +667,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
+        _diverWeaponReplicator?.Clear();
     }
 
     private void SetLobbyVisible(bool visible, bool restoreCursor = true)

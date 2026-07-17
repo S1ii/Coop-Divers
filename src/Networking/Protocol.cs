@@ -3719,14 +3719,15 @@ internal static class Protocol
             return false;
 
         var hasWeapon = (state.Fields & DiverRuntimeFields.Weapon) != 0;
-        if (hasWeapon ? state.WeaponId <= 0 : state.WeaponId != 0)
-            return false;
-
         var hasAmmo = (state.Fields & DiverRuntimeFields.Ammo) != 0;
-        return hasAmmo
-            ? hasWeapon && state.MaxAmmo is > 0 and <= 1_000_000 &&
-              state.Ammo >= 0 && state.Ammo <= state.MaxAmmo
-            : state.Ammo == 0 && state.MaxAmmo == 0;
+        if (hasWeapon != hasAmmo)
+            return false;
+        if (!hasWeapon)
+            return state.WeaponId == 0 && state.Ammo == 0 && state.MaxAmmo == 0;
+        return state.WeaponId == 0
+            ? state.Ammo == 0 && state.MaxAmmo == 0
+            : state.WeaponId > 0 && state.MaxAmmo is > 0 and <= 1_000_000 &&
+              state.Ammo >= 0 && state.Ammo <= state.MaxAmmo;
     }
 
     private static bool IsValidRuntimeValuePair(float current, float maximum) =>
@@ -3787,11 +3788,10 @@ internal static class Protocol
 
         var weaponFields = result.State.Fields &
             (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo);
-        var equipped = weaponFields ==
-            (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo);
-        var unequipped = weaponFields == DiverRuntimeFields.None;
-        if (!equipped && !unequipped)
+        if (weaponFields != (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo))
             return false;
+        var equipped = result.State.WeaponId != 0;
+        var unequipped = !equipped;
 
         if (result.Accepted &&
             (result.Action == DiverWeaponAction.Unequip ? !unequipped : !equipped))
@@ -4131,8 +4131,6 @@ internal static class Protocol
 
         var unequippedState = weaponState with
         {
-            Fields = weaponState.Fields &
-                ~(DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo),
             WeaponId = 0,
             Ammo = 0,
             MaxAmmo = 0

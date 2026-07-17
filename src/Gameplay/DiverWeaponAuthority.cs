@@ -21,10 +21,8 @@ internal sealed class DiverWeaponAuthority
 {
     private const int ProcessedRequestCapacity = 256;
 
-    private readonly record struct Decision(bool Accepted, DiverWeaponRejectReason Reason);
-
     private readonly Queue<ulong> _processedOrder = new();
-    private readonly Dictionary<ulong, Decision> _processed = new();
+    private readonly Dictionary<ulong, DiverWeaponAuthorityResult> _processed = new();
     private uint _sceneId;
     private uint _sceneEpoch;
     private uint _revision;
@@ -115,13 +113,12 @@ internal sealed class DiverWeaponAuthority
     internal DiverWeaponAuthorityResult Reload(
         ulong requestId,
         int weaponId,
-        int ammo,
-        int maxAmmo)
+        int ammo)
     {
         EnsureInitialized();
         if (TryDuplicate(requestId, out var duplicate))
             return duplicate;
-        if (requestId == 0 || weaponId <= 0 || !IsValidAmmo(ammo, maxAmmo))
+        if (requestId == 0 || weaponId <= 0 || ammo < 0 || ammo > _maxAmmo)
             return Reject(requestId, DiverWeaponRejectReason.InvalidState);
         if (weaponId != _weaponId)
             return Reject(requestId, DiverWeaponRejectReason.InvalidWeapon);
@@ -130,11 +127,10 @@ internal sealed class DiverWeaponAuthority
         if (appliedRounds <= 0)
             return Reject(requestId, DiverWeaponRejectReason.ReloadNotNeeded);
 
-        var changed = _ammo != ammo || _maxAmmo != maxAmmo;
+        var changed = _ammo != ammo;
         if (changed)
         {
             _ammo = ammo;
-            _maxAmmo = maxAmmo;
             AdvanceRevision();
         }
         return Accept(requestId, changed, appliedRounds);
@@ -159,6 +155,18 @@ internal sealed class DiverWeaponAuthority
         return Accept(requestId, changed);
     }
 
+    internal DiverWeaponAuthorityResult RejectRequest(
+        ulong requestId,
+        DiverWeaponRejectReason reason)
+    {
+        EnsureInitialized();
+        if (reason == DiverWeaponRejectReason.None)
+            throw new ArgumentOutOfRangeException(nameof(reason));
+        if (TryDuplicate(requestId, out var duplicate))
+            return duplicate;
+        return Reject(requestId, reason);
+    }
+
     internal static void SelfTest()
     {
         var authority = new DiverWeaponAuthority();
@@ -169,7 +177,7 @@ internal sealed class DiverWeaponAuthority
         if (!fired.Accepted || !fired.Changed || fired.AppliedRounds != 2 ||
             fired.Ammo != 0 || fired.Revision != 1 || fired.CommitRevision != 2 ||
             !duplicate.Accepted || duplicate.CommitRevision != 2 ||
-            !duplicate.Duplicate || duplicate.Changed || duplicate.AppliedRounds != 0 ||
+            !duplicate.Duplicate || !duplicate.Changed || duplicate.AppliedRounds != 2 ||
             duplicate.Ammo != 0)
             throw new InvalidOperationException("Weapon fire/dedupe failed");
 
@@ -184,7 +192,7 @@ internal sealed class DiverWeaponAuthority
             invalid.CommitRevision != 5 || invalid.Revision != 1)
             throw new InvalidOperationException("Weapon fire rejection failed");
 
-        var reload = authority.Reload(5, 1001, 6, 6);
+        var reload = authority.Reload(5, 1001, 6);
         var equip = authority.Equip(6, 2001, 3, 8);
         var unequip = authority.Unequip(7);
         if (!reload.Accepted || reload.AppliedRounds != 6 || reload.Ammo != 6 ||
@@ -204,15 +212,51 @@ internal sealed class DiverWeaponAuthority
         if (nextEpoch.Duplicate || nextEpoch.SceneEpoch != 21 || nextEpoch.Ammo != 1)
             throw new InvalidOperationException("Weapon epoch reset failed");
 
+        var zeroCapacityRejected = false;
+        try
+        {
+            authority.Initialize(10, 22, 10, 1001, 0, 0);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            zeroCapacityRejected = true;
+        }
+        if (!zeroCapacityRejected)
+            throw new InvalidOperationException("Weapon zero-capacity equipped state accepted");
+
         authority.Initialize(10, 22, 10, 0, 0, 0);
         if (authority.Current.WeaponId != 0 || authority.Current.CommitRevision != 1)
             throw new InvalidOperationException("Weapon canonical unequipped failed");
+        var zeroCapacityEquip = authority.Equip(1, 1001, 0, 0);
+        if (zeroCapacityEquip.Reason != DiverWeaponRejectReason.InvalidState ||
+            zeroCapacityEquip.Accepted)
+            throw new InvalidOperationException("Weapon zero-capacity equip accepted");
         authority._commitRevision = uint.MaxValue;
         var wrappedCommit = authority.Fire(2, 1001, 1);
         if (wrappedCommit.CommitRevision != 1 || wrappedCommit.Accepted)
             throw new InvalidOperationException("Weapon commit revision wrap failed");
 
-        authority.Initialize(10, 23, 10, 1001, 300, 300);
+        authority.Initialize(10, 23, 10, 1001, 2, 6);
+        var rejected = authority.RejectRequest(1, DiverWeaponRejectReason.Dead);
+        var duplicateReject = authority.RejectRequest(1, DiverWeaponRejectReason.Unsupported);
+        if (rejected.Accepted || rejected.Reason != DiverWeaponRejectReason.Dead ||
+            rejected.CommitRevision != 2 || duplicateReject.Accepted ||
+            duplicateReject.Reason != DiverWeaponRejectReason.Dead ||
+            !duplicateReject.Duplicate || duplicateReject.CommitRevision != 2)
+            throw new InvalidOperationException("Weapon explicit reject/dedupe failed");
+        var noneRejected = false;
+        try
+        {
+            authority.RejectRequest(2, DiverWeaponRejectReason.None);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            noneRejected = true;
+        }
+        if (!noneRejected || authority.Current.CommitRevision != 2)
+            throw new InvalidOperationException("Weapon None rejection reason accepted");
+
+        authority.Initialize(10, 24, 10, 1001, 300, 300);
         for (ulong requestId = 1; requestId <= ProcessedRequestCapacity + 1UL; requestId++)
             authority.Fire(requestId, 1001, 1);
         var evicted = authority.Fire(1, 1001, 1);
@@ -227,9 +271,10 @@ internal sealed class DiverWeaponAuthority
         int appliedRounds = 0)
     {
         AdvanceCommit(requestId);
-        Remember(requestId, new Decision(true, DiverWeaponRejectReason.None));
-        return Result(true, DiverWeaponRejectReason.None, changed: changed,
+        var result = Result(true, DiverWeaponRejectReason.None, changed: changed,
             appliedRounds: appliedRounds);
+        Remember(requestId, result);
+        return result;
     }
 
     private DiverWeaponAuthorityResult Reject(
@@ -237,24 +282,25 @@ internal sealed class DiverWeaponAuthority
         DiverWeaponRejectReason reason)
     {
         AdvanceCommit(requestId);
-        Remember(requestId, new Decision(false, reason));
-        return Result(false, reason);
+        var result = Result(false, reason);
+        Remember(requestId, result);
+        return result;
     }
 
     private bool TryDuplicate(ulong requestId, out DiverWeaponAuthorityResult result)
     {
-        if (requestId != 0 && _processed.TryGetValue(requestId, out var decision))
+        if (requestId != 0 && _processed.TryGetValue(requestId, out var original))
         {
-            result = Result(decision.Accepted, decision.Reason, duplicate: true);
+            result = original with { Duplicate = true };
             return true;
         }
         result = default;
         return false;
     }
 
-    private void Remember(ulong requestId, Decision decision)
+    private void Remember(ulong requestId, DiverWeaponAuthorityResult result)
     {
-        if (requestId == 0 || !_processed.TryAdd(requestId, decision))
+        if (requestId == 0 || !_processed.TryAdd(requestId, result))
             return;
         _processedOrder.Enqueue(requestId);
         if (_processedOrder.Count > ProcessedRequestCapacity)
@@ -300,7 +346,7 @@ internal sealed class DiverWeaponAuthority
             _maxAmmo);
 
     private static bool IsValidAmmo(int ammo, int maxAmmo) =>
-        ammo >= 0 && maxAmmo >= 0 && ammo <= maxAmmo && maxAmmo <= 1_000_000;
+        ammo >= 0 && maxAmmo is >= 1 and <= 1_000_000 && ammo <= maxAmmo;
 
     private static bool IsValidWeaponState(int weaponId, int ammo, int maxAmmo) =>
         weaponId == 0
