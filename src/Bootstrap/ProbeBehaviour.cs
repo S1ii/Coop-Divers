@@ -77,6 +77,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private string _lobbyName = string.Empty;
     private string _lobbyError = string.Empty;
     private float _hostAuthorityRefreshAt;
+    private bool _wasSessionConnected;
     private int _remoteMissionApplyDepth;
     private int _clientPresentationLifecycleDepth;
     private bool _restoringClientOriginals;
@@ -227,6 +228,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
 
         _session?.Update(Time.realtimeSinceStartup);
+        var sessionConnected = _session?.Connected == true;
+        if (ManagerEventReplicator.ShouldScheduleReconnectKeyframe(
+                Role, _wasSessionConnected, sessionConnected))
+        {
+            _hostAuthorityRefreshAt = Time.realtimeSinceStartup + 2f;
+            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=rejoin-await-scene-settle missions=1 story=1 day=1");
+        }
+        _wasSessionConnected = sessionConnected;
         FishSpawnSeedCoordinator.Update(Role, _session);
         if (Role == SessionRole.Client && _session != null && _session.TryTakePeerLoss(out var peerLoss))
         {
@@ -278,7 +287,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _hostAuthorityRefreshAt = 0f;
             _missionProgressReplicator?.ForceHostKeyframe();
             _managerEventReplicator?.ForceHostKeyframe();
-            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=scene-settled missions=1 story=1 day=1");
+            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=scene-or-rejoin-settled missions=1 story=1 day=1");
         }
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
@@ -801,6 +810,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (Role != nextRole)
             _remoteCatchLedger?.Clear("network authority changed");
+        _wasSessionConnected = false;
+        _hostAuthorityRefreshAt = 0f;
         _remoteAvatar.Clear();
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();

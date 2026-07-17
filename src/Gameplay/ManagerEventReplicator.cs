@@ -285,6 +285,11 @@ internal sealed class ManagerEventReplicator
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 0f, 3f) ||
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 3f, 2f))
             throw new InvalidOperationException("Manager scene keyframe gate self-test failed");
+        if (!ShouldScheduleReconnectKeyframe(SessionRole.Host, false, true) ||
+            ShouldScheduleReconnectKeyframe(SessionRole.Host, true, true) ||
+            ShouldScheduleReconnectKeyframe(SessionRole.Host, false, false) ||
+            ShouldScheduleReconnectKeyframe(SessionRole.Client, false, true))
+            throw new InvalidOperationException("Manager reconnect keyframe gate self-test failed");
         if (!ShouldForceScenarioMilestoneKeyframe(
                 false, SessionRole.Host, true, 17, 17) ||
             ShouldForceScenarioMilestoneKeyframe(
@@ -298,7 +303,6 @@ internal sealed class ManagerEventReplicator
             ShouldForceScenarioMilestoneKeyframe(
                 false, SessionRole.Host, true, 17, 18))
             throw new InvalidOperationException("Manager scenario keyframe gate self-test failed");
-
         var outboundOverflow = new ManagerEventReplicator(null);
         var outboundSession = new UdpSession(null);
         for (var index = 0; index < MaxPendingManagerEvents; index++)
@@ -1514,6 +1518,12 @@ internal sealed class ManagerEventReplicator
         float requestedAt,
         float now) =>
         role == SessionRole.Host && scenesMatch && requestedAt > 0f && now >= requestedAt;
+
+    internal static bool ShouldScheduleReconnectKeyframe(
+        SessionRole role,
+        bool wasConnected,
+        bool connected) =>
+        role == SessionRole.Host && !wasConnected && connected;
 
     private static bool ShouldForceScenarioMilestoneKeyframe(
         bool applying,

@@ -31,7 +31,10 @@ internal static class MultiplayerSaveSync
     private const int MpSlotIndex = 6;
     private const SaveSlotType MpSlotType = SaveSlotType.Manual;
     private const uint BundleMagic = 0x42534D44; // DMSB
-    private const int BundleHeaderSize = 16;
+    // Independent from the transport protocol: unversioned bundles are rejected
+    // because their length fields cannot safely identify a compatible schema.
+    private const uint BundleSchema = 1;
+    private const int BundleHeaderSize = 20;
     private const int MarkerSchema = 3;
     private const int LegacyMarkerSchema = 2;
     private const int MaxBundleBytes = 16 * 1024 * 1024;
@@ -107,7 +110,21 @@ internal static class MultiplayerSaveSync
             throw new InvalidOperationException("MP save bundle round-trip self-test failed");
         bundle[4] = byte.MaxValue;
         if (TryUnpackBundle(bundle, out _, out _, out _))
+            throw new InvalidOperationException("MP save bundle accepted an unsupported schema");
+        bundle = PackBundle("{\"g\":1}", "{\"p\":2}", "{\"d\":3}");
+        bundle[8] = byte.MaxValue;
+        if (TryUnpackBundle(bundle, out _, out _, out _))
             throw new InvalidOperationException("MP save bundle accepted invalid lengths");
+        var unversioned = new byte[16 + 7 + 7 + 7];
+        BinaryPrimitives.WriteUInt32LittleEndian(unversioned, BundleMagic);
+        BinaryPrimitives.WriteInt32LittleEndian(unversioned.AsSpan(4), 7);
+        BinaryPrimitives.WriteInt32LittleEndian(unversioned.AsSpan(8), 7);
+        BinaryPrimitives.WriteInt32LittleEndian(unversioned.AsSpan(12), 7);
+        Encoding.UTF8.GetBytes("{\"g\":1}").CopyTo(unversioned, 16);
+        Encoding.UTF8.GetBytes("{\"p\":2}").CopyTo(unversioned, 23);
+        Encoding.UTF8.GetBytes("{\"d\":3}").CopyTo(unversioned, 30);
+        if (TryUnpackBundle(unversioned, out _, out _, out _))
+            throw new InvalidOperationException("MP save bundle accepted unversioned data");
         if (AreBundleLengthsValid(MaxBundleBytes, 1, 1) ||
             AreBundleLengthsValid(int.MaxValue, int.MaxValue, int.MaxValue))
             throw new InvalidOperationException("MP save bundle accepted oversized lengths");
@@ -949,9 +966,10 @@ internal static class MultiplayerSaveSync
         var player = Encoding.UTF8.GetBytes(playerJson);
         var bundle = new byte[BundleHeaderSize + game.Length + photo.Length + player.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(bundle, BundleMagic);
-        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(4), game.Length);
-        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(8), photo.Length);
-        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(12), player.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(bundle.AsSpan(4), BundleSchema);
+        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(8), game.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(12), photo.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(bundle.AsSpan(16), player.Length);
         game.CopyTo(bundle, BundleHeaderSize);
         photo.CopyTo(bundle, BundleHeaderSize + game.Length);
         player.CopyTo(bundle, BundleHeaderSize + game.Length + photo.Length);
@@ -965,12 +983,11 @@ internal static class MultiplayerSaveSync
         out string playerJson)
     {
         gameJson = photoJson = playerJson = string.Empty;
-        if (bundle == null || bundle.Length < BundleHeaderSize ||
-            BinaryPrimitives.ReadUInt32LittleEndian(bundle) != BundleMagic)
+        if (!HasSupportedBundleHeader(bundle))
             return false;
-        var gameLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(4));
-        var photoLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(8));
-        var playerLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(12));
+        var gameLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(8));
+        var photoLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(12));
+        var playerLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(16));
         if (!AreBundleLengthsValid(gameLength, photoLength, playerLength) ||
             (long)BundleHeaderSize + gameLength + photoLength + playerLength != bundle.Length)
             return false;
@@ -984,6 +1001,11 @@ internal static class MultiplayerSaveSync
     private static bool AreBundleLengthsValid(int gameLength, int photoLength, int playerLength) =>
         gameLength > 0 && photoLength > 0 && playerLength > 0 &&
         (long)BundleHeaderSize + gameLength + photoLength + playerLength <= MaxBundleBytes;
+
+    private static bool HasSupportedBundleHeader(byte[] bundle) =>
+        bundle != null && bundle.Length >= BundleHeaderSize &&
+        BinaryPrimitives.ReadUInt32LittleEndian(bundle) == BundleMagic &&
+        BinaryPrimitives.ReadUInt32LittleEndian(bundle.AsSpan(4)) == BundleSchema;
 
     private static bool IsJsonObject(string value)
     {
