@@ -140,8 +140,17 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
     private readonly ConcurrentQueue<PickupRequest> _pickupRequests = new();
     private readonly ConcurrentQueue<PickupResult> _pickupResults = new();
-    private readonly ConcurrentQueue<SceneTransitionCommand> _sceneTransitions = new();
-    private readonly ConcurrentQueue<SceneSeed> _sceneSeeds = new();
+    private SceneTransitionCommand _nextSceneTransition;
+    private SceneSeed _nextSceneSeed;
+    private DiveState _nextDiveState;
+    private bool _hasNextSceneTransition;
+    private bool _hasNextSceneSeed;
+    private bool _hasNextDiveState;
+    private uint _nextWorldSceneId;
+    private uint _nextWorldSceneEpoch;
+    private uint _nextWorldSequence;
+    private int _nextWorldSeed;
+    private bool _hasNextWorld;
     private readonly ConcurrentQueue<CargoState> _cargoStates = new();
     private readonly ConcurrentQueue<IngredientsSyncRequest> _ingredientsSyncRequests = new();
     private readonly ConcurrentQueue<IngredientsSnapshotChunk> _ingredientsSnapshotChunks = new();
@@ -151,7 +160,6 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<SaveSnapshotChunk> _saveSnapshotChunks = new();
     private readonly ConcurrentQueue<SaveSnapshotAck> _saveSnapshotAcks = new();
     private readonly ConcurrentQueue<DiveReady> _diveReady = new();
-    private readonly ConcurrentQueue<DiveState> _diveStates = new();
     private readonly ConcurrentQueue<DiverLifeState> _diverLifeStates = new();
     private readonly ConcurrentQueue<DiveExitRequest> _diveExitRequests = new();
     private readonly ConcurrentQueue<BoatDecoState> _boatDecoStates = new();
@@ -286,9 +294,11 @@ internal sealed class UdpSession : IDisposable
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
         TestSaveSnapshotAckQueueOverflow();
+        TestFishActionRequestEpochGate();
+        TestNpcInteractionEpochGate();
         TestCargoEpochGate();
         TestManagerEventEpochGate();
-        TestSceneSeedEpochGate();
+        TestNextWorldControlBuffer();
         TestHandshakeReject();
     }
 
@@ -519,6 +529,57 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Cargo state survived a world reset");
     }
 
+    private static void TestFishActionRequestEpochGate()
+    {
+        var session = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Host,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _localSceneEpoch = 20,
+            _hasRemoteScene = true
+        };
+        var current = default(FishActionRequest) with { SceneId = 10, SceneEpoch = 20 };
+        var stale = current with { SceneEpoch = 19 };
+        if (!session.ShouldQueueFishActionRequest(current) ||
+            session.ShouldQueueFishActionRequest(stale))
+            throw new InvalidOperationException("Fish action request scene epoch gate self-test failed");
+    }
+
+    private static void TestNpcInteractionEpochGate()
+    {
+        var interaction = new NpcInteraction(
+            1, 10, 20, 1, 0, NpcInteractionAction.Request, 1, 0, 0,
+            NpcInteractionResult.Pending);
+        var host = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Host,
+            _localSceneId = 10,
+            _localSceneEpoch = 30,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 20,
+            _hasRemoteScene = true
+        };
+        var client = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Client,
+            _localSceneId = 10,
+            _localSceneEpoch = 20,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 30,
+            _hasRemoteScene = true
+        };
+        var stale = interaction with { SceneEpoch = 19 };
+        if (!host.MatchesNpcInteractionWorld(interaction) ||
+            !client.MatchesNpcInteractionWorld(interaction) ||
+            host.MatchesNpcInteractionWorld(stale) ||
+            client.MatchesNpcInteractionWorld(stale))
+            throw new InvalidOperationException("NPC interaction scene epoch gate self-test failed");
+    }
+
     private static void TestManagerEventEpochGate()
     {
         var session = new UdpSession(null)
@@ -543,7 +604,7 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Manager event stale queue self-test failed");
     }
 
-    private static void TestSceneSeedEpochGate()
+    private static void TestNextWorldControlBuffer()
     {
         var session = new UdpSession(null)
         {
@@ -554,15 +615,28 @@ internal sealed class UdpSession : IDisposable
             _remoteSceneEpoch = 20,
             _hasRemoteScene = true
         };
-        var current = new SceneSeed(10, 20, 123);
-        var stale = current with { SceneEpoch = 19 };
-        if (!session.ShouldQueueSceneSeed(current) || session.ShouldQueueSceneSeed(stale))
-            throw new InvalidOperationException("Scene seed epoch gate self-test failed");
-        session._sceneSeeds.Enqueue(stale);
-        session._sceneSeeds.Enqueue(current);
-        if (!session.TryTakeSceneSeed(out var delivered) || delivered != current ||
-            session.TryTakeSceneSeed(out _))
-            throw new InvalidOperationException("Scene seed stale queue self-test failed");
+        var oldSeed = new SceneSeed(11, 21, 123);
+        var currentSeed = new SceneSeed(Protocol.SceneId("A02_01_01"), 22, 456);
+        var transition = new SceneTransitionCommand("A02_01_01", 1, 0,
+            currentSeed.SceneId, currentSeed.SceneEpoch, currentSeed.Seed);
+        var state = new DiveState(1, true, true,
+            currentSeed.SceneId, currentSeed.SceneEpoch, currentSeed.Seed);
+        if (!session.StageNextWorldSeed(10, oldSeed) ||
+            !session.StageNextWorldTransition(12, transition) ||
+            session.StageNextWorldSeed(11, oldSeed) ||
+            !session.TryTakeSceneTransition(out var deliveredTransition) ||
+            deliveredTransition != transition || session.TryTakeSceneSeed(out _))
+            throw new InvalidOperationException("Next-world target supersession self-test failed");
+        if (session.StageNextWorldSeed(13, currentSeed with { Seed = 789 }) ||
+            !session.StageNextWorldSeed(13, currentSeed) ||
+            !session.StageNextWorldDiveState(14, state) ||
+            !session.TryTakeSceneSeed(out var deliveredSeed) || deliveredSeed != currentSeed ||
+            !session.TryTakeDiveState(out var deliveredState) || deliveredState != state)
+            throw new InvalidOperationException("Next-world control delivery self-test failed");
+        session.SetRemoteWorld(currentSeed.SceneId, currentSeed.SceneEpoch, 15);
+        if (!session.StageNextWorldSeed(16, currentSeed) ||
+            !session.TryTakeSceneSeed(out deliveredSeed) || deliveredSeed != currentSeed)
+            throw new InvalidOperationException("Next-world control reset self-test failed");
     }
 
     private static void TestHandshakeReject()
@@ -1141,6 +1215,9 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakeFishActionRequest(out FishActionRequest request) =>
         _fishActionRequests.TryDequeue(out request);
 
+    private bool ShouldQueueFishActionRequest(FishActionRequest request) =>
+        MatchesLocalWorld(request.SceneId, request.SceneEpoch);
+
     internal bool SendFishActionAck(FishActionAck ack)
     {
         return _role == SessionRole.Host && SceneMatches(ack.SceneId) &&
@@ -1215,8 +1292,14 @@ internal sealed class UdpSession : IDisposable
             SendReliable(Protocol.EncodeSceneTransition(++_sequence, command));
     }
 
-    internal bool TryTakeSceneTransition(out SceneTransitionCommand command) =>
-        _sceneTransitions.TryDequeue(out command);
+    internal bool TryTakeSceneTransition(out SceneTransitionCommand command)
+    {
+        command = _nextSceneTransition;
+        if (!_hasNextSceneTransition)
+            return false;
+        _hasNextSceneTransition = false;
+        return true;
+    }
 
     internal void SendSceneSeed(SceneSeed seed)
     {
@@ -1226,15 +1309,30 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeSceneSeed(out SceneSeed seed)
     {
-        while (_sceneSeeds.TryDequeue(out seed))
-            if (ShouldQueueSceneSeed(seed))
-                return true;
-        seed = default;
-        return false;
+        seed = _nextSceneSeed;
+        if (!_hasNextSceneSeed)
+            return false;
+        _hasNextSceneSeed = false;
+        return true;
     }
 
-    private bool ShouldQueueSceneSeed(SceneSeed seed) =>
-        MatchesRemoteWorld(seed.SceneId, seed.SceneEpoch);
+    private bool StageNextWorldTransition(uint sequence, SceneTransitionCommand command)
+    {
+        if (!TryStageNextWorld(sequence, command.SceneId, command.SceneEpoch, command.Seed))
+            return false;
+        _nextSceneTransition = command;
+        _hasNextSceneTransition = true;
+        return true;
+    }
+
+    private bool StageNextWorldSeed(uint sequence, SceneSeed seed)
+    {
+        if (!TryStageNextWorld(sequence, seed.SceneId, seed.SceneEpoch, seed.Seed))
+            return false;
+        _nextSceneSeed = seed;
+        _hasNextSceneSeed = true;
+        return true;
+    }
 
     internal void SendCargoState(CargoState state)
     {
@@ -1324,7 +1422,23 @@ internal sealed class UdpSession : IDisposable
             SendReliable(Protocol.EncodeDiveState(++_sequence, state));
     }
 
-    internal bool TryTakeDiveState(out DiveState state) => _diveStates.TryDequeue(out state);
+    internal bool TryTakeDiveState(out DiveState state)
+    {
+        state = _nextDiveState;
+        if (!_hasNextDiveState)
+            return false;
+        _hasNextDiveState = false;
+        return true;
+    }
+
+    private bool StageNextWorldDiveState(uint sequence, DiveState state)
+    {
+        if (!TryStageNextWorld(sequence, state.SceneId, state.SceneEpoch, state.Seed))
+            return false;
+        _nextDiveState = state;
+        _hasNextDiveState = true;
+        return true;
+    }
 
     internal void SendDiverLifeState(DiverLifeState state)
     {
@@ -1501,12 +1615,17 @@ internal sealed class UdpSession : IDisposable
 
     internal bool SendNpcInteraction(NpcInteraction state)
     {
-        if (!_connected || !SceneMatches(state.SceneId) ||
+        if (!_connected || !MatchesNpcInteractionWorld(state) ||
             (_role == SessionRole.Client && state.Action == NpcInteractionAction.Granted) ||
             (_role == SessionRole.Host && state.Action == NpcInteractionAction.Request))
             return false;
         return SendReliable(Protocol.EncodeNpcInteraction(++_sequence, state));
     }
+
+    private bool MatchesNpcInteractionWorld(NpcInteraction state) =>
+        _role == SessionRole.Host
+            ? MatchesRemoteWorld(state.SceneId, state.SceneEpoch)
+            : _role == SessionRole.Client && MatchesLocalWorld(state.SceneId, state.SceneEpoch);
 
     internal bool TryTakeNpcInteraction(out NpcInteraction state) =>
         _npcInteractions.TryDequeue(out state);
@@ -1857,7 +1976,7 @@ internal sealed class UdpSession : IDisposable
                     _lastSceneSequence = sceneSequence;
                     if (!_hasRemoteScene || _remoteSceneId != sceneId)
                         _log.LogInfo($"Network: peer scene {sceneId:X8}");
-                    SetRemoteWorld(sceneId, sceneEpoch);
+                    SetRemoteWorld(sceneId, sceneEpoch, sceneSequence);
                 }
             }
             return;
@@ -1869,8 +1988,8 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeSceneSeed(received.Buffer, out _, out var seed))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence) && ShouldQueueSceneSeed(seed))
-                    _sceneSeeds.Enqueue(seed);
+                if (AcceptReliable(sequence))
+                    StageNextWorldSeed(sequence, seed);
             }
             return;
         }
@@ -1920,7 +2039,7 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeFishActionRequest(received.Buffer, out _, out var request))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) && ShouldQueueFishActionRequest(request))
                     _fishActionRequests.Enqueue(request);
             }
             return;
@@ -2107,7 +2226,7 @@ internal sealed class UdpSession : IDisposable
                 if (AcceptReliable(sequence) && IsNewer(sequence, _lastTransitionSequence))
                 {
                     _lastTransitionSequence = sequence;
-                    _sceneTransitions.Enqueue(command);
+                    StageNextWorldTransition(sequence, command);
                 }
             }
             return;
@@ -2216,7 +2335,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _diveStates.Enqueue(state);
+                    StageNextWorldDiveState(sequence, state);
             }
             return;
         }
@@ -2428,7 +2547,7 @@ internal sealed class UdpSession : IDisposable
                     NpcInteractionAction.Granted or NpcInteractionAction.Released))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) && MatchesNpcInteractionWorld(state))
                     _npcInteractions.Enqueue(state);
             }
             return;
@@ -2551,8 +2670,10 @@ internal sealed class UdpSession : IDisposable
         connected && hasRemoteScene && sceneId != 0 && sceneEpoch != 0 &&
         sceneId == localSceneId && sceneId == remoteSceneId && sceneEpoch == expectedEpoch;
 
-    private void SetRemoteWorld(uint sceneId, uint sceneEpoch)
+    private void SetRemoteWorld(uint sceneId, uint sceneEpoch, uint sequence = 0)
     {
+        if (sequence != 0)
+            TryStageNextWorld(sequence, sceneId, sceneEpoch, 0);
         if (!_hasRemoteScene || _remoteSceneId != sceneId || _remoteSceneEpoch != sceneEpoch)
             ClearRemoteWorldState();
         _remoteSceneId = sceneId;
@@ -2562,6 +2683,49 @@ internal sealed class UdpSession : IDisposable
         DrainPendingWorldDiverVitalResults();
         PrunePendingWorldDiverWeaponResults(_localSceneId);
         DrainPendingWorldDiverWeaponResults();
+    }
+
+    private bool TryStageNextWorld(uint sequence, uint sceneId, uint sceneEpoch, int seed)
+    {
+        if (sceneId == 0 || sceneEpoch == 0)
+            return false;
+        if (_hasNextWorld && _nextWorldSceneId == sceneId && _nextWorldSceneEpoch == sceneEpoch)
+        {
+            if (seed != 0 && _nextWorldSeed != 0 && seed != _nextWorldSeed)
+                return false;
+            if (seed != 0)
+                _nextWorldSeed = seed;
+            return true;
+        }
+        if (_hasNextWorld && !IsNewer(sequence, _nextWorldSequence))
+            return false;
+        _nextWorldSceneId = sceneId;
+        _nextWorldSceneEpoch = sceneEpoch;
+        _nextWorldSequence = sequence;
+        _nextWorldSeed = seed;
+        _hasNextWorld = true;
+        _nextSceneTransition = default;
+        _nextSceneSeed = default;
+        _nextDiveState = default;
+        _hasNextSceneTransition = false;
+        _hasNextSceneSeed = false;
+        _hasNextDiveState = false;
+        return true;
+    }
+
+    private void ClearNextWorldControl()
+    {
+        _nextWorldSceneId = 0;
+        _nextWorldSceneEpoch = 0;
+        _nextWorldSequence = 0;
+        _nextWorldSeed = 0;
+        _hasNextWorld = false;
+        _nextSceneTransition = default;
+        _nextSceneSeed = default;
+        _nextDiveState = default;
+        _hasNextSceneTransition = false;
+        _hasNextSceneSeed = false;
+        _hasNextDiveState = false;
     }
 
     private void ClearRemoteWorldState()
@@ -2950,9 +3114,7 @@ internal sealed class UdpSession : IDisposable
         while (_pickupResults.TryDequeue(out _))
         {
         }
-        while (_sceneTransitions.TryDequeue(out _))
-        {
-        }
+        ClearNextWorldControl();
         while (_cargoStates.TryDequeue(out _))
         {
         }
@@ -3004,9 +3166,6 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_diveReady.TryDequeue(out _))
-        {
-        }
-        while (_diveStates.TryDequeue(out _))
         {
         }
         while (_diverLifeStates.TryDequeue(out _))
