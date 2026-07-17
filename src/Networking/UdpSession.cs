@@ -26,6 +26,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishDamageRequests = 256;
+    private const int MaxPendingFishRemovals = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishLootGrants = 256;
@@ -317,9 +318,11 @@ internal sealed class UdpSession : IDisposable
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
         TestBulkReliableControlReserve();
+        TestSaveTransferControlReserve();
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
         TestFishDamageRequestQueueOverflow();
+        TestFishRemovedQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
         TestFishLootGrantQueueOverflow();
@@ -428,6 +431,21 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Fish damage request queue overflow self-test failed");
     }
 
+    private static void TestFishRemovedQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishRemovals; index++)
+            session._fishRemovals.Enqueue(default);
+        session.QueueFishRemoved(default);
+        if (session._connected || !session._fishRemovals.IsEmpty ||
+            session._peerLostReason != "fish removal receive queue overflow")
+            throw new InvalidOperationException("Fish removal queue overflow self-test failed");
+    }
+
     private static void TestBulkReliableControlReserve()
     {
         var session = new UdpSession(null);
@@ -445,6 +463,30 @@ internal sealed class UdpSession : IDisposable
         session._reliableBacklog.Enqueue(new QueuedReliable());
         if (session.ReliableBulkCapacityRemaining != 0)
             throw new InvalidOperationException("Reliable bulk reserve backlog self-test failed");
+    }
+
+    private static void TestSaveTransferControlReserve()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        var data = new byte[Protocol.MaxSaveSnapshotChunkBytes];
+        var chunkCount = (ushort)(256 - ReservedReliableControlSlots);
+        var totalBytes = data.Length * chunkCount;
+        for (ushort index = 0; index < chunkCount; index++)
+            if (!session.SendSaveSnapshotChunk(new SaveSnapshotChunk(
+                    1, 1, totalBytes, index, chunkCount, data)))
+                throw new InvalidOperationException("Save transfer reserve self-test failed while filling bulk capacity");
+        if (session.SendSaveSnapshotChunk(new SaveSnapshotChunk(
+                1, 1, totalBytes, 0, chunkCount, data)))
+            throw new InvalidOperationException("Save transfer reserve self-test allowed a bulk chunk into control capacity");
+
+        session.SendRoomState(new RoomState(1, 1, false));
+        if (session._pendingReliable.Count != chunkCount + 1 ||
+            session._reliableBacklog.Count != 0 || session.ReliableBulkCapacityRemaining != 0)
+            throw new InvalidOperationException("Save transfer control delivery self-test failed");
     }
 
     private static void TestFishLifecycleQueueOverflow()
@@ -2524,7 +2566,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && removed.SceneId == _remoteSceneId &&
                     removed.SceneEpoch == _remoteSceneEpoch)
-                    _fishRemovals.Enqueue(removed);
+                    QueueFishRemoved(removed);
             }
             return;
         }
@@ -3402,6 +3444,16 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("fish damage request receive queue overflow");
     }
 
+    private void QueueFishRemoved(FishRemoved removed)
+    {
+        if (HasDecodedQueueCapacity(_fishRemovals.Count, MaxPendingFishRemovals))
+        {
+            _fishRemovals.Enqueue(removed);
+            return;
+        }
+        FailReliableDelivery("fish removal receive queue overflow");
+    }
+
     private void QueueFishLifecycle(FishLifecycle state)
     {
         if (HasDecodedQueueCapacity(_fishLifecycles.Count, MaxPendingFishLifecycles))
@@ -3535,10 +3587,10 @@ internal sealed class UdpSession : IDisposable
 
     private void FailReliableDelivery(string reason)
     {
-        if (reason.EndsWith(" receive queue overflow", System.StringComparison.Ordinal))
-            Interlocked.Increment(ref _reliableQueueOverflows);
         SignalPeerLoss(reason);
         ResetPeerState();
+        if (reason.EndsWith(" receive queue overflow", System.StringComparison.Ordinal))
+            Interlocked.Increment(ref _reliableQueueOverflows);
         if (_role == SessionRole.Host)
             _remote = null;
         _log?.LogWarning($"Network: {reason}; peer session reset");
@@ -3703,7 +3755,6 @@ internal sealed class UdpSession : IDisposable
         Interlocked.Exchange(ref _incomingCapHits, 0);
         Interlocked.Exchange(ref _reliableRetries, 0);
         Interlocked.Exchange(ref _reliableExpired, 0);
-        Interlocked.Exchange(ref _reliableQueueOverflows, 0);
         Interlocked.Exchange(ref _visualStatesCoalesced, 0);
         _pendingReliable.Clear();
         _reliableBacklog.Clear();
