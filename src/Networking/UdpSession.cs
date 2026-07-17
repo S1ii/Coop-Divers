@@ -37,6 +37,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingFishLootCompletions = 256;
     private const int MaxPendingPickupRequests = 256;
     private const int MaxPendingPickupResults = 256;
+    private const int MaxPendingWorldFlagRequests = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
@@ -337,6 +338,7 @@ internal sealed class UdpSession : IDisposable
         TestFishLootCompleteQueueOverflow();
         TestPickupRequestQueueOverflow();
         TestPickupResultQueueOverflow();
+        TestWorldFlagRequestQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
@@ -643,6 +645,20 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._pickupResults.IsEmpty ||
             session._peerLostReason != "pickup result receive queue overflow")
             throw new InvalidOperationException("Pickup result queue overflow self-test failed");
+    }
+
+    private static void TestWorldFlagRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingWorldFlagRequests; index++)
+            session._worldFlagRequests.Enqueue(default);
+        session.QueueWorldFlagRequest(default);
+        if (session._connected || !session._worldFlagRequests.IsEmpty)
+            throw new InvalidOperationException("World flag request queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -2958,7 +2974,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _worldFlagRequests.Enqueue(request);
+                    QueueWorldFlagRequest(request);
             }
             return;
         }
@@ -3620,6 +3636,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("pickup result receive queue overflow");
+    }
+
+    private void QueueWorldFlagRequest(WorldFlagRequest request)
+    {
+        if (HasDecodedQueueCapacity(_worldFlagRequests.Count, MaxPendingWorldFlagRequests))
+        {
+            _worldFlagRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("world flag request receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
