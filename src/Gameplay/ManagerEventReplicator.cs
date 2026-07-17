@@ -26,7 +26,8 @@ internal enum ManagerDomain : byte
     Timeline = 13,
     InsectBattle = 14,
     SeahorseRace = 15,
-    Scenario = 16
+    Scenario = 16,
+    Progression = 17
 }
 
 internal enum ManagerAction : byte
@@ -69,12 +70,24 @@ internal enum ManagerAction : byte
     DialogueNode = 36,
     DialogueFinished = 37,
     PhoneCall = 38,
-    PhoneAnswered = 39
+    PhoneAnswered = 39,
+    RewardFirst = 40,
+    RewardLast = 68,
+    Wallet = 69,
+    Unlock = 70,
+    SushiPickupRequest = 71,
+    SushiPickupResult = 72,
+    SushiServeRequest = 73,
+    SushiServeResult = 74,
+    SushiCleanRequest = 75,
+    SushiCleanResult = 76,
+    SushiWasabiRequest = 77
 }
 
 internal sealed class ManagerEventReplicator
 {
     private const int MaxTimelineGeneration = 0x3fffffff;
+    private const int RewardActionBase = (int)ManagerAction.RewardFirst;
 
     private enum RestoreDecision
     {
@@ -88,6 +101,7 @@ internal sealed class ManagerEventReplicator
     private enum ScenarioStartKind { Normal, Branch }
     internal enum DialogueStartKind { Normal, Arguments, Small, VisualNovel }
     private enum CallbackIdentityDecision { None, Invoke, Clear }
+    private enum InvocationReplayDecision { Local, Synthesize, Spectate }
     private enum TimelineStartRoute { ByTid, ByController }
     private enum TimelineStartDecision { ReplayByTid, ReplayByController, ConsumeSpectator }
     private enum TimelineCallbackDecision { None, Wait, Invoke }
@@ -184,6 +198,11 @@ internal sealed class ManagerEventReplicator
     private bool _applyingDialogueAuthority;
     private int _suppressPublish;
     private float _nextSushiScan;
+    private float _nextProgressionScan;
+    private readonly int[] _hostWallet = new int[6];
+    private readonly Dictionary<int, byte> _hostUnlocks = new();
+    private SushiBarOrderQueue.ProgressData _remoteSushiPlate;
+    private bool _clientRemoteSushiPlate;
     private bool _wasConnected;
     private bool _storySnapshotPublished;
     private float _nextStoryScan;
@@ -242,6 +261,12 @@ internal sealed class ManagerEventReplicator
     private int _pendingClientPhoneTid;
     private Il2CppSystem.Action<bool> _pendingClientPhoneCallback;
     private string _pendingHostScenarioStartBundleId = string.Empty;
+    private ManagerInvocationDescriptor? _pendingHostScenarioInvocation;
+    private ManagerInvocationDescriptor? _hostScenarioInvocation;
+    private ManagerInvocationDescriptor? _pendingHostDialogueInvocation;
+    private ManagerInvocationDescriptor? _hostDialogueInvocation;
+    private ManagerInvocationDescriptor? _pendingHostTimelineInvocation;
+    private ManagerInvocationDescriptor? _hostTimelineInvocation;
 
     internal ManagerEventReplicator(ManualLogSource log)
     {
@@ -313,6 +338,17 @@ internal sealed class ManagerEventReplicator
         var hostRevisions = new Dictionary<ManagerDomain, uint> { [ManagerDomain.Story] = 4 };
         var clientRevisions = new Dictionary<ManagerDomain, uint> { [ManagerDomain.Day] = 3 };
         ResetLaneState(pendingLanes, hostRevisions, clientRevisions);
+        var synthesizedScenario = CreateScenarioStart(new ManagerInvocationDescriptor(
+            ManagerInvocationKind.Scenario, "z", new string[] { "a", null, string.Empty },
+            true, false, true, true, false, 0f, 0f, 0f));
+        var synthesizedNullDialogue = CreateDialogueStart(new ManagerInvocationDescriptor(
+            ManagerInvocationKind.DialogueArguments, "dialogue/replay", null,
+            false, true, false, true, false, 0f, 0f, 0f));
+        var synthesizedEmptyDialogue = CreateDialogueStart(new ManagerInvocationDescriptor(
+            ManagerInvocationKind.DialogueArguments, "dialogue/replay", Array.Empty<string>(),
+            true, false, false, true, false, 0f, 0f, 0f));
+        var rewardContext = PackRewardContext(17, RewardShowType.SilentReward);
+        var sushiTarget = PackSushiTarget(SushiBar.Place.Branch, 7);
         if (scenarioCancels != 1 || dialogueCancels != 1 ||
             timelineStarts != 1 || timelineCancels != 1 ||
             dialogueRevision != 0 || dialoguePending.Count != 1 ||
@@ -397,7 +433,35 @@ internal sealed class ManagerEventReplicator
             !ShouldDropTimelineLease(true, false) ||
             ShouldDropTimelineLease(true, true) ||
             ShouldDropTimelineLease(false, false) ||
-            GetTimelineTargets()[0] == null || GetTimelineTargets()[1] == null ||
+            ScenarioPreviousKey(false, () => throw new NullReferenceException()) != 0 ||
+            ScenarioPreviousKey(true, () => throw new NullReferenceException()) != 0 ||
+            ScenarioPreviousKey(true, () => "scenario-a") != ContentKey("scenario-a") ||
+             synthesizedScenario.Kind != ScenarioStartKind.Normal ||
+             synthesizedScenario.Arguments == null || synthesizedScenario.Arguments.Count != 3 ||
+             synthesizedScenario.Arguments[0] != "a" ||
+             synthesizedScenario.Arguments[1] != null ||
+             synthesizedScenario.Arguments[2] != string.Empty ||
+             !synthesizedScenario.UseButton || !synthesizedScenario.IgnorePlaying ||
+             synthesizedNullDialogue.Kind != DialogueStartKind.Arguments ||
+             synthesizedNullDialogue.Arguments != null ||
+             synthesizedEmptyDialogue.Arguments == null ||
+             synthesizedEmptyDialogue.Arguments.Count != 0 ||
+             DecideInvocationReplay(true, true) != InvocationReplayDecision.Local ||
+             DecideInvocationReplay(false, true) != InvocationReplayDecision.Synthesize ||
+             DecideInvocationReplay(false, false) != InvocationReplayDecision.Spectate ||
+             ProgressionRewardAction(CommonRewardType.Gold) != 40 ||
+             !TryUnpackRewardContext(
+                 rewardContext, out var rewardCount, out var rewardShowType) ||
+             rewardCount != 17 || rewardShowType != RewardShowType.SilentReward ||
+             !IsWalletDebitValid(GoodsType.gold, -100, 100) ||
+             IsWalletDebitValid(GoodsType.none, -100, 100) ||
+             IsWalletDebitValid(GoodsType.gold, 1, 100) ||
+             IsWalletDebitValid(GoodsType.gold, -101, 100) ||
+             !TryUnpackSushiTarget(
+                 sushiTarget, out var sushiPlace, out var sushiTable) ||
+             sushiPlace != SushiBar.Place.Branch || sushiTable != 7 ||
+             TryUnpackSushiTarget(-1, out _, out _) ||
+             GetTimelineTargets()[0] == null || GetTimelineTargets()[1] == null ||
             GetTimelineTargets()[2] == null || GetTimelineTargets()[3] == null)
             throw new InvalidOperationException("Manager event self-test failed");
     }
@@ -422,7 +486,10 @@ internal sealed class ManagerEventReplicator
         {
             _hostMenuSlots.Clear();
             Array.Fill(_hostWasabi, -1);
+            Array.Fill(_hostWallet, -1);
+            _hostUnlocks.Clear();
             _nextSushiScan = 0f;
+            _nextProgressionScan = 0f;
             _nextDayScan = 0f;
             _nextStoryScan = 0f;
             _activeSessionSnapshotPublished = false;
@@ -464,6 +531,11 @@ internal sealed class ManagerEventReplicator
         {
             _nextSushiScan = now + 0.5f;
             PublishSushiRuntimeChanges(session);
+        }
+        if (role == SessionRole.Host && now >= _nextProgressionScan)
+        {
+            _nextProgressionScan = now + 0.5f;
+            PublishProgressionChanges(session);
         }
         while (session.TryTakeManagerEvent(out var state))
         {
@@ -528,6 +600,86 @@ internal sealed class ManagerEventReplicator
         return role != SessionRole.Client;
     }
 
+    internal void ObserveReward(SessionRole role, UdpSession session, Reward reward)
+    {
+        if (_applying || role != SessionRole.Host || session?.Connected != true || reward == null)
+            return;
+        var action = ProgressionRewardAction(reward.Type);
+        var context = PackRewardContext(reward.Count, reward.ShowType);
+        if (action is < (int)ManagerAction.RewardFirst or > (int)ManagerAction.RewardLast ||
+            reward.Value < 0 || reward.Count is <= 0 or > 1_000_000 ||
+            !TryUnpackRewardContext(context, out _, out _))
+            return;
+        Publish(session, ManagerDomain.Progression, (ManagerAction)action, reward.Value, context);
+    }
+
+    internal bool InterceptPlayerGoods(
+        SessionRole role, UdpSession session, GoodsType type, int value)
+    {
+        if (_applying || role != SessionRole.Client || session?.Connected != true)
+            return true;
+        if (value < 0 && type is >= GoodsType.gold and <= GoodsType.fakePoint)
+        {
+            _outboundEvents.Enqueue(new ManagerEvent(
+                0, 0, CurrentTick(), (byte)ManagerDomain.Progression,
+                (byte)ManagerAction.Wallet, (int)type, value));
+            FlushOutbound(session);
+            return true;
+        }
+        return false;
+    }
+
+    internal bool InterceptSushiInteraction(
+        SessionRole role, UdpSession session, StaffDave staff, SushiBarInteraction interaction)
+    {
+        if (_applying || role != SessionRole.Client || session?.Connected != true ||
+            interaction != SushiBarInteraction.Serve)
+            return true;
+        if (!_clientRemoteSushiPlate)
+        {
+            QueueClientRequest(session, ManagerDomain.SushiMenu,
+                ManagerAction.SushiPickupRequest, (int)SushiBar.Place.Main, 0);
+            return false;
+        }
+        var customer = FindNearestCustomer(staff?.transform.position ?? default);
+        if (customer != null)
+            QueueClientRequest(session, ManagerDomain.SushiMenu,
+                ManagerAction.SushiServeRequest, 0,
+                PackSushiTarget(customer.PlaceTag, customer.SeatNumber));
+        return false;
+    }
+
+    internal bool InterceptSushiClean(
+        SessionRole role, UdpSession session, SushiBarTrashTrigger trigger, int gold)
+    {
+        if (_applying || role != SessionRole.Client || session?.Connected != true)
+            return true;
+        if (trigger?.Target != null && TryFindTablePlace(trigger.Target, out var place))
+            QueueClientRequest(session, ManagerDomain.SushiTable,
+                ManagerAction.SushiCleanRequest, gold,
+                PackSushiTarget(place, trigger.TableNumber));
+        return false;
+    }
+
+    internal bool InterceptSushiWasabi(
+        SessionRole role, UdpSession session, SushiBar.Place place, int count)
+    {
+        if (_applying || role != SessionRole.Client || session?.Connected != true)
+            return true;
+        if (count > 0)
+            QueueClientRequest(session, ManagerDomain.SushiWasabi,
+                ManagerAction.SushiWasabiRequest, (int)place, count);
+        return false;
+    }
+
+    private void QueueClientRequest(
+        UdpSession session, ManagerDomain domain, ManagerAction action, int value, int context)
+    {
+        _outboundEvents.Enqueue(new ManagerEvent(
+            0, _sceneId, CurrentTick(), (byte)domain, (byte)action, value, context));
+        FlushOutbound(session);
+    }
+
     internal bool BeginIntercept(
         SessionRole role,
         UdpSession session,
@@ -566,6 +718,15 @@ internal sealed class ManagerEventReplicator
             return true;
         if (role == SessionRole.Host)
         {
+            var hasCustomPosition = customPos.HasValue;
+            var position = hasCustomPosition ? customPos.Value : default;
+            var invocation = new ManagerInvocationDescriptor(
+                ManagerInvocationKind.TimelineByTid, null, null,
+                false, false, false, applyOffset, hasCustomPosition,
+                position.x, position.y, position.z);
+            _pendingHostTimelineInvocation = Protocol.IsValidManagerInvocation(
+                (byte)ManagerDomain.Timeline, (byte)ManagerAction.TimelineStart,
+                tid, invocation) ? invocation : null;
             RecordHostTimelineRoute(tid, TimelineStartRoute.ByTid);
             return true;
         }
@@ -602,6 +763,7 @@ internal sealed class ManagerEventReplicator
         var tid = id != 0 ? id : controller?.TimelineID ?? 0;
         if (role == SessionRole.Host)
         {
+            _pendingHostTimelineInvocation = null;
             RecordHostTimelineRoute(tid, TimelineStartRoute.ByController);
             return true;
         }
@@ -653,7 +815,10 @@ internal sealed class ManagerEventReplicator
             }
             if (role == SessionRole.Host && tid != int.MinValue &&
                 _hostTimelineRouteTid == Math.Abs(tid))
+            {
                 _hostTimelineRouteTid = 0;
+                _pendingHostTimelineInvocation = null;
+            }
             return;
         }
         if (role == SessionRole.Client)
@@ -673,6 +838,11 @@ internal sealed class ManagerEventReplicator
             _hostTimelineActiveRoute = _hostTimelineRouteTid == tid
                 ? _hostTimelineRoute
                 : TimelineStartRoute.ByTid;
+            _hostTimelineInvocation = _hostTimelineActiveRoute == TimelineStartRoute.ByTid &&
+                _hostTimelineRouteTid == tid
+                ? _pendingHostTimelineInvocation
+                : null;
+            _pendingHostTimelineInvocation = null;
         }
         var flag = start
             ? _hostTimelineActiveRoute == TimelineStartRoute.ByController
@@ -686,7 +856,9 @@ internal sealed class ManagerEventReplicator
         if (session?.Connected == true)
             Publish(session, ManagerDomain.Timeline,
                 start ? ManagerAction.TimelineStart : ManagerAction.TimelineFinish,
-                tid, context);
+                tid, context, start ? _hostTimelineInvocation : null);
+        if (!start)
+            _hostTimelineInvocation = null;
     }
 
     internal bool AllowTimelineTerminalControl(SessionRole role, UdpSession session) =>
@@ -773,6 +945,21 @@ internal sealed class ManagerEventReplicator
         bool showCurtain,
         bool ignorePlaying)
     {
+        if (!_applying && role == SessionRole.Host)
+        {
+            _pendingHostScenarioInvocation = null;
+            if (!isBranch)
+            {
+                var invocation = new ManagerInvocationDescriptor(
+                    ManagerInvocationKind.Scenario, bundleId, SnapshotArguments(arguments),
+                    useButton, showCurtain, ignorePlaying, true, false, 0f, 0f, 0f);
+                var invocationKey = ContentKey(bundleId);
+                if (Protocol.IsValidManagerInvocation(
+                        (byte)ManagerDomain.Scenario,
+                        (byte)ManagerAction.ScenarioStarted, invocationKey, invocation))
+                    _pendingHostScenarioInvocation = invocation;
+            }
+        }
         if (_applying || ProbeBehaviour.Instance?.IsApplyingNpcGrant == true ||
             role != SessionRole.Client || session?.Connected != true)
             return true;
@@ -811,6 +998,29 @@ internal sealed class ManagerEventReplicator
         bool useButton,
         bool showCurtain)
     {
+        if (!_applying && role == SessionRole.Host)
+        {
+            _pendingHostDialogueInvocation = null;
+            var invocationKind = kind switch
+            {
+                DialogueStartKind.Normal => ManagerInvocationKind.DialogueNormal,
+                DialogueStartKind.Arguments => ManagerInvocationKind.DialogueArguments,
+                DialogueStartKind.Small => ManagerInvocationKind.DialogueSmall,
+                _ => (ManagerInvocationKind)0
+            };
+            if (invocationKind != 0)
+            {
+                var invocation = new ManagerInvocationDescriptor(
+                    invocationKind, bundleId,
+                    kind == DialogueStartKind.Arguments ? SnapshotArguments(arguments) : null,
+                    useButton, showCurtain, false, true, false, 0f, 0f, 0f);
+                var invocationKey = ContentKey(bundleId);
+                if (Protocol.IsValidManagerInvocation(
+                        (byte)ManagerDomain.Dialogue,
+                        (byte)ManagerAction.DialogueStarted, invocationKey, invocation))
+                    _pendingHostDialogueInvocation = invocation;
+            }
+        }
         if (_applying || ProbeBehaviour.Instance?.IsApplyingNpcGrant == true ||
             role != SessionRole.Client || session?.Connected != true)
             return true;
@@ -877,9 +1087,12 @@ internal sealed class ManagerEventReplicator
         _pendingHostScenarioStartBundleId = string.Empty;
         _hostScenarioBundleKey = key;
         _hostScenarioNodeId = -1;
+        _hostScenarioInvocation = _pendingHostScenarioInvocation is { } invocation &&
+            ContentKey(invocation.BundleId) == key ? invocation : null;
+        _pendingHostScenarioInvocation = null;
         if (session?.Connected == true)
             Publish(session, ManagerDomain.Scenario, ManagerAction.ScenarioStarted,
-                _hostScenarioBundleKey, 0);
+                _hostScenarioBundleKey, 0, _hostScenarioInvocation);
     }
 
     internal void ObserveScenarioNode(
@@ -948,6 +1161,7 @@ internal sealed class ManagerEventReplicator
         _hostScenarioBundleId = string.Empty;
         _hostScenarioBundleKey = 0;
         _hostScenarioNodeId = -1;
+        _hostScenarioInvocation = null;
     }
 
     internal void ObserveScenarioFinished(SessionRole role, UdpSession session) =>
@@ -967,8 +1181,12 @@ internal sealed class ManagerEventReplicator
             return;
         _hostDialogueBundleKey = key;
         _hostDialogueIndex = -1;
+        _hostDialogueInvocation = _pendingHostDialogueInvocation is { } invocation &&
+            ContentKey(invocation.BundleId) == key ? invocation : null;
+        _pendingHostDialogueInvocation = null;
         if (session?.Connected == true)
-            Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueStarted, key, 0);
+            Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueStarted,
+                key, 0, _hostDialogueInvocation);
     }
 
     internal void ObserveDialogueNode(
@@ -997,6 +1215,7 @@ internal sealed class ManagerEventReplicator
                 bundleKey, result ? 1 : 0);
         _hostDialogueBundleKey = 0;
         _hostDialogueIndex = -1;
+        _hostDialogueInvocation = null;
     }
 
     internal void ObserveDialogueFinished(SessionRole role, UdpSession session) =>
@@ -1159,6 +1378,10 @@ internal sealed class ManagerEventReplicator
         ResetLaneState(_pendingHostEvents, _hostRevisions, _clientManagerRevisions);
         _hostMenuSlots.Clear();
         Array.Fill(_hostWasabi, -1);
+        Array.Fill(_hostWallet, -1);
+        _hostUnlocks.Clear();
+        _remoteSushiPlate = null;
+        _clientRemoteSushiPlate = false;
         _sushiRevision = 0;
         _clientSushiRevision = 0;
         _pendingSushiResult = null;
@@ -1167,6 +1390,7 @@ internal sealed class ManagerEventReplicator
         _applyingDialogueAuthority = false;
         _suppressPublish = 0;
         _nextSushiScan = 0f;
+        _nextProgressionScan = 0f;
         _nextDayScan = 0f;
         _nextStoryScan = 0f;
         _hostCurrentChapter = int.MinValue;
@@ -1187,6 +1411,8 @@ internal sealed class ManagerEventReplicator
             _hostTimelineRoute = TimelineStartRoute.ByTid;
             _hostTimelineGeneration = 0;
             _hostTimelineActiveRoute = TimelineStartRoute.ByTid;
+            _pendingHostTimelineInvocation = null;
+            _hostTimelineInvocation = null;
         }
         _hasHostClockOffset = false;
         _hostClockOffset = 0;
@@ -1199,8 +1425,12 @@ internal sealed class ManagerEventReplicator
             _hostScenarioBundleId = string.Empty;
             _hostScenarioBundleKey = 0;
             _hostScenarioNodeId = -1;
+            _pendingHostScenarioInvocation = null;
+            _hostScenarioInvocation = null;
             _hostDialogueBundleKey = 0;
             _hostDialogueIndex = -1;
+            _pendingHostDialogueInvocation = null;
+            _hostDialogueInvocation = null;
         }
         _clientScenarioBundleId = string.Empty;
         _clientScenarioBundleKey = 0;
@@ -1226,11 +1456,17 @@ internal sealed class ManagerEventReplicator
         _hostDayTime = int.MinValue;
         _hostWeather = int.MinValue;
         _nextDayScan = 0f;
+        Array.Fill(_hostWallet, -1);
+        _hostUnlocks.Clear();
+        _nextProgressionScan = 0f;
         _activeSessionSnapshotPublished = false;
     }
 
     internal void OnSceneChanged()
     {
+        _remoteSushiPlate = null;
+        _clientRemoteSushiPlate = false;
+        _pendingHostTimelineInvocation = null;
         CancelPendingScenarioStart();
         CancelPendingDialogueStart();
         CompletePendingPhoneCallback(false);
@@ -1264,7 +1500,8 @@ internal sealed class ManagerEventReplicator
         ManagerDomain domain,
         ManagerAction action,
         int value,
-        int context)
+        int context,
+        ManagerInvocationDescriptor? invocation = null)
     {
         var lane = LaneOf(domain);
         var revision = NextRevision(GetRevision(_hostRevisions, lane));
@@ -1273,7 +1510,7 @@ internal sealed class ManagerEventReplicator
             revision,
             IsGlobal(domain) ? 0 : _sceneId,
             CurrentTick(),
-            (byte)domain, (byte)action, value, context));
+            (byte)domain, (byte)action, value, context, invocation));
         FlushOutbound(session);
     }
 
@@ -1286,8 +1523,30 @@ internal sealed class ManagerEventReplicator
 
     private void ApplyClientRequest(UdpSession session, ManagerEvent state)
     {
-        if ((ManagerDomain)state.Domain != ManagerDomain.Dialogue || state.Revision != 0 ||
-            state.SceneId != 0 || !ValidateDialogueIntent(state))
+        if (state.Revision != 0)
+            return;
+        var domain = (ManagerDomain)state.Domain;
+        if (domain == ManagerDomain.Progression &&
+            (ManagerAction)state.Action == ManagerAction.Wallet)
+        {
+            if (state.SceneId != 0)
+                return;
+            var type = (GoodsType)state.Value;
+            var balance = GetWalletBalance(type);
+            if (!IsWalletDebitValid(type, state.Context, balance))
+                return;
+            CommonDefine.Instance?.AddPlayerGoods(type, state.Context);
+            PublishWallet(session, type);
+            return;
+        }
+        if ((domain is ManagerDomain.SushiMenu or ManagerDomain.SushiTable or
+                ManagerDomain.SushiWasabi) &&
+            state.SceneId == _sceneId && state.SceneId != 0 && session.SceneMatches(_sceneId))
+        {
+            ApplySushiClientRequest(session, state);
+            return;
+        }
+        if (state.SceneId != 0 || domain != ManagerDomain.Dialogue || !ValidateDialogueIntent(state))
             return;
         if (Apply(state))
             Publish(session, (ManagerDomain)state.Domain, (ManagerAction)state.Action,
@@ -1340,9 +1599,14 @@ internal sealed class ManagerEventReplicator
                     return ApplyJungleSushi((ManagerAction)state.Action, state.Value != 0);
                 case ManagerDomain.Dialogue:
                     return ApplyDialogueState(
-                        (ManagerAction)state.Action, state.Value, state.Context);
+                        (ManagerAction)state.Action, state.Value, state.Context,
+                        state.Invocation);
                 case ManagerDomain.Scenario:
                     return ApplyScenarioState(
+                        (ManagerAction)state.Action, state.Value, state.Context,
+                        state.Invocation);
+                case ManagerDomain.Progression:
+                    return ApplyProgression(
                         (ManagerAction)state.Action, state.Value, state.Context);
                 case ManagerDomain.Betting:
                     var betting = UnityEngine.Object.FindFirstObjectByType<MiniGame.BettingGameUI_ResultPage>();
@@ -1372,10 +1636,16 @@ internal sealed class ManagerEventReplicator
                     result.Show(state.Value, track);
                     return true;
                 case ManagerDomain.SushiMenu:
+                    if ((ManagerAction)state.Action is ManagerAction.SushiPickupResult or
+                        ManagerAction.SushiServeResult)
+                        return ApplySushiFoodResult(
+                            (ManagerAction)state.Action, state.Value, state.Context);
                     return ApplyMenuState((ManagerAction)state.Action, state.Value, state.Context);
                 case ManagerDomain.SushiWasabi:
                     return ApplyWasabiState(state.Value, state.Context);
                 case ManagerDomain.SushiTable:
+                    if ((ManagerAction)state.Action == ManagerAction.SushiCleanResult)
+                        return ApplySushiCleanResult(state.Value, state.Context);
                     return ApplyTableState(state.Value != 0, state.Context);
                 case ManagerDomain.Story:
                     return ApplyStory((ManagerAction)state.Action, state.Value);
@@ -1383,7 +1653,8 @@ internal sealed class ManagerEventReplicator
                     return ApplyDay((ManagerAction)state.Action, state.Value, state.Context);
                 case ManagerDomain.Timeline:
                     return ApplyTimeline(
-                        (ManagerAction)state.Action, state.Value, state.Context, state.HostTick);
+                        (ManagerAction)state.Action, state.Value, state.Context,
+                        state.HostTick, state.Invocation);
                 case ManagerDomain.InsectBattle:
                     var battle = UnityEngine.Object.FindFirstObjectByType<InsectBattle.InsectBattleStateManager>();
                     if (battle == null)
@@ -1455,7 +1726,11 @@ internal sealed class ManagerEventReplicator
         }
     }
 
-    private bool ApplyDialogueState(ManagerAction action, int bundleKey, int index)
+    private bool ApplyDialogueState(
+        ManagerAction action,
+        int bundleKey,
+        int index,
+        ManagerInvocationDescriptor? invocation)
     {
         var manager = DialogueManager.Instance;
         switch (action)
@@ -1465,14 +1740,29 @@ internal sealed class ManagerEventReplicator
                 _clientDialogueIndex = -1;
                 if (bundleKey == 0)
                     return false;
+                if (manager?.IsPlaying == true && ContentKey(manager.CurrentBundleID) == bundleKey)
+                {
+                    _clientDialogueIndex = manager.m_CurrentDialogueIndex;
+                    _clientDialogueSpectating = false;
+                    return true;
+                }
                 if (CallbackIdentity(_pendingClientDialogueStart?.BundleKey ?? 0, bundleKey) ==
                     CallbackIdentityDecision.Clear)
                     CancelPendingDialogueStart();
-                if (_pendingClientDialogueStart?.BundleKey != bundleKey || manager == null)
+                var dialogueDecision = DecideInvocationReplay(
+                    _pendingClientDialogueStart?.BundleKey == bundleKey,
+                    IsDialogueInvocation(invocation));
+                if (dialogueDecision == InvocationReplayDecision.Synthesize)
+                {
+                    _pendingClientDialogueStart = CreateDialogueStart(invocation.Value);
+                    _log.LogInfo($"Dialogue presentation synthesized: bundle={bundleKey:X8}");
+                }
+                if (dialogueDecision == InvocationReplayDecision.Spectate || manager == null)
                 {
                     _clientDialogueSpectating = true;
                     _log.LogInfo(
-                        $"Dialogue presentation spectating: bundle={bundleKey:X8}; local invocation unavailable");
+                        $"Dialogue presentation spectator fallback: bundle={bundleKey:X8}; " +
+                        "unsupported or unavailable invocation");
                     return true;
                 }
                 _clientDialogueSpectating = false;
@@ -1585,7 +1875,11 @@ internal sealed class ManagerEventReplicator
             InvokeClientPresentationCallback(() => callback.Invoke(result), "phone call");
     }
 
-    private bool ApplyScenarioState(ManagerAction action, int bundleKey, int nodeId)
+    private bool ApplyScenarioState(
+        ManagerAction action,
+        int bundleKey,
+        int nodeId,
+        ManagerInvocationDescriptor? invocation)
     {
         var manager = ScenarioManager.Instance;
         switch (action)
@@ -1595,6 +1889,12 @@ internal sealed class ManagerEventReplicator
                     return false;
                 _clientScenarioBundleKey = bundleKey;
                 _clientScenarioNodeId = -1;
+                if (ScenarioPreviousKey(
+                        manager?.IsPlaying == true, () => manager.CurrentSequenceID) == bundleKey)
+                {
+                    _clientScenarioSpectating = false;
+                    return true;
+                }
                 if (CallbackIdentity(_pendingClientScenarioStart?.BundleKey ?? 0, bundleKey) ==
                     CallbackIdentityDecision.Clear)
                 {
@@ -1602,11 +1902,20 @@ internal sealed class ManagerEventReplicator
                     _blockedClientScenarioNode = null;
                     _blockedClientScenarioNodeKey = 0;
                 }
-                if (_pendingClientScenarioStart?.BundleKey != bundleKey || manager == null)
+                var scenarioDecision = DecideInvocationReplay(
+                    _pendingClientScenarioStart?.BundleKey == bundleKey,
+                    invocation?.Kind == ManagerInvocationKind.Scenario);
+                if (scenarioDecision == InvocationReplayDecision.Synthesize)
+                {
+                    _pendingClientScenarioStart = CreateScenarioStart(invocation.Value);
+                    _log.LogInfo($"Scenario presentation synthesized: bundle={bundleKey:X8}");
+                }
+                if (scenarioDecision == InvocationReplayDecision.Spectate || manager == null)
                 {
                     _clientScenarioSpectating = true;
                     _log.LogInfo(
-                        $"Scenario presentation spectating: bundle={bundleKey:X8}; local invocation unavailable");
+                        $"Scenario presentation spectator fallback: bundle={bundleKey:X8}; " +
+                        "unsupported or unavailable invocation");
                     return true;
                 }
                 _clientScenarioSpectating = false;
@@ -1692,6 +2001,62 @@ internal sealed class ManagerEventReplicator
         }
     }
 
+    private static string[] SnapshotArguments(
+        Il2CppSystem.Collections.Generic.List<string> arguments)
+    {
+        if (arguments == null)
+            return null;
+        var snapshot = new string[arguments.Count];
+        for (var index = 0; index < snapshot.Length; index++)
+            snapshot[index] = arguments[index];
+        return snapshot;
+    }
+
+    private static Il2CppSystem.Collections.Generic.List<string> RestoreArguments(
+        string[] arguments)
+    {
+        if (arguments == null)
+            return null;
+        var restored = new Il2CppSystem.Collections.Generic.List<string>();
+        foreach (var argument in arguments)
+            restored.Add(argument);
+        return restored;
+    }
+
+    private static PendingScenarioStart CreateScenarioStart(
+        ManagerInvocationDescriptor invocation) => new()
+    {
+        Kind = ScenarioStartKind.Normal,
+        BundleId = invocation.BundleId,
+        BundleKey = ContentKey(invocation.BundleId),
+        Arguments = RestoreArguments(invocation.Arguments),
+        UseButton = invocation.UseButton,
+        ShowCurtain = invocation.ShowCurtain,
+        IgnorePlaying = invocation.IgnorePlaying
+    };
+
+    private static PendingDialogueStart CreateDialogueStart(
+        ManagerInvocationDescriptor invocation) => new()
+    {
+        Kind = invocation.Kind switch
+        {
+            ManagerInvocationKind.DialogueArguments => DialogueStartKind.Arguments,
+            ManagerInvocationKind.DialogueSmall => DialogueStartKind.Small,
+            _ => DialogueStartKind.Normal
+        },
+        BundleId = invocation.BundleId,
+        BundleKey = ContentKey(invocation.BundleId),
+        Arguments = invocation.Kind == ManagerInvocationKind.DialogueArguments
+            ? RestoreArguments(invocation.Arguments)
+            : null,
+        UseButton = invocation.UseButton,
+        ShowCurtain = invocation.ShowCurtain
+    };
+
+    private static bool IsDialogueInvocation(ManagerInvocationDescriptor? invocation) =>
+        invocation?.Kind is ManagerInvocationKind.DialogueNormal or
+            ManagerInvocationKind.DialogueArguments or ManagerInvocationKind.DialogueSmall;
+
     private void CompleteScenarioCallback(int bundleKey, bool result)
     {
         var decision = CallbackIdentity(
@@ -1745,6 +2110,8 @@ internal sealed class ManagerEventReplicator
         if (callback == null)
             return;
         var probe = ProbeBehaviour.Instance;
+        var previousApplying = _applying;
+        _applying = false;
         probe?.BeginClientPresentationLifecycle();
         try
         {
@@ -1757,6 +2124,7 @@ internal sealed class ManagerEventReplicator
         finally
         {
             probe?.EndClientPresentationLifecycle();
+            _applying = previousApplying;
         }
     }
 
@@ -1830,6 +2198,166 @@ internal sealed class ManagerEventReplicator
             _log.LogWarning($"Sushi result apply failed: {exception.Message}");
             return false;
         }
+    }
+
+    private void ApplySushiClientRequest(UdpSession session, ManagerEvent state)
+    {
+        var action = (ManagerAction)state.Action;
+        if (action == ManagerAction.SushiPickupRequest)
+        {
+            var place = (SushiBar.Place)state.Value;
+            var queue = place is >= SushiBar.Place.Main and < SushiBar.Place.Max
+                ? SushiBarStaffManager.GetInstanceOrderQueue(place)
+                : null;
+            if (_remoteSushiPlate == null && queue != null)
+                _remoteSushiPlate = queue.GetNowServingData(CustomerTypeFlag.ALL, null, false);
+            var recipe = _remoteSushiPlate == null
+                ? 0
+                : _remoteSushiPlate.PickUpID != 0
+                    ? _remoteSushiPlate.PickUpID
+                    : _remoteSushiPlate.OrderID;
+            var target = _remoteSushiPlate?.ReciveCustomer;
+            Publish(session, ManagerDomain.SushiMenu, ManagerAction.SushiPickupResult,
+                recipe, target == null ? PackSushiTarget(place, 0) :
+                PackSushiTarget(target.PlaceTag, target.SeatNumber));
+            return;
+        }
+        if (action == ManagerAction.SushiServeRequest)
+        {
+            var success = false;
+            if (_remoteSushiPlate != null &&
+                TryUnpackSushiTarget(state.Context, out var place, out var table))
+            {
+                var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
+                    .GetVisitCustomer(table, place);
+                var expected = _remoteSushiPlate.ReciveCustomer;
+                var staff = SushiBarManager.Instance?.dave;
+                if (customer != null && customer.CanServed() &&
+                    staff != null &&
+                    (expected == null || expected.GetInstanceID() == customer.GetInstanceID()))
+                    success = customer.Served(staff);
+            }
+            if (success)
+                _remoteSushiPlate = null;
+            Publish(session, ManagerDomain.SushiMenu, ManagerAction.SushiServeResult,
+                success ? 1 : 0, state.Context);
+            return;
+        }
+        if (action == ManagerAction.SushiCleanRequest && state.Value is >= 0 and <= 1_000_000 &&
+            TryUnpackSushiTarget(state.Context, out var cleanPlace, out var cleanTable))
+        {
+            var trigger = FindTrashTrigger(cleanPlace, cleanTable);
+            var success = trigger?.Target?.IsTrash == true;
+            if (success)
+                trigger.CleanFinished(state.Value);
+            Publish(session, ManagerDomain.SushiTable, ManagerAction.SushiCleanResult,
+                success ? state.Value : -1, state.Context);
+            return;
+        }
+        if (action == ManagerAction.SushiWasabiRequest &&
+            state.Value is >= (int)SushiBar.Place.Main and < (int)SushiBar.Place.Max &&
+            state.Context is >= 1 and <= 1000)
+            SushiBarContext.Operation?.UpdateWasabiCount(
+                (SushiBar.Place)state.Value, state.Context);
+    }
+
+    private bool ApplySushiFoodResult(ManagerAction action, int value, int context)
+    {
+        var dave = SushiBarManager.Instance?.dave;
+        if (dave == null)
+            return false;
+        if (action == ManagerAction.SushiPickupResult)
+        {
+            if (value <= 0)
+                return true;
+            var place = TryUnpackSushiTarget(context, out var targetPlace, out _)
+                ? targetPlace
+                : SushiBar.Place.Main;
+            var local = SushiBarStaffManager.GetInstanceOrderQueue(place)?
+                .GetNowServingData(CustomerTypeFlag.ALL, null, false);
+            dave.ProgressData = local;
+            dave.PickupRecipeID.Value = value;
+            _clientRemoteSushiPlate = true;
+            return true;
+        }
+        if (action != ManagerAction.SushiServeResult || value == 0)
+            return true;
+        if (TryUnpackSushiTarget(context, out var placeTag, out var table))
+        {
+            var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
+                .GetVisitCustomer(table, placeTag);
+            if (customer?.CanServed() == true)
+                customer.Served(dave);
+        }
+        dave.ProgressData = null;
+        dave.PickupRecipeID.Value = 0;
+        _clientRemoteSushiPlate = false;
+        return true;
+    }
+
+    private bool ApplySushiCleanResult(int gold, int context)
+    {
+        if (gold < 0 || !TryUnpackSushiTarget(context, out var place, out var table))
+            return true;
+        var trigger = FindTrashTrigger(place, table);
+        if (trigger?.Target?.IsTrash == true)
+            trigger.CleanFinished(gold);
+        return true;
+    }
+
+    private static SushiBar.Customer.SushiBarCustomer FindNearestCustomer(Vector3 position)
+    {
+        SushiBar.Customer.SushiBarCustomer nearest = null;
+        var distance = 16f;
+        foreach (var customer in UnityEngine.Object.FindObjectsByType<
+                     SushiBar.Customer.SushiBarCustomer>(FindObjectsSortMode.None))
+        {
+            if (customer == null || !customer.CanServed())
+                continue;
+            var current = (customer.transform.position - position).sqrMagnitude;
+            if (current >= distance)
+                continue;
+            nearest = customer;
+            distance = current;
+        }
+        return nearest;
+    }
+
+    private static SushiBarTrashTrigger FindTrashTrigger(SushiBar.Place place, int table)
+    {
+        foreach (var trigger in UnityEngine.Object.FindObjectsByType<SushiBarTrashTrigger>(
+                     FindObjectsSortMode.None))
+            if (trigger != null && trigger.TableNumber == table && trigger.Target != null &&
+                TryFindTablePlace(trigger.Target, out var current) && current == place)
+                return trigger;
+        return null;
+    }
+
+    private static bool TryFindTablePlace(SushiBarTable table, out SushiBar.Place place)
+    {
+        var manager = SushibarTableManager.Instance;
+        if (manager != null)
+            for (var value = (int)SushiBar.Place.Main; value < (int)SushiBar.Place.Max; value++)
+                if (manager.GetTable(table.tableNumber, (SushiBar.Place)value) == table)
+                {
+                    place = (SushiBar.Place)value;
+                    return true;
+                }
+        place = SushiBar.Place.Unknown;
+        return false;
+    }
+
+    private static int PackSushiTarget(SushiBar.Place place, int table) =>
+        place is >= SushiBar.Place.Main and < SushiBar.Place.Max && table is >= 0 and <= ushort.MaxValue
+            ? ((int)place << 16) | table
+            : -1;
+
+    private static bool TryUnpackSushiTarget(
+        int value, out SushiBar.Place place, out int table)
+    {
+        place = (SushiBar.Place)((uint)value >> 16);
+        table = value & 0xffff;
+        return value >= 0 && place is >= SushiBar.Place.Main and < SushiBar.Place.Max;
     }
 
     private void PublishSushiRuntimeChanges(UdpSession session)
@@ -2110,7 +2638,12 @@ internal sealed class ManagerEventReplicator
             BitConverter.SingleToInt32Bits((float)director.time));
     }
 
-    private bool ApplyTimeline(ManagerAction action, int tid, int context, uint hostTick)
+    private bool ApplyTimeline(
+        ManagerAction action,
+        int tid,
+        int context,
+        uint hostTick,
+        ManagerInvocationDescriptor? invocation)
     {
         var manager = TimelineManager.Instance;
         if (manager == null || tid == 0 || tid == int.MinValue)
@@ -2135,6 +2668,26 @@ internal sealed class ManagerEventReplicator
             }
             var intent = lease?.Generation == 0 && lease.Tid == timelineTid &&
                 lease.Route == route ? lease : null;
+            var invocationDecision = DecideInvocationReplay(
+                intent != null,
+                route == TimelineStartRoute.ByTid &&
+                    invocation?.Kind == ManagerInvocationKind.TimelineByTid);
+            if (invocationDecision == InvocationReplayDecision.Synthesize)
+            {
+                var descriptor = invocation.Value;
+                intent = new TimelineLease
+                {
+                    Tid = timelineTid,
+                    Route = TimelineStartRoute.ByTid,
+                    State = ClientTimelineState.AwaitingHostStart,
+                    ApplyOffset = descriptor.ApplyOffset,
+                    CustomPos = descriptor.HasCustomPosition
+                        ? new Il2CppSystem.Nullable<Vector3>(new Vector3(
+                            descriptor.CustomX, descriptor.CustomY, descriptor.CustomZ))
+                        : default
+                };
+                _log.LogInfo($"Timeline presentation synthesized: tid={timelineTid}");
+            }
             if (intent == null)
                 CancelTimelineLease(lease);
             _clientTimelineLease = lease = new TimelineLease
@@ -2161,6 +2714,9 @@ internal sealed class ManagerEventReplicator
             {
                 lease.State = ClientTimelineState.Spectating;
                 lease.StartObserved = true;
+                _log.LogInfo(
+                    $"Timeline presentation spectator fallback: tid={timelineTid}; " +
+                    "controller invocation unavailable");
                 DeliverTimelineStart(lease);
                 return true;
             }
@@ -2333,6 +2889,135 @@ internal sealed class ManagerEventReplicator
         }
     }
 
+    private bool ApplyProgression(ManagerAction action, int value, int context)
+    {
+        var probe = ProbeBehaviour.Instance;
+        probe?.BeginRemoteMissionApply();
+        try
+        {
+            var actionValue = (int)action;
+            if (actionValue is >= (int)ManagerAction.RewardFirst and <= (int)ManagerAction.RewardLast)
+            {
+                if (!TryUnpackRewardContext(context, out var count, out var showType))
+                    return false;
+                var type = (CommonRewardType)(actionValue - RewardActionBase);
+                var reward = Reward.CreateInstance(type, value, count, showType);
+                if (reward == null || RewardManager.Instance == null)
+                    return false;
+                RewardManager.Instance.Reward(reward);
+                _log.LogInfo($"Shared reward applied: type={type}; value={value}; count={count}");
+                return true;
+            }
+            if (action == ManagerAction.Wallet)
+            {
+                var type = (GoodsType)value;
+                if (context < 0 || type is < GoodsType.gold or > GoodsType.fakePoint)
+                    return false;
+                var current = GetWalletBalance(type);
+                if (current < 0)
+                    return false;
+                if (current != context)
+                    CommonDefine.Instance?.AddPlayerGoods(type, context - current);
+                return true;
+            }
+            if (action != ManagerAction.Unlock || context is < 0 or > 3)
+                return false;
+            var data = ContentsUnlockManager.Instance?.GetUnlockData((ContentsList)value);
+            if (data == null)
+                return false;
+            data.isUnlock = (context & 1) != 0;
+            data.isNew = (context & 2) != 0;
+            data.Save();
+            return true;
+        }
+        finally
+        {
+            probe?.EndRemoteMissionApply();
+        }
+    }
+
+    private void PublishProgressionChanges(UdpSession session)
+    {
+        for (var value = (int)GoodsType.gold; value <= (int)GoodsType.fakePoint; value++)
+            PublishWalletIfChanged(session, (GoodsType)value);
+
+        var unlocks = ContentsUnlockManager.Instance?.m_UnlockDatas;
+        if (unlocks == null)
+            return;
+        foreach (var pair in unlocks)
+        {
+            var data = pair.Value;
+            if (data == null)
+                continue;
+            var id = (int)pair.Key;
+            var flags = (byte)((data.isUnlock ? 1 : 0) | (data.isNew ? 2 : 0));
+            if (_hostUnlocks.TryGetValue(id, out var previous) && previous == flags)
+                continue;
+            _hostUnlocks[id] = flags;
+            if (flags != 0 || previous != 0)
+                Publish(session, ManagerDomain.Progression, ManagerAction.Unlock, id, flags);
+        }
+    }
+
+    private void PublishWalletIfChanged(UdpSession session, GoodsType type)
+    {
+        var balance = GetWalletBalance(type);
+        var index = (int)type - (int)GoodsType.gold;
+        if (balance < 0 || index < 0 || index >= _hostWallet.Length || _hostWallet[index] == balance)
+            return;
+        _hostWallet[index] = balance;
+        Publish(session, ManagerDomain.Progression, ManagerAction.Wallet, (int)type, balance);
+    }
+
+    private void PublishWallet(UdpSession session, GoodsType type)
+    {
+        var index = (int)type - (int)GoodsType.gold;
+        var balance = GetWalletBalance(type);
+        if (index < 0 || index >= _hostWallet.Length || balance < 0)
+            return;
+        _hostWallet[index] = balance;
+        Publish(session, ManagerDomain.Progression, ManagerAction.Wallet, (int)type, balance);
+    }
+
+    private static int GetWalletBalance(GoodsType type)
+    {
+        var player = SaveSystem.GetGameSave()?.playerInfo;
+        if (player == null)
+            return -1;
+        return type switch
+        {
+            GoodsType.gold => player.m_Gold,
+            GoodsType.researchPoint => player.m_researchPoint,
+            GoodsType.Bei => player.m_Bei,
+            GoodsType.trustPoint => player.m_TrustPoint,
+            GoodsType.chefFlame => player.m_ChefFlame,
+            GoodsType.fakePoint => player.m_FakePoint,
+            _ => -1
+        };
+    }
+
+    private static int ProgressionRewardAction(CommonRewardType type) =>
+        RewardActionBase + (int)type;
+
+    private static int PackRewardContext(int count, RewardShowType showType) =>
+        count is > 0 and <= 1_000_000 &&
+        showType is >= RewardShowType.AlwaysShow and <= RewardShowType.SilentReward
+            ? (count & 0x3fffffff) | ((int)showType << 30)
+            : -1;
+
+    private static bool TryUnpackRewardContext(
+        int context, out int count, out RewardShowType showType)
+    {
+        count = context & 0x3fffffff;
+        showType = (RewardShowType)((uint)context >> 30);
+        return count is > 0 and <= 1_000_000 &&
+            showType is >= RewardShowType.AlwaysShow and <= RewardShowType.SilentReward;
+    }
+
+    private static bool IsWalletDebitValid(GoodsType type, int delta, int balance) =>
+        type is >= GoodsType.gold and <= GoodsType.fakePoint &&
+        delta is < 0 and >= -1_000_000_000 && balance >= 0 && (long)balance + delta >= 0;
+
     private static int PackUShorts(int low, int high) =>
         (Math.Clamp(low, 0, ushort.MaxValue) & 0xffff) |
         (Math.Clamp(high, 0, ushort.MaxValue) << 16);
@@ -2401,13 +3086,14 @@ internal sealed class ManagerEventReplicator
             Publish(session, ManagerDomain.Timeline, ManagerAction.TimelineStart,
                 _hostTimelineTid,
                 PackTimelineContext(_hostTimelineGeneration,
-                    _hostTimelineActiveRoute == TimelineStartRoute.ByController));
+                    _hostTimelineActiveRoute == TimelineStartRoute.ByController),
+                _hostTimelineInvocation);
             PublishTimelineProgress(session);
         }
         if (_hostScenarioBundleKey != 0)
         {
             Publish(session, ManagerDomain.Scenario, ManagerAction.ScenarioStarted,
-                _hostScenarioBundleKey, 0);
+                _hostScenarioBundleKey, 0, _hostScenarioInvocation);
             if (_hostScenarioNodeId >= 0)
                 Publish(session, ManagerDomain.Scenario, ManagerAction.ScenarioNode,
                     _hostScenarioBundleKey, _hostScenarioNodeId);
@@ -2415,7 +3101,7 @@ internal sealed class ManagerEventReplicator
         if (_hostDialogueBundleKey != 0)
         {
             Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueStarted,
-                _hostDialogueBundleKey, 0);
+                _hostDialogueBundleKey, 0, _hostDialogueInvocation);
             if (_hostDialogueIndex >= 0)
                 Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueNode,
                     _hostDialogueBundleKey, _hostDialogueIndex);
@@ -2533,6 +3219,20 @@ internal sealed class ManagerEventReplicator
         ? 0
         : unchecked((int)Protocol.SceneId(value));
 
+    internal static int ScenarioPreviousKey(bool wasPlaying, Func<string> readSequenceId)
+    {
+        if (!wasPlaying)
+            return 0;
+        try
+        {
+            return ContentKey(readSequenceId());
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
     private static TimelineStartDecision DecideTimelineStart(
         bool hasIntent, TimelineStartRoute route, bool hasController)
     {
@@ -2542,6 +3242,13 @@ internal sealed class ManagerEventReplicator
             ? TimelineStartDecision.ReplayByController
             : TimelineStartDecision.ReplayByTid;
     }
+
+    private static InvocationReplayDecision DecideInvocationReplay(
+        bool localMatches, bool hasDescriptor) => localMatches
+        ? InvocationReplayDecision.Local
+        : hasDescriptor
+            ? InvocationReplayDecision.Synthesize
+            : InvocationReplayDecision.Spectate;
 
     private static CallbackIdentityDecision TimelineCallbackIdentity(
         int leaseTid, int eventTid) => CallbackIdentity(leaseTid, eventTid);
@@ -2746,7 +3453,7 @@ internal sealed class ManagerEventReplicator
 
     private static bool IsGlobal(ManagerDomain domain) =>
         domain is ManagerDomain.Story or ManagerDomain.Day or
-            ManagerDomain.Dialogue or ManagerDomain.Scenario;
+            ManagerDomain.Dialogue or ManagerDomain.Scenario or ManagerDomain.Progression;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;
@@ -2944,12 +3651,11 @@ internal static class ScenarioStartAuthorityPatch
         if (allowed && behaviour != null)
             __args[callbackIndex] = behaviour.WrapScenarioFinish(
                 (string)__args[0], __args[callbackIndex] as Il2CppSystem.Action<bool>);
+        var wasPlaying = __instance.IsPlaying;
         __state = new ManagerEventReplicator.ScenarioStartObservation(
-            (string)__args[0],
-            __instance.IsPlaying,
-            string.IsNullOrEmpty(__instance.CurrentSequenceID)
-                ? 0
-                : unchecked((int)Protocol.SceneId(__instance.CurrentSequenceID)),
+            (string)__args[0], wasPlaying,
+            ManagerEventReplicator.ScenarioPreviousKey(
+                wasPlaying, () => __instance.CurrentSequenceID),
             allowed);
         var requestedKey = string.IsNullOrEmpty(__state.BundleId)
             ? 0
@@ -3024,17 +3730,19 @@ internal static class DialogueStartAuthorityPatch
         var behaviour = ProbeBehaviour.Instance;
         var visual = __originalMethod.Name == nameof(DialogueManager.StartVisualNovel);
         var small = __originalMethod.Name == nameof(DialogueManager.StartSmallDialogue);
-        var arguments = !visual && !small && __args.Length == 5
+        var hasArguments = !visual && !small &&
+            __originalMethod.GetParameters().Length == 5;
+        var arguments = hasArguments
             ? __args[1] as Il2CppSystem.Collections.Generic.List<string>
             : null;
         var kind = visual
             ? ManagerEventReplicator.DialogueStartKind.VisualNovel
             : small
                 ? ManagerEventReplicator.DialogueStartKind.Small
-                : arguments == null
-                    ? ManagerEventReplicator.DialogueStartKind.Normal
-                    : ManagerEventReplicator.DialogueStartKind.Arguments;
-        var callbackIndex = arguments == null ? 1 : 2;
+                : hasArguments
+                    ? ManagerEventReplicator.DialogueStartKind.Arguments
+                    : ManagerEventReplicator.DialogueStartKind.Normal;
+        var callbackIndex = hasArguments ? 2 : 1;
         var allowed = behaviour?.InterceptDialogueStart(
             (string)__args[0],
             kind,
@@ -3043,8 +3751,8 @@ internal static class DialogueStartAuthorityPatch
             visual ? __args[2] as ScenarioButtonInfo : null,
             !visual ? __args[callbackIndex] as Il2CppSystem.Action<bool> : null,
             visual ? __args[3] as Il2CppSystem.Action<int> : null,
-            visual || (bool)__args[arguments == null ? 2 : 3],
-            visual || (bool)__args[arguments == null ? 3 : 4]) ?? true;
+            visual || (bool)__args[hasArguments ? 3 : 2],
+            visual || (bool)__args[hasArguments ? 4 : 3]) ?? true;
         if (allowed && !visual && behaviour != null)
             __args[callbackIndex] = behaviour.WrapDialogueFinish(
                 (string)__args[0], __args[callbackIndex] as Il2CppSystem.Action<bool>);

@@ -27,6 +27,7 @@
     <Reference Include="InputSystemWrapper" HintPath="$(GameInstallPath)\BepInEx\interop\InputSystemWrapper.dll" Private="false" />
     <Reference Include="Steamworks.NET" HintPath="$(GameInstallPath)\BepInEx\interop\com.rlabrecque.steamworks.net.dll" Private="false" />
     <Reference Include="Sirenix.Serialization" HintPath="$(GameInstallPath)\BepInEx\interop\Sirenix.Serialization.dll" Private="false" />
+    <Reference Include="UniRx" HintPath="$(GameInstallPath)\BepInEx\interop\UniRx.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.CoreModule.dll" Private="false" />
     <Reference Include="UnityEngine.AnimationModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.AnimationModule.dll" Private="false" />
     <Reference Include="UnityEngine.DirectorModule" HintPath="$(GameInstallPath)\BepInEx\interop\UnityEngine.DirectorModule.dll" Private="false" />

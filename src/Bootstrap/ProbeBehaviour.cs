@@ -85,7 +85,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             typeof(Plugin).Module.ModuleVersionId);
         _sessionTrace = new SessionTrace(Logger);
         _remoteCatchLedger = new RemoteCatchLedger(Logger, _sessionTrace);
-        _fishReplicator = new FishReplicator(Logger, _sessionTrace);
+        _fishReplicator = new FishReplicator(Logger, _sessionTrace, _remoteCatchLedger);
         _remoteCatchLedger.SetRemoteLootEvidence(request =>
             _fishReplicator?.TryCaptureRemoteLoot(
                 _session, _sceneId, request, _remoteCatchLedger) ?? false);
@@ -215,8 +215,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Time.realtimeSinceStartup);
         _managerEventReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _npcInteractionCoordinator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
-        _missionProgressReplicator?.Update(
-            Role, _session, Time.realtimeSinceStartup, Role == SessionRole.Client && IsDiveScene());
+        _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
@@ -247,7 +246,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         {
             var renderer = _playerRenderer ?? _lobbyRenderer ?? _sushiRenderer;
             if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
-                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName);
+                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene());
             else
                 _remoteAvatar.Clear();
         }
@@ -273,30 +272,28 @@ public sealed class ProbeBehaviour : MonoBehaviour
                     : _sushiRenderer ??= RemoteAvatar.FindPrimaryRenderer(_sushiPlayer);
             var position = transform.position;
             var velocity = controller != null ? controller.GetVelocity() : Vector2.zero;
-            var rotation = renderer != null
-                ? renderer.transform.eulerAngles.z
-                : controller != null ? controller.GetRotation() : transform.eulerAngles.z;
-            var flipped = renderer != null
-                ? renderer.flipX
-                : controller != null && controller.IsFliped();
+            var visible = renderer != null
+                ? RemoteAvatar.CaptureVisibleTransform(renderer)
+                : new VisibleTransform(
+                    controller != null ? controller.GetRotation() : transform.eulerAngles.z,
+                    Mathf.Abs(transform.lossyScale.x), Mathf.Abs(transform.lossyScale.y),
+                    controller != null && controller.IsFliped(), false);
             var spriteId = renderer != null && renderer.sprite != null
                 ? Protocol.SceneId(renderer.sprite.name)
                 : 0u;
-            var visualScale = renderer != null ? renderer.transform.lossyScale : transform.lossyScale;
-            flipped ^= visualScale.x < 0f;
             _session.SendSnapshot(new PlayerSnapshot(
                 _sceneId,
                 _session.LocalSceneEpoch,
                 position.x,
                 position.y,
                 position.z,
-                rotation,
+                visible.Rotation,
                 velocity.x,
                 velocity.y,
                 spriteId,
-                Mathf.Abs(visualScale.x),
-                Mathf.Abs(visualScale.y),
-                flipped));
+                visible.ScaleX,
+                visible.ScaleY,
+                visible.FlipX));
             _nextSnapshot = Time.realtimeSinceStartup + 0.05f;
         }
         else if (_session == null || !_session.SceneMatches(_sceneId))
@@ -387,7 +384,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _playerPresent = true;
     }
 
-    private void LateUpdate() => _travelCoordinator?.LateUpdate();
+    private void LateUpdate()
+    {
+        _travelCoordinator?.LateUpdate();
+        _fishReplicator?.LateUpdate();
+    }
 
     private void OnDestroy()
     {
@@ -601,13 +602,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void ClearReplicationState(SessionRole nextRole)
     {
-        if (Role != nextRole && (Role == SessionRole.Host || nextRole == SessionRole.Host))
+        if (Role != nextRole)
             _remoteCatchLedger?.Clear("network authority changed");
         _remoteAvatar.Clear();
         _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _sceneReplicator?.Clear();
         _diveCoordinator?.Reset();
+        _travelCoordinator?.Reset();
         _missionProgressReplicator?.Clear();
         _managerEventReplicator?.Clear(Role == SessionRole.Host && nextRole == SessionRole.Host);
         _worldStateReplicator?.Clear();
@@ -908,6 +910,22 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void PublishSushiResult() =>
         _managerEventReplicator?.PublishSushiResult(Role, _session);
 
+    internal void ObserveReward(Reward reward) =>
+        _managerEventReplicator?.ObserveReward(Role, _session, reward);
+
+    internal bool InterceptPlayerGoods(GoodsType type, int value) =>
+        _managerEventReplicator?.InterceptPlayerGoods(Role, _session, type, value) ?? true;
+
+    internal bool InterceptSushiInteraction(StaffDave staff, SushiBarInteraction interaction) =>
+        _managerEventReplicator?.InterceptSushiInteraction(
+            Role, _session, staff, interaction) ?? true;
+
+    internal bool InterceptSushiClean(SushiBarTrashTrigger trigger, int gold) =>
+        _managerEventReplicator?.InterceptSushiClean(Role, _session, trigger, gold) ?? true;
+
+    internal bool InterceptSushiWasabi(SushiBar.Place place, int count) =>
+        _managerEventReplicator?.InterceptSushiWasabi(Role, _session, place, count) ?? true;
+
     internal bool InterceptTimelinePlay(
         int tid,
         Il2CppSystem.Action onStart,
@@ -979,9 +997,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         LootBox.AutoLiftedType liftType,
         Il2CppSystem.Collections.Generic.List<string> getTimes,
         bool updateMission) =>
-        Role == SessionRole.Host &&
-        (_remoteCatchLedger?.TryIntercept(
-            itemId, count, bonusGrade, liftType, getTimes, updateMission) ?? false);
+        IsCompletingClientPresentation || Role == SessionRole.Host &&
+            (_remoteCatchLedger?.TryIntercept(
+                itemId, count, bonusGrade, liftType, getTimes, updateMission) ?? false);
 
     internal void PrepareRemoteCatchResult()
     {
@@ -1032,40 +1050,139 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void EndClientLootSource() => _remoteCatchLedger?.EndClientLootSource();
 
-    internal void BeginClientFishLootSource()
+    internal bool BeginClientFishLootSource(FishAISystem fish)
     {
         if (Role == SessionRole.Client)
             _remoteCatchLedger?.BeginClientFishSource();
+        return Role == SessionRole.Client &&
+            (_fishReplicator?.BeginPendingClientFishLootScope(fish) ?? false);
+    }
+
+    internal void EndClientFishLootSource(bool pendingScope)
+    {
+        if (pendingScope)
+            _fishReplicator?.EndPendingClientFishLootScope();
+        EndClientLootSource();
+    }
+
+    internal bool ShouldSuppressPendingClientFishLoot(int itemId, int count)
+    {
+        if (Role != SessionRole.Client ||
+            _fishReplicator?.ShouldSuppressPendingClientFishLoot(itemId) != true)
+            return false;
+        _sessionTrace?.Write("FISH-LOOT-DEFER", $"item={itemId} count={count}");
+        return true;
     }
 
     internal bool AllowFishDamage(
         FishAISystem fish,
         int damage,
         EElement element,
-        AttackType attackType) => true;
+        AttackType attackType) =>
+        Role != SessionRole.Client || _fishReplicator?.ShouldAllowClientDamageWrite(fish) != false;
 
-    internal bool BeginFishDamage(
-        FishAISystem fish,
-        AttackData attackData,
-        out bool scoped)
+    internal void ObserveFishDamage(FishAISystem fish, AttackData attackData)
     {
-        scoped = false;
-        return true;
+        if (Role != SessionRole.Client || _fishReplicator?.ClientAuthorityActive != true ||
+            _fishReplicator.ApplyingClientState || !_fishReplicator.IsClientProxy(fish))
+            return;
+        _fishReplicator.ObserveClientDamage(_session, _sceneId, fish, attackData);
     }
 
-    internal void EndFishDamage(FishAISystem fish, bool scoped) { }
+    internal bool AllowFishTrueDamage(FishAISystem fish) =>
+        Role != SessionRole.Client ||
+        _fishReplicator?.ShouldAllowDirectClientProxyWrite(fish) != false;
 
-    internal bool AllowFishTrueDamage(FishAISystem fish) => true;
-
-    internal void OnFishCaptureWon(FishAISystem fish)
+    internal bool AllowFishCaptureWon(FishAISystem fish)
     {
+        if (IsCompletingClientPresentation)
+            return true;
+        if (Role == SessionRole.Client &&
+            _fishReplicator?.SuppressingNativeRecallOutcome == true)
+            return false;
+        if (Role != SessionRole.Client ||
+            _fishReplicator?.ClientAuthorityActive != true)
+            return true;
+        return _fishReplicator.RequestClientCapture(_session, _sceneId, fish);
     }
 
-    internal bool AllowFishSimulation(FishAISystem fish) => true;
+    internal void RefreshMissionAfterNativeChange()
+    {
+        if (Role == SessionRole.Host)
+            _missionProgressReplicator?.RefreshAfterNativeMissionChange();
+    }
 
-    internal bool AllowFishInteraction(FishInteractionBody body, bool nativeAvailable) => nativeAvailable;
+    internal void OnFishHooked(FishAISystem fish)
+    {
+        if (Role == SessionRole.Client && _fishReplicator?.ClientAuthorityActive == true)
+            _fishReplicator.ObserveClientHook(_session, _sceneId, fish);
+    }
 
-    internal bool AllowFishPickup(FishInteractionBody body, BaseCharacter character) => true;
+    internal void OnFishHookEnded(FishAISystem fish)
+    {
+        if (Role == SessionRole.Client && _fishReplicator?.ClientAuthorityActive == true)
+            _fishReplicator.ObserveClientRelease(_session, _sceneId, fish);
+    }
+
+    internal void BeginHarpoonRecall(bool isSuccess)
+    {
+        if (Role == SessionRole.Client)
+            _fishReplicator?.BeginClientHarpoonRecall(_session, _sceneId, isSuccess);
+    }
+
+    internal void EndHarpoonRecall()
+    {
+        if (Role == SessionRole.Client)
+            _fishReplicator?.EndClientHarpoonRecall();
+    }
+
+    internal void OnHarpoonReset()
+    {
+        if (Role == SessionRole.Client)
+            _fishReplicator?.ResetClientHarpoon(_session, _sceneId);
+    }
+
+    internal void ApplyFishAuthoritativeState(FishAISystem fish)
+    {
+        if (Role == SessionRole.Client && _fishReplicator?.ClientAuthorityActive == true)
+        {
+            _fishReplicator.PublishClientHookPose(
+                _session, _sceneId, fish, Time.realtimeSinceStartup);
+            _fishReplicator.ApplyClientAuthoritativeAfterPresentation(fish);
+        }
+    }
+
+    internal bool AllowFishSimulation(FishAISystem fish) =>
+        Role != SessionRole.Client ||
+        _fishReplicator?.ShouldAllowClientSimulation(fish) != false;
+
+    internal bool AllowFishRemoval(FishAISystem fish)
+    {
+        if (Role == SessionRole.Host && _remoteCatchLedger?.AllowFishRemoval(fish) == false)
+            return false;
+        return _fishReplicator?.IsClientProxy(fish) != true ||
+            !IsCompletingClientPresentation &&
+            _fishReplicator?.SuppressingNativeRecallOutcome != true &&
+            _fishReplicator?.HasPendingClientCapture(fish) != true;
+    }
+
+    internal bool AllowFishInteraction(FishInteractionBody body, bool nativeAvailable) =>
+        Role == SessionRole.Client && _fishReplicator?.ClientAuthorityActive == true
+            ? _fishReplicator.CanClientInteract(body, nativeAvailable)
+            : nativeAvailable;
+
+    internal bool AllowFishPickup(FishInteractionBody body, BaseCharacter character)
+    {
+        if (IsCompletingClientPresentation || Role != SessionRole.Client ||
+            _fishReplicator?.ClientAuthorityActive != true)
+            return true;
+        var fish = body?.GetComponentInParent<FishAISystem>();
+        if (!_fishReplicator.IsClientProxy(fish))
+            return true;
+        if (!_fishReplicator.RequestPickup(_session, _sceneId, fish))
+            character?.SuccessInteraction();
+        return false;
+    }
 
     internal void TraceFishPickup(string stage, FishAISystem fish, FishInteractionBody body, bool? result = null)
     {

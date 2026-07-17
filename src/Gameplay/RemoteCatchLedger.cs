@@ -3,10 +3,18 @@ using System.Collections.Generic;
 using System.Reflection;
 using BepInEx.Logging;
 using DR;
+using DR.AI;
 using HarmonyLib;
 using UnityEngine;
 
 namespace DaveTheDiverMP;
+
+internal sealed class CommittedFishLoot
+{
+    internal FishActionAck Ack;
+    internal List<FishLootGrant> Grants;
+    internal ulong LastSentSessionId;
+}
 
 internal sealed class RemoteCatchLedger
 {
@@ -28,6 +36,7 @@ internal sealed class RemoteCatchLedger
     private const int MaxSources = 16_384;
     private const int MaxStacks = 4_096;
     private const int MaxCountPerAdd = 9_999;
+    internal const int MaxFishGrantEntries = 64;
     private readonly ManualLogSource _log;
     private readonly SessionTrace _trace;
     private readonly List<LootEntry> _entries = new();
@@ -38,6 +47,21 @@ internal sealed class RemoteCatchLedger
     private bool _hostResultSent;
     private bool _applyingClientResult;
     private bool _applyingRemoteLoot;
+    private FishAISystem _escrowFish;
+    private bool _fishRemovalEscrowActive;
+    private bool _deferredFishRemoval;
+    private bool _allowEscrowFishRemoval;
+    private bool _escrowFishActive;
+    private bool _escrowFishBehaviorEnabled;
+    private bool _escrowFishBehaviorKnown;
+    private bool _escrowFishCaptured;
+    private bool _escrowFishEnabled;
+    private bool _escrowFishCorpse;
+    private float _escrowFishHp;
+    private readonly HashSet<ulong> _appliedFishTransactions = new();
+    private readonly Dictionary<ulong, HashSet<ushort>> _appliedFishEntryIndexes = new();
+    private readonly Dictionary<ulong, CommittedFishLoot> _committedFishByRequest = new();
+    private readonly Dictionary<ulong, CommittedFishLoot> _committedFishByTransaction = new();
     private ulong _clientResultTransfer;
     private ushort _clientResultTotal;
     private readonly Dictionary<ushort, DiveResultEntry> _clientResultEntries = new();
@@ -82,6 +106,46 @@ internal sealed class RemoteCatchLedger
             SelectClientLootSource(0, 7, 3f, 2f) != 0 ||
             SelectClientLootSource(8, 7, 3f, 2f) != 8)
             throw new InvalidOperationException("Delayed client loot evidence selection failed");
+
+        var grants = new[]
+        {
+            new FishLootGrant(1, 2, 3, 4, 5, 6, FishAction.Capture, 0, 2, 101, 1, 0, 1, 2f),
+            new FishLootGrant(1, 2, 3, 4, 5, 6, FishAction.Capture, 1, 2, 102, 1, 0, 1, 2f)
+        };
+        var applied = new HashSet<ushort> { 0 };
+        var journalByRequest = new Dictionary<ulong, CommittedFishLoot>();
+        var journalByTransaction = new Dictionary<ulong, CommittedFishLoot>();
+        var journal = new CommittedFishLoot
+        {
+            Ack = new FishActionAck(
+                4, 2, 3, 5, 6, FishAction.Capture, FishActionResult.Accepted,
+                FishActionRejectReason.None, 0f, FishPhase.Captured),
+            Grants = new List<FishLootGrant>(grants)
+        };
+        if (!ExactGrantSet(grants) || NextUnappliedIndex(grants, applied) != 1 ||
+            !CompletionMatches(grants[0], new FishLootComplete(
+                1, 2, 3, 4, 5, 6, FishAction.Capture)) ||
+            !TryJournal(journalByRequest, journalByTransaction, journal) ||
+            TryJournal(journalByRequest, journalByTransaction, journal) ||
+            RebaseGrants(journal, 9)[0].SceneEpoch != 9 || RebaseAck(journal, 9).SceneEpoch != 9 ||
+            !NeedsReplay(journal, 41) || !MarkSent(journal, 41) ||
+            NeedsReplay(journal, 41) || !NeedsReplay(journal, 42) || MarkSent(journal, 0))
+            throw new InvalidOperationException("Fish loot journal identity failed");
+        if (!ShouldDeferFishRemoval(true, false, true) ||
+            ShouldDeferFishRemoval(false, false, true) ||
+            ShouldDeferFishRemoval(true, true, true) ||
+            ShouldDeferFishRemoval(true, false, false) ||
+            !ShouldExecuteDeferredRemoval(true, true) ||
+            ShouldExecuteDeferredRemoval(false, true) ||
+            ShouldExecuteDeferredRemoval(true, false))
+            throw new InvalidOperationException("Fish removal escrow decision failed");
+        var validCapturedEntries = new List<LootEntry>
+        {
+            new() { ItemId = 101, Count = 1, BonusGrade = 0, LiftType = 0 }
+        };
+        if (CapturedEntriesValid(Array.Empty<LootEntry>()) ||
+            !CapturedEntriesValid(validCapturedEntries))
+            throw new InvalidOperationException("Fish escrow requires validated nonempty loot");
     }
 
     internal string Status => _entries.Count == 0
@@ -91,6 +155,23 @@ internal sealed class RemoteCatchLedger
     internal bool ApplyingClientResult => _applyingClientResult;
 
     internal bool ApplyingRemoteLoot => _applyingRemoteLoot;
+
+    internal void BeginFishPresentation() => _applyingRemoteLoot = true;
+
+    internal void EndFishPresentation() => _applyingRemoteLoot = false;
+
+    internal bool AllowFishRemoval(FishAISystem fish)
+    {
+        var matches = fish != null && _escrowFish != null && fish == _escrowFish;
+        if (!ShouldDeferFishRemoval(
+                _fishRemovalEscrowActive, _allowEscrowFishRemoval, matches))
+            return true;
+        if (!_deferredFishRemoval)
+            _trace?.Write("FISH-ESCROW-DEFER",
+                $"type={fish.FishDataTID} instance={fish.GetInstanceID()}");
+        _deferredFishRemoval = true;
+        return false;
+    }
 
     internal void SetRemoteLootEvidence(Func<DiveLootRequest, bool> evidence) =>
         _remoteLootEvidence = evidence;
@@ -203,6 +284,10 @@ internal sealed class RemoteCatchLedger
     {
         _entries.Clear();
         _acceptedSources.Clear();
+        _appliedFishTransactions.Clear();
+        _appliedFishEntryIndexes.Clear();
+        _committedFishByRequest.Clear();
+        _committedFishByTransaction.Clear();
         _clientLootSource = 0;
         _pendingClientLootSource = 0;
         _pendingClientLootSourceUntil = 0f;
@@ -395,6 +480,226 @@ internal sealed class RemoteCatchLedger
         return true;
     }
 
+    internal bool CaptureFishTransaction(
+        ulong transactionId,
+        uint sceneId,
+        uint sceneEpoch,
+        ulong requestId,
+        int fishId,
+        uint revision,
+        FishAction action,
+        float hp,
+        FishPhase phase,
+        FishAISystem fish,
+        Action nativePickup,
+        out CommittedFishLoot transaction)
+    {
+        transaction = null;
+        if (transactionId == 0 || sceneId == 0 || sceneEpoch == 0 || requestId == 0 ||
+            fishId <= 0 || revision == 0 || fish == null || nativePickup == null || _capture != null ||
+            _acceptedSources.Contains(transactionId) || _acceptedSources.Count >= MaxSources ||
+            _committedFishByRequest.ContainsKey(requestId) ||
+            _committedFishByTransaction.ContainsKey(transactionId) ||
+            action is not (FishAction.Capture or FishAction.CorpsePickup) ||
+            !float.IsFinite(hp) || hp < 0f ||
+            _entries.Count > MaxStacks - MaxFishGrantEntries || !HasCarryCapacity())
+            return false;
+
+        var reservation = new CommittedFishLoot
+        {
+            Ack = new FishActionAck(
+                requestId, sceneId, sceneEpoch, fishId, revision, action,
+                FishActionResult.Accepted, FishActionRejectReason.None, hp, phase),
+            Grants = new List<FishLootGrant>()
+        };
+        _committedFishByRequest.Add(requestId, reservation);
+        _committedFishByTransaction.Add(transactionId, reservation);
+
+        var capture = new Capture();
+        Exception failure = null;
+        var committed = false;
+        _capture = capture;
+        BeginFishRemovalEscrow(fish);
+        try
+        {
+            try
+            {
+                nativePickup();
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+            finally
+            {
+                _capture = null;
+            }
+            if (!CapturedEntriesValid(capture.Entries))
+            {
+                _committedFishByRequest.Remove(requestId);
+                _committedFishByTransaction.Remove(transactionId);
+                return false;
+            }
+
+            var addedWeight = 0f;
+            foreach (var entry in capture.Entries)
+                addedWeight += ItemWeight(entry.ItemId) * entry.Count;
+            var nativeWeight = LootBox.Instance?.weight ?? 0f;
+            if (!float.IsFinite(nativeWeight))
+                nativeWeight = 0f;
+            var carriedWeight = Math.Max(0f, nativeWeight + _carriedWeight + addedWeight);
+            var grants = new List<FishLootGrant>(capture.Entries.Count);
+            for (ushort index = 0; index < capture.Entries.Count; index++)
+            {
+                var entry = capture.Entries[index];
+                grants.Add(new FishLootGrant(
+                    transactionId, sceneId, sceneEpoch, requestId, fishId, revision,
+                    action, index, (ushort)capture.Entries.Count, entry.ItemId, entry.Count,
+                    Math.Max(0, entry.BonusGrade), (int)entry.LiftType, carriedWeight));
+            }
+            if (!ExactGrantSet(grants))
+            {
+                _committedFishByRequest.Remove(requestId);
+                _committedFishByTransaction.Remove(transactionId);
+                return false;
+            }
+            reservation.Grants = grants;
+            transaction = reservation;
+            _acceptedSources.Add(transactionId);
+            _entries.AddRange(capture.Entries);
+            _carriedWeight += addedWeight;
+            UpdateAcceptedMissions(capture.Entries);
+            committed = true;
+            if (failure != null)
+                _log.LogWarning($"Remote fish pickup committed after late error: {failure.Message}");
+            return true;
+        }
+        finally
+        {
+            _capture = null;
+            EndFishRemovalEscrow(committed);
+        }
+    }
+
+    internal bool ApplyFishTransaction(IReadOnlyList<FishLootGrant> grants)
+    {
+        if (grants == null || grants.Count == 0 ||
+            !ExactGrantSet(grants))
+            return false;
+        var transactionId = grants[0].TransactionId;
+        if (_appliedFishTransactions.Contains(transactionId))
+            return true;
+        var lootBox = LootBox.Instance;
+        if (lootBox == null)
+            return false;
+        if (!_appliedFishEntryIndexes.TryGetValue(transactionId, out var applied))
+        {
+            applied = new HashSet<ushort>();
+            _appliedFishEntryIndexes[transactionId] = applied;
+        }
+        _applyingRemoteLoot = true;
+        try
+        {
+            foreach (var grant in grants)
+            {
+                if (applied.Contains(grant.Index))
+                    continue;
+                var before = TryGetTotalCount(lootBox, grant.ItemId);
+                try
+                {
+                    var added = lootBox.AddIgnoreOverloaded(
+                        grant.ItemId, grant.Count, grant.BonusGrade,
+                        (LootBox.AutoLiftedType)grant.LiftType, null, false);
+                    var after = TryGetTotalCount(lootBox, grant.ItemId);
+                    if (!added && !(before >= 0 && after >= before + grant.Count))
+                        return false;
+                    applied.Add(grant.Index);
+                }
+                catch (Exception exception)
+                {
+                    var after = TryGetTotalCount(lootBox, grant.ItemId);
+                    if (before >= 0 && after >= before + grant.Count)
+                        applied.Add(grant.Index);
+                    else
+                    {
+                        _log.LogWarning(
+                            $"Fish grant apply retained: transaction={transactionId}; " +
+                            $"index={grant.Index}; {exception.Message}");
+                        return false;
+                    }
+                }
+            }
+            if (applied.Count != grants.Count)
+                return false;
+            lootBox.RefreshOverweight(0f);
+            _appliedFishTransactions.Add(transactionId);
+            _appliedFishEntryIndexes.Remove(transactionId);
+            return true;
+        }
+        finally
+        {
+            _applyingRemoteLoot = false;
+        }
+    }
+
+    internal bool HasAppliedFishTransaction(ulong transactionId) =>
+        _appliedFishTransactions.Contains(transactionId);
+
+    internal bool CanBeginFishTransaction() =>
+        _capture == null && _acceptedSources.Count < MaxSources &&
+        _entries.Count <= MaxStacks - MaxFishGrantEntries && HasCarryCapacity();
+
+    internal bool TryGetCommittedFishLoot(ulong requestId, out CommittedFishLoot transaction) =>
+        _committedFishByRequest.TryGetValue(requestId, out transaction);
+
+    internal IEnumerable<CommittedFishLoot> FishLootNeedingReplay(
+        uint sceneId, ulong sessionId)
+    {
+        foreach (var transaction in _committedFishByRequest.Values)
+            if (transaction.Ack.SceneId == sceneId && NeedsReplay(transaction, sessionId))
+                yield return transaction;
+    }
+
+    internal static bool NeedsReplay(CommittedFishLoot transaction, ulong sessionId) =>
+        sessionId != 0 && transaction.LastSentSessionId != sessionId;
+
+    internal static bool MarkSent(CommittedFishLoot transaction, ulong sessionId)
+    {
+        if (sessionId == 0)
+            return false;
+        transaction.LastSentSessionId = sessionId;
+        return true;
+    }
+
+    internal static FishActionAck RebaseAck(CommittedFishLoot transaction, uint sceneEpoch) =>
+        transaction.Ack with { SceneEpoch = sceneEpoch };
+
+    internal static List<FishLootGrant> RebaseGrants(
+        CommittedFishLoot transaction, uint sceneEpoch)
+    {
+        var grants = new List<FishLootGrant>(transaction.Grants.Count);
+        foreach (var grant in transaction.Grants)
+            grants.Add(grant with { SceneEpoch = sceneEpoch });
+        return grants;
+    }
+
+    internal bool CompleteFishTransaction(FishLootComplete complete)
+    {
+        if (!_committedFishByTransaction.TryGetValue(complete.TransactionId, out var transaction) ||
+            transaction.Grants.Count == 0 ||
+            !CompletionMatches(transaction.Grants[0], complete))
+            return false;
+        _committedFishByTransaction.Remove(complete.TransactionId);
+        _committedFishByRequest.Remove(complete.RequestId);
+        return true;
+    }
+
+    private void ClearCommittedFishTransactions()
+    {
+        _committedFishByRequest.Clear();
+        _committedFishByTransaction.Clear();
+    }
+
     internal bool TryIntercept(
         int itemId,
         int count,
@@ -499,6 +804,9 @@ internal sealed class RemoteCatchLedger
             _log.LogInfo($"Remote carry cleared ({reason}): {_entries.Count} stacks");
         _entries.Clear();
         _acceptedSources.Clear();
+        _appliedFishTransactions.Clear();
+        _appliedFishEntryIndexes.Clear();
+        ClearCommittedFishTransactions();
         _capture = null;
         _carriedWeight = 0f;
         _materializing = false;
@@ -602,7 +910,8 @@ internal sealed class RemoteCatchLedger
         try
         {
             var item = DataManager.Instance.GetItems(itemId);
-            return item != null ? Math.Max(0f, item.ItemWeight) : 0f;
+            return item != null && float.IsFinite(item.ItemWeight)
+                ? Math.Max(0f, item.ItemWeight) : 0f;
         }
         catch
         {
@@ -639,6 +948,136 @@ internal sealed class RemoteCatchLedger
 
     private static bool TryAcceptEvidence(HashSet<ulong> accepted, ulong sourceId, bool hasEvidence) =>
         sourceId != 0 && hasEvidence && accepted.Add(sourceId);
+
+    private static bool CapturedEntriesValid(IReadOnlyList<LootEntry> entries)
+    {
+        if (entries == null || entries.Count is < 1 or > MaxFishGrantEntries)
+            return false;
+        foreach (var entry in entries)
+            if (entry == null || entry.ItemId <= 0 || entry.Count is < 1 or > MaxCountPerAdd ||
+                entry.BonusGrade is < 0 or > 100 || (int)entry.LiftType is < 0 or > 3)
+                return false;
+        return true;
+    }
+
+    private static bool ShouldDeferFishRemoval(
+        bool escrowActive, bool allowRemoval, bool targetMatches) =>
+        escrowActive && !allowRemoval && targetMatches;
+
+    private static bool ShouldExecuteDeferredRemoval(bool committed, bool deferred) =>
+        committed && deferred;
+
+    private void BeginFishRemovalEscrow(FishAISystem fish)
+    {
+        _escrowFish = fish;
+        _fishRemovalEscrowActive = true;
+        _deferredFishRemoval = false;
+        _allowEscrowFishRemoval = false;
+        _escrowFishActive = fish.gameObject.activeInHierarchy;
+        FishBehaviorTreeState.ObserveActive(fish);
+        _escrowFishBehaviorKnown = FishBehaviorTreeState.TryGet(
+            fish, out _escrowFishBehaviorEnabled);
+        _escrowFishCaptured = fish.IsFishCaptured;
+        _escrowFishEnabled = fish.IsFishEnable;
+        _escrowFishCorpse = fish.IsCorpse;
+        _escrowFishHp = fish.HP;
+        _trace?.Write("FISH-ESCROW-BEGIN",
+            $"type={fish.FishDataTID} instance={fish.GetInstanceID()}");
+    }
+
+    private void EndFishRemovalEscrow(bool committed)
+    {
+        var fish = _escrowFish;
+        try
+        {
+            if (fish == null)
+                return;
+            if (ShouldExecuteDeferredRemoval(committed, _deferredFishRemoval))
+            {
+                _allowEscrowFishRemoval = true;
+                try
+                {
+                    fish.DestroySelf();
+                    _trace?.Write("FISH-ESCROW-COMMIT",
+                        $"type={fish.FishDataTID} instance={fish.GetInstanceID()}");
+                }
+                catch (Exception exception)
+                {
+                    _log.LogWarning($"Deferred fish removal failed: {exception.Message}");
+                    _trace?.Write("FISH-ESCROW-REMOVE-ERROR",
+                        $"type={fish.FishDataTID} error={exception.GetType().Name}:{exception.Message}");
+                }
+            }
+            else if (!committed)
+            {
+                fish.SetHP(Math.Max(0f, _escrowFishHp));
+                fish.IsFishCaptured = _escrowFishCaptured;
+                fish.IsFishEnable = _escrowFishEnabled;
+                fish.IsCorpse = _escrowFishCorpse;
+                if (_escrowFishBehaviorKnown)
+                    FishBehaviorTreeState.Set(fish, _escrowFishBehaviorEnabled);
+                fish.gameObject.SetActive(_escrowFishActive);
+                _trace?.Write("FISH-ESCROW-CANCEL",
+                    $"type={fish.FishDataTID} deferred={_deferredFishRemoval} " +
+                    $"active={_escrowFishActive} behavior={_escrowFishBehaviorEnabled}");
+            }
+        }
+        finally
+        {
+            _escrowFish = null;
+            _fishRemovalEscrowActive = false;
+            _deferredFishRemoval = false;
+            _allowEscrowFishRemoval = false;
+            _escrowFishBehaviorKnown = false;
+        }
+    }
+
+    internal static bool ExactGrantSet(IReadOnlyList<FishLootGrant> grants)
+    {
+        if (grants == null || grants.Count == 0 || grants.Count != grants[0].EntryCount)
+            return false;
+        var first = grants[0];
+        for (var index = 0; index < grants.Count; index++)
+        {
+            var grant = grants[index];
+            if (grant.Index != index || grant.EntryCount != grants.Count ||
+                grant.TransactionId != first.TransactionId || grant.SceneId != first.SceneId ||
+                grant.SceneEpoch != first.SceneEpoch || grant.RequestId != first.RequestId ||
+                grant.FishId != first.FishId || grant.Revision != first.Revision ||
+                grant.Action != first.Action ||
+                grant.CarriedWeight != first.CarriedWeight)
+                return false;
+        }
+        return true;
+    }
+
+    internal static ushort NextUnappliedIndex(
+        IReadOnlyList<FishLootGrant> grants, HashSet<ushort> applied)
+    {
+        foreach (var grant in grants)
+            if (!applied.Contains(grant.Index))
+                return grant.Index;
+        return ushort.MaxValue;
+    }
+
+    internal static bool CompletionMatches(FishLootGrant grant, FishLootComplete complete) =>
+        grant.TransactionId == complete.TransactionId && grant.SceneId == complete.SceneId &&
+        grant.RequestId == complete.RequestId && grant.FishId == complete.FishId &&
+        grant.Revision == complete.Revision && grant.Action == complete.Action;
+
+    private static bool TryJournal(
+        Dictionary<ulong, CommittedFishLoot> byRequest,
+        Dictionary<ulong, CommittedFishLoot> byTransaction,
+        CommittedFishLoot transaction)
+    {
+        if (transaction?.Grants == null || transaction.Grants.Count == 0 ||
+            byRequest.ContainsKey(transaction.Ack.RequestId) ||
+            byTransaction.ContainsKey(transaction.Grants[0].TransactionId))
+            return false;
+        byRequest.Add(transaction.Ack.RequestId, transaction);
+        byTransaction.Add(transaction.Grants[0].TransactionId, transaction);
+        return true;
+    }
 
     private static ulong SelectClientLootSource(
         ulong active,
@@ -788,6 +1227,9 @@ internal sealed class RemoteCatchLedger
 
 internal static class RemoteCatchPatchBridge
 {
+    internal static bool ShouldSuppressPendingClientFishLoot(int itemId, int count) =>
+        ProbeBehaviour.Instance?.ShouldSuppressPendingClientFishLoot(itemId, count) ?? false;
+
     internal static bool TryCapture(
         int itemId,
         int count,
@@ -860,6 +1302,11 @@ internal static class RemoteCatchLootAddPatch
         ref bool __result)
     {
         ProbeBehaviour.Instance?.TraceLootEntry("add-prefix", id, count, liftType, false);
+        if (RemoteCatchPatchBridge.ShouldSuppressPendingClientFishLoot(id, count))
+        {
+            __result = true;
+            return false;
+        }
         if (!RemoteCatchPatchBridge.TryCapture(
                 id, count, bonusGrade, liftType, getTimes, bUpdateMissionCnt))
             return true;
@@ -898,6 +1345,11 @@ internal static class RemoteCatchLootAddIgnorePatch
         ref bool __result)
     {
         ProbeBehaviour.Instance?.TraceLootEntry("add-ignore-prefix", id, count, liftType, false);
+        if (RemoteCatchPatchBridge.ShouldSuppressPendingClientFishLoot(id, count))
+        {
+            __result = true;
+            return false;
+        }
         if (!RemoteCatchPatchBridge.TryCapture(
                 id, count, bonusGrade, liftType, getTimes, bUpdateMissionCnt))
             return true;

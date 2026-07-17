@@ -53,7 +53,12 @@ internal enum PacketType : byte
     NpcInteraction = 47,
     FishLifecycle = 48,
     FishActionRequest = 49,
-    FishActionAck = 50
+    FishActionAck = 50,
+    FishLootGrant = 51,
+    FishLootComplete = 52,
+    FishHookPose = 53,
+    SaveSnapshotChunk = 54,
+    SaveSnapshotAck = 55
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -163,7 +168,9 @@ internal enum FishLifecycleKind : byte
 {
     Spawn = 1,
     Despawn = 2,
-    Phase = 3
+    Phase = 3,
+    InterestEnter = 4,
+    InterestLeave = 5
 }
 
 internal enum FishPhase : byte
@@ -201,6 +208,7 @@ internal enum FishActionRejectReason : byte
     InvalidAction,
     InvalidState,
     OutOfRange,
+    Capacity,
     Duplicate,
     InternalError
 }
@@ -221,6 +229,7 @@ internal readonly record struct FishActionRequest(
     uint SceneEpoch,
     int Id,
     uint KnownRevision,
+    ulong LeaseId,
     FishAction Action,
     int Damage,
     int Element,
@@ -237,6 +246,57 @@ internal readonly record struct FishActionAck(
     FishActionRejectReason RejectReason,
     float Hp,
     FishPhase Phase);
+
+internal readonly record struct FishLootGrant(
+    ulong TransactionId,
+    uint SceneId,
+    uint SceneEpoch,
+    ulong RequestId,
+    int FishId,
+    uint Revision,
+    FishAction Action,
+    ushort Index,
+    ushort EntryCount,
+    int ItemId,
+    int Count,
+    int BonusGrade,
+    int LiftType,
+    float CarriedWeight);
+
+internal readonly record struct FishLootComplete(
+    ulong TransactionId,
+    uint SceneId,
+    uint SceneEpoch,
+    ulong RequestId,
+    int FishId,
+    uint Revision,
+    FishAction Action);
+
+internal readonly record struct FishHookPose(
+    uint SceneId,
+    uint SceneEpoch,
+    int FishId,
+    ulong LeaseId,
+    uint Tick,
+    float X,
+    float Y,
+    float Z,
+    float Rotation,
+    float VelocityX,
+    float VelocityY);
+
+internal readonly record struct SaveSnapshotChunk(
+    ulong TransferId,
+    uint Fingerprint,
+    int TotalBytes,
+    ushort ChunkIndex,
+    ushort ChunkCount,
+    byte[] Data);
+
+internal readonly record struct SaveSnapshotAck(
+    ulong TransferId,
+    uint Fingerprint,
+    bool Loaded);
 
 internal readonly record struct PickupRemoved(
     uint SceneId,
@@ -379,6 +439,26 @@ internal readonly record struct BossState(
     int AnimationHash,
     float AnimationTime,
     byte Flags);
+internal enum ManagerInvocationKind : byte
+{
+    Scenario = 1,
+    DialogueNormal = 2,
+    DialogueArguments = 3,
+    DialogueSmall = 4,
+    TimelineByTid = 5
+}
+internal readonly record struct ManagerInvocationDescriptor(
+    ManagerInvocationKind Kind,
+    string BundleId,
+    string[] Arguments,
+    bool UseButton,
+    bool ShowCurtain,
+    bool IgnorePlaying,
+    bool ApplyOffset,
+    bool HasCustomPosition,
+    float CustomX,
+    float CustomY,
+    float CustomZ);
 internal readonly record struct ManagerEvent(
     uint Revision,
     uint SceneId,
@@ -386,7 +466,8 @@ internal readonly record struct ManagerEvent(
     byte Domain,
     byte Action,
     int Value,
-    int Context);
+    int Context,
+    ManagerInvocationDescriptor? Invocation = null);
 internal readonly record struct SushiResultState(
     uint Revision,
     int SalesMenu,
@@ -398,7 +479,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 34;
+    private const byte Version = 42;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int VisualStateFixedSize = HeaderSize + 5;
@@ -406,7 +487,8 @@ internal static class Protocol
     private const int ProjectileVisualStateSize = HeaderSize + 70;
     internal const int MaxVisualSprites = 16;
     private const int FishSnapshotBatchFixedSize = HeaderSize + 13;
-    private const int FishSnapshotEntrySize = 41;
+    private const int FishSnapshotCompactEntrySize = 26;
+    private const int FishSnapshotFullEntrySize = 38;
     private const int FishDamageRequestSize = HeaderSize + 28;
     private const int BossDamageRequestSize = HeaderSize + 20;
     private const int BossStateSize = HeaderSize + 45;
@@ -418,8 +500,15 @@ internal static class Protocol
     private const int FishManifestFixedSize = HeaderSize + 46;
     private const int FishManifestStateSize = HeaderSize + 14;
     private const int FishLifecycleSize = HeaderSize + 26;
-    private const int FishActionRequestSize = HeaderSize + 37;
+    private const int FishActionRequestSize = HeaderSize + 45;
     private const int FishActionAckSize = HeaderSize + 32;
+    private const int FishLootGrantSize = HeaderSize + 57;
+    private const int FishLootCompleteSize = HeaderSize + 33;
+    private const int FishHookPoseFixedSize = HeaderSize + 25;
+    private const int FishHookPoseCompactSize = FishHookPoseFixedSize + 12;
+    private const int FishHookPoseFullSize = FishHookPoseFixedSize + 24;
+    private const int SaveSnapshotChunkFixedSize = HeaderSize + 22;
+    private const int SaveSnapshotAckSize = HeaderSize + 13;
     private const int PickupRemovedSize = HeaderSize + 12;
     private const int IngredientsSyncRequestSize = HeaderSize + 8;
     private const int IngredientsSnapshotChunkFixedSize = HeaderSize + 26;
@@ -451,8 +540,13 @@ internal static class Protocol
         (1200 - MissionRosterFixedSize) / sizeof(int);
     internal const int MaxWorldFlagKeyBytes = 128;
     internal const int MaxTravelSceneNameBytes = 128;
+    internal const int MaxDatagramSize = 1200;
+    private const int MaxManagerInvocationArguments = 128;
+    private const int MaxManagerInvocationStringBytes = 512;
+    internal const int MaxSaveSnapshotChunkBytes = MaxDatagramSize - SaveSnapshotChunkFixedSize;
+    internal const int MaxSaveSnapshotChunks = 16384;
     internal const int MaxFishSnapshotsPerPacket =
-        (1200 - FishSnapshotBatchFixedSize) / FishSnapshotEntrySize;
+        (MaxDatagramSize - FishSnapshotBatchFixedSize) / FishSnapshotFullEntrySize;
     private const int MaxFishAllocatorUidBytes = byte.MaxValue;
     private const int MaxPlayerNameCharacters = 24;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
@@ -900,30 +994,54 @@ internal static class Protocol
             count > MaxFishSnapshotsPerPacket || offset > snapshots.Count - count)
             throw new ArgumentOutOfRangeException(nameof(count));
 
-        var packet = new byte[FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize];
+        var packetSize = FishSnapshotBatchFixedSize;
+        for (var index = 0; index < count; index++)
+            packetSize += CanCompactFishSnapshot(snapshots[offset + index])
+                ? FishSnapshotCompactEntrySize : FishSnapshotFullEntrySize;
+        if (packetSize > MaxDatagramSize)
+            throw new ArgumentOutOfRangeException(nameof(count));
+        var packet = new byte[packetSize];
         WriteHeader(packet, PacketType.FishSnapshotBatch, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), sceneId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), sceneEpoch);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), tick);
         packet[HeaderSize + 12] = (byte)count;
+        var entryOffset = FishSnapshotBatchFixedSize;
         for (var index = 0; index < count; index++)
         {
             var snapshot = snapshots[offset + index];
             if (snapshot.SceneId != sceneId || snapshot.SceneEpoch != sceneEpoch ||
                 snapshot.Tick != tick || !IsValidFishSnapshot(snapshot))
                 throw new ArgumentOutOfRangeException(nameof(snapshots));
-            var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
             BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset), snapshot.Id);
             BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(entryOffset + 4), snapshot.Revision);
-            BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(entryOffset + 8), snapshot.FishDataTID);
-            WriteSingle(packet.AsSpan(entryOffset + 12), snapshot.X);
-            WriteSingle(packet.AsSpan(entryOffset + 16), snapshot.Y);
-            WriteSingle(packet.AsSpan(entryOffset + 20), snapshot.Z);
-            WriteSingle(packet.AsSpan(entryOffset + 24), snapshot.Rotation);
-            WriteSingle(packet.AsSpan(entryOffset + 28), snapshot.VelocityX);
-            WriteSingle(packet.AsSpan(entryOffset + 32), snapshot.VelocityY);
-            WriteSingle(packet.AsSpan(entryOffset + 36), snapshot.Hp);
-            packet[entryOffset + 40] = snapshot.Flags;
+            var compact = CanCompactFishSnapshot(snapshot);
+            packet[entryOffset + 8] = compact ? (byte)0 : (byte)1;
+            if (compact)
+            {
+                WriteQuantized(packet.AsSpan(entryOffset + 9), snapshot.X, 64f);
+                WriteQuantized(packet.AsSpan(entryOffset + 11), snapshot.Y, 64f);
+                WriteQuantized(packet.AsSpan(entryOffset + 13), snapshot.Z, 64f);
+                BinaryPrimitives.WriteUInt16LittleEndian(
+                    packet.AsSpan(entryOffset + 15), QuantizeRotation(snapshot.Rotation));
+                WriteQuantized(packet.AsSpan(entryOffset + 17), snapshot.VelocityX, 16f);
+                WriteQuantized(packet.AsSpan(entryOffset + 19), snapshot.VelocityY, 16f);
+                WriteSingle(packet.AsSpan(entryOffset + 21), snapshot.Hp);
+                packet[entryOffset + 25] = snapshot.Flags;
+                entryOffset += FishSnapshotCompactEntrySize;
+            }
+            else
+            {
+                WriteSingle(packet.AsSpan(entryOffset + 9), snapshot.X);
+                WriteSingle(packet.AsSpan(entryOffset + 13), snapshot.Y);
+                WriteSingle(packet.AsSpan(entryOffset + 17), snapshot.Z);
+                WriteSingle(packet.AsSpan(entryOffset + 21), snapshot.Rotation);
+                WriteSingle(packet.AsSpan(entryOffset + 25), snapshot.VelocityX);
+                WriteSingle(packet.AsSpan(entryOffset + 29), snapshot.VelocityY);
+                WriteSingle(packet.AsSpan(entryOffset + 33), snapshot.Hp);
+                packet[entryOffset + 37] = snapshot.Flags;
+                entryOffset += FishSnapshotFullEntrySize;
+            }
         }
         return packet;
     }
@@ -943,42 +1061,56 @@ internal static class Protocol
         var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
         var tick = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
         var count = packet[HeaderSize + 12];
-        if (sceneId == 0 || sceneEpoch == 0 || tick == 0 || count is < 1 || count > MaxFishSnapshotsPerPacket ||
-            packet.Length != FishSnapshotBatchFixedSize + count * FishSnapshotEntrySize)
+        if (sceneId == 0 || sceneEpoch == 0 || tick == 0 || count is < 1 ||
+            count > MaxFishSnapshotsPerPacket || packet.Length > MaxDatagramSize)
             return false;
 
         snapshots = new FishSnapshot[count];
+        var entryOffset = FishSnapshotBatchFixedSize;
         for (var index = 0; index < count; index++)
         {
-            var entryOffset = FishSnapshotBatchFixedSize + index * FishSnapshotEntrySize;
+            if (entryOffset + 9 > packet.Length || packet[entryOffset + 8] > 1)
+            {
+                snapshots = Array.Empty<FishSnapshot>();
+                return false;
+            }
+            var compact = packet[entryOffset + 8] == 0;
+            var entrySize = compact ? FishSnapshotCompactEntrySize : FishSnapshotFullEntrySize;
+            if (entryOffset + entrySize > packet.Length)
+            {
+                snapshots = Array.Empty<FishSnapshot>();
+                return false;
+            }
             var snapshot = new FishSnapshot(
                 sceneId,
                 sceneEpoch,
                 tick,
                 BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset)),
                 BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(entryOffset + 4)),
-                BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(entryOffset + 8)),
-                ReadSingle(packet.Slice(entryOffset + 12)),
-                ReadSingle(packet.Slice(entryOffset + 16)),
-                ReadSingle(packet.Slice(entryOffset + 20)),
-                ReadSingle(packet.Slice(entryOffset + 24)),
-                ReadSingle(packet.Slice(entryOffset + 28)),
-                ReadSingle(packet.Slice(entryOffset + 32)),
-                ReadSingle(packet.Slice(entryOffset + 36)),
-                packet[entryOffset + 40]);
-            if (!IsValidFishSnapshot(snapshot))
+                0,
+                compact ? ReadQuantized(packet.Slice(entryOffset + 9), 64f) : ReadSingle(packet.Slice(entryOffset + 9)),
+                compact ? ReadQuantized(packet.Slice(entryOffset + 11), 64f) : ReadSingle(packet.Slice(entryOffset + 13)),
+                compact ? ReadQuantized(packet.Slice(entryOffset + 13), 64f) : ReadSingle(packet.Slice(entryOffset + 17)),
+                compact ? BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(entryOffset + 15)) *
+                    (360f / ushort.MaxValue) : ReadSingle(packet.Slice(entryOffset + 21)),
+                compact ? ReadQuantized(packet.Slice(entryOffset + 17), 16f) : ReadSingle(packet.Slice(entryOffset + 25)),
+                compact ? ReadQuantized(packet.Slice(entryOffset + 19), 16f) : ReadSingle(packet.Slice(entryOffset + 29)),
+                ReadSingle(packet.Slice(entryOffset + (compact ? 21 : 33))),
+                packet[entryOffset + entrySize - 1]);
+            if (!IsValidFishSnapshot(snapshot, false))
             {
                 snapshots = Array.Empty<FishSnapshot>();
                 return false;
             }
             snapshots[index] = snapshot;
+            entryOffset += entrySize;
         }
-        return true;
+        return entryOffset == packet.Length;
     }
 
-    private static bool IsValidFishSnapshot(FishSnapshot snapshot) =>
+    private static bool IsValidFishSnapshot(FishSnapshot snapshot, bool requireFishDataTid = true) =>
         snapshot.SceneId != 0 && snapshot.SceneEpoch != 0 && snapshot.Tick != 0 &&
-        snapshot.Id > 0 && snapshot.Revision != 0 && snapshot.FishDataTID > 0 &&
+        snapshot.Id > 0 && snapshot.Revision != 0 && (!requireFishDataTid || snapshot.FishDataTID > 0) &&
         float.IsFinite(snapshot.X) && float.IsFinite(snapshot.Y) && float.IsFinite(snapshot.Z) &&
         float.IsFinite(snapshot.Rotation) && float.IsFinite(snapshot.VelocityX) &&
         float.IsFinite(snapshot.VelocityY) && float.IsFinite(snapshot.Hp) &&
@@ -986,6 +1118,38 @@ internal static class Protocol
         MathF.Abs(snapshot.X) <= 1_000_000f && MathF.Abs(snapshot.Y) <= 1_000_000f &&
         MathF.Abs(snapshot.Z) <= 1_000_000f && MathF.Abs(snapshot.VelocityX) <= 10_000f &&
         MathF.Abs(snapshot.VelocityY) <= 10_000f && snapshot.Flags <= 7;
+
+    private static bool CanCompactFishSnapshot(FishSnapshot snapshot) =>
+        CanQuantize(snapshot.X, 64f) && CanQuantize(snapshot.Y, 64f) &&
+        CanQuantize(snapshot.Z, 64f) && CanQuantize(snapshot.VelocityX, 16f) &&
+        CanQuantize(snapshot.VelocityY, 16f);
+
+    internal static int FishSnapshotRecordSize(FishSnapshot snapshot) =>
+        CanCompactFishSnapshot(snapshot) ? FishSnapshotCompactEntrySize : FishSnapshotFullEntrySize;
+
+    internal static int FishSnapshotBatchOverhead => FishSnapshotBatchFixedSize;
+
+    private static bool CanQuantize(float value, float scale)
+    {
+        if (!float.IsFinite(value))
+            return false;
+        var scaled = MathF.Round(value * scale);
+        return scaled is >= short.MinValue and <= short.MaxValue;
+    }
+
+    private static void WriteQuantized(Span<byte> destination, float value, float scale) =>
+        BinaryPrimitives.WriteInt16LittleEndian(destination, (short)MathF.Round(value * scale));
+
+    private static float ReadQuantized(ReadOnlySpan<byte> source, float scale) =>
+        BinaryPrimitives.ReadInt16LittleEndian(source) / scale;
+
+    private static ushort QuantizeRotation(float rotation)
+    {
+        var normalized = rotation % 360f;
+        if (normalized < 0f)
+            normalized += 360f;
+        return (ushort)MathF.Round(normalized * (ushort.MaxValue / 360f));
+    }
 
     internal static byte[] EncodeFishDamageRequest(uint sequence, FishDamageRequest request)
     {
@@ -1132,9 +1296,13 @@ internal static class Protocol
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
-        if (state.Domain == 0 || state.Domain > 16 || state.Action == 0 || state.Action > 39)
+        if (state.Domain == 0 || state.Domain > 17 || state.Action == 0 || state.Action > 77)
             throw new ArgumentOutOfRangeException(nameof(state));
-        var packet = new byte[ManagerEventSize];
+        var invocationSize = 0;
+        if (state.Invocation is { } invocation &&
+            !TryGetManagerInvocationSize(state, invocation, out invocationSize))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[ManagerEventSize + invocationSize];
         WriteHeader(packet, PacketType.ManagerEvent, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.Revision);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneId);
@@ -1143,6 +1311,8 @@ internal static class Protocol
         packet[HeaderSize + 13] = state.Action;
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), state.Value);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 18), state.Context);
+        if (state.Invocation is { } descriptor)
+            WriteManagerInvocation(packet.AsSpan(ManagerEventSize), descriptor);
         return packet;
     }
 
@@ -1153,10 +1323,10 @@ internal static class Protocol
     {
         sequence = 0;
         state = default;
-        if (packet.Length != ManagerEventSize ||
+        if (packet.Length < ManagerEventSize || packet.Length > MaxDatagramSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.ManagerEvent)
             return false;
-        state = new ManagerEvent(
+        var candidate = new ManagerEvent(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
@@ -1164,7 +1334,265 @@ internal static class Protocol
             packet[HeaderSize + 13],
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 18)));
-        return IsValidManagerEvent(state);
+        if (!IsValidManagerEvent(candidate))
+            return false;
+        if (packet.Length == ManagerEventSize)
+        {
+            state = candidate;
+            return true;
+        }
+        if (!TryReadManagerInvocation(
+                packet.Slice(ManagerEventSize), candidate, out var invocation))
+            return false;
+        state = candidate with { Invocation = invocation };
+        return true;
+    }
+
+    private static bool TryGetManagerInvocationSize(
+        ManagerEvent state,
+        ManagerInvocationDescriptor invocation,
+        out int size)
+    {
+        size = 2;
+        if (state.Revision == 0)
+            return false;
+        var routeMatches = invocation.Kind switch
+        {
+            ManagerInvocationKind.Scenario => state.Domain == 16 && state.Action == 32,
+            ManagerInvocationKind.DialogueNormal or ManagerInvocationKind.DialogueArguments or
+                ManagerInvocationKind.DialogueSmall => state.Domain == 3 && state.Action == 35,
+            ManagerInvocationKind.TimelineByTid => state.Domain == 13 && state.Action == 24,
+            _ => false
+        };
+        if (!routeMatches)
+            return false;
+        if (invocation.Kind == ManagerInvocationKind.TimelineByTid)
+        {
+            if (invocation.BundleId != null || invocation.Arguments != null ||
+                invocation.UseButton || invocation.ShowCurtain || invocation.IgnorePlaying ||
+                (state.Context & 1) != 0 ||
+                invocation.HasCustomPosition &&
+                (!float.IsFinite(invocation.CustomX) || !float.IsFinite(invocation.CustomY) ||
+                 !float.IsFinite(invocation.CustomZ) ||
+                 MathF.Abs(invocation.CustomX) > 1_000_000f ||
+                 MathF.Abs(invocation.CustomY) > 1_000_000f ||
+                 MathF.Abs(invocation.CustomZ) > 1_000_000f) ||
+                !invocation.HasCustomPosition &&
+                (invocation.CustomX != 0f || invocation.CustomY != 0f || invocation.CustomZ != 0f))
+                return false;
+            if (invocation.HasCustomPosition)
+                size += 12;
+            return ManagerEventSize + size <= MaxDatagramSize;
+        }
+
+        if (string.IsNullOrEmpty(invocation.BundleId) || invocation.HasCustomPosition ||
+            invocation.CustomX != 0f || invocation.CustomY != 0f || invocation.CustomZ != 0f ||
+            !invocation.ApplyOffset ||
+            unchecked((int)SceneId(invocation.BundleId)) != state.Value ||
+            invocation.Kind != ManagerInvocationKind.Scenario && invocation.IgnorePlaying ||
+            (invocation.Kind is ManagerInvocationKind.DialogueNormal or
+                ManagerInvocationKind.DialogueSmall) && invocation.Arguments != null)
+            return false;
+        if (!TryGetManagerInvocationStringSize(invocation.BundleId, out var bundleSize))
+            return false;
+        size += 2 + bundleSize;
+        if (invocation.Kind is ManagerInvocationKind.Scenario or
+            ManagerInvocationKind.DialogueArguments)
+        {
+            size += 2;
+            if (invocation.Arguments != null)
+            {
+                if (invocation.Arguments.Length > MaxManagerInvocationArguments)
+                    return false;
+                foreach (var argument in invocation.Arguments)
+                {
+                    if (argument == null)
+                        size += 2;
+                    else
+                    {
+                        if (!TryGetManagerInvocationStringSize(argument, out var argumentSize))
+                            return false;
+                        size += 2 + argumentSize;
+                    }
+                }
+            }
+        }
+        return ManagerEventSize + size <= MaxDatagramSize;
+    }
+
+    internal static bool IsValidManagerInvocation(
+        byte domain,
+        byte action,
+        int value,
+        ManagerInvocationDescriptor invocation) =>
+        TryGetManagerInvocationSize(
+            new ManagerEvent(1, 0, 1, domain, action, value, 0), invocation, out _);
+
+    private static bool TryGetManagerInvocationStringSize(string value, out int size)
+    {
+        try
+        {
+            size = StrictUtf8.GetByteCount(value);
+            return value.IndexOf('\0') < 0 && size <= MaxManagerInvocationStringBytes;
+        }
+        catch (EncoderFallbackException)
+        {
+            size = 0;
+            return false;
+        }
+    }
+
+    private static void WriteManagerInvocation(
+        Span<byte> destination, ManagerInvocationDescriptor invocation)
+    {
+        destination[0] = (byte)invocation.Kind;
+        destination[1] = invocation.Kind switch
+        {
+            ManagerInvocationKind.Scenario =>
+                (byte)((invocation.UseButton ? 1 : 0) |
+                    (invocation.ShowCurtain ? 2 : 0) |
+                    (invocation.IgnorePlaying ? 4 : 0)),
+            ManagerInvocationKind.DialogueNormal or ManagerInvocationKind.DialogueArguments or
+                ManagerInvocationKind.DialogueSmall =>
+                (byte)((invocation.UseButton ? 1 : 0) |
+                    (invocation.ShowCurtain ? 2 : 0)),
+            _ => (byte)((invocation.ApplyOffset ? 1 : 0) |
+                (invocation.HasCustomPosition ? 2 : 0))
+        };
+        var offset = 2;
+        if (invocation.Kind == ManagerInvocationKind.TimelineByTid)
+        {
+            if (!invocation.HasCustomPosition)
+                return;
+            WriteSingle(destination.Slice(offset), invocation.CustomX);
+            WriteSingle(destination.Slice(offset + 4), invocation.CustomY);
+            WriteSingle(destination.Slice(offset + 8), invocation.CustomZ);
+            return;
+        }
+        offset += WriteManagerInvocationString(destination.Slice(offset), invocation.BundleId);
+        if (invocation.Kind is not (ManagerInvocationKind.Scenario or
+            ManagerInvocationKind.DialogueArguments))
+            return;
+        if (invocation.Arguments == null)
+        {
+            BinaryPrimitives.WriteUInt16LittleEndian(destination.Slice(offset), ushort.MaxValue);
+            return;
+        }
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            destination.Slice(offset), (ushort)invocation.Arguments.Length);
+        offset += 2;
+        foreach (var argument in invocation.Arguments)
+        {
+            if (argument == null)
+            {
+                BinaryPrimitives.WriteUInt16LittleEndian(destination.Slice(offset), ushort.MaxValue);
+                offset += 2;
+            }
+            else
+                offset += WriteManagerInvocationString(destination.Slice(offset), argument);
+        }
+    }
+
+    private static int WriteManagerInvocationString(Span<byte> destination, string value)
+    {
+        var length = StrictUtf8.GetByteCount(value);
+        BinaryPrimitives.WriteUInt16LittleEndian(destination, (ushort)length);
+        StrictUtf8.GetBytes(value, destination.Slice(2, length));
+        return length + 2;
+    }
+
+    private static bool TryReadManagerInvocation(
+        ReadOnlySpan<byte> source,
+        ManagerEvent state,
+        out ManagerInvocationDescriptor invocation)
+    {
+        invocation = default;
+        if (source.Length < 2)
+            return false;
+        var kind = (ManagerInvocationKind)source[0];
+        var flags = source[1];
+        var offset = 2;
+        string bundleId = null;
+        string[] arguments = null;
+        var applyOffset = true;
+        var hasCustomPosition = false;
+        var customX = 0f;
+        var customY = 0f;
+        var customZ = 0f;
+        if (kind == ManagerInvocationKind.TimelineByTid)
+        {
+            if ((flags & ~3) != 0)
+                return false;
+            applyOffset = (flags & 1) != 0;
+            hasCustomPosition = (flags & 2) != 0;
+            if (hasCustomPosition)
+            {
+                if (source.Length - offset != 12)
+                    return false;
+                customX = ReadSingle(source.Slice(offset));
+                customY = ReadSingle(source.Slice(offset + 4));
+                customZ = ReadSingle(source.Slice(offset + 8));
+                offset += 12;
+            }
+        }
+        else
+        {
+            var allowedFlags = kind == ManagerInvocationKind.Scenario ? 7 : 3;
+            if ((flags & ~allowedFlags) != 0 ||
+                !TryReadManagerInvocationString(source, ref offset, false, out bundleId))
+                return false;
+            if (kind is ManagerInvocationKind.Scenario or ManagerInvocationKind.DialogueArguments)
+            {
+                if (source.Length - offset < 2)
+                    return false;
+                var count = BinaryPrimitives.ReadUInt16LittleEndian(source.Slice(offset));
+                offset += 2;
+                if (count != ushort.MaxValue)
+                {
+                    if (count > MaxManagerInvocationArguments)
+                        return false;
+                    arguments = new string[count];
+                    for (var index = 0; index < count; index++)
+                        if (!TryReadManagerInvocationString(
+                                source, ref offset, true, out arguments[index]))
+                            return false;
+                }
+            }
+        }
+        if (offset != source.Length)
+            return false;
+        invocation = new ManagerInvocationDescriptor(
+            kind, bundleId, arguments,
+            kind != ManagerInvocationKind.TimelineByTid && (flags & 1) != 0,
+            kind != ManagerInvocationKind.TimelineByTid && (flags & 2) != 0,
+            kind == ManagerInvocationKind.Scenario && (flags & 4) != 0,
+            applyOffset, hasCustomPosition, customX, customY, customZ);
+        return TryGetManagerInvocationSize(state, invocation, out var expectedSize) &&
+            expectedSize == source.Length;
+    }
+
+    private static bool TryReadManagerInvocationString(
+        ReadOnlySpan<byte> source, ref int offset, bool allowNull, out string value)
+    {
+        value = null;
+        if (source.Length - offset < 2)
+            return false;
+        var length = BinaryPrimitives.ReadUInt16LittleEndian(source.Slice(offset));
+        offset += 2;
+        if (length == ushort.MaxValue)
+            return allowNull;
+        if (length > MaxManagerInvocationStringBytes || source.Length - offset < length)
+            return false;
+        try
+        {
+            value = StrictUtf8.GetString(source.Slice(offset, length));
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+        offset += length;
+        return true;
     }
 
     private static bool IsValidManagerEvent(ManagerEvent state)
@@ -1173,28 +1601,32 @@ internal static class Protocol
         {
             1 or 2 => state.Action is 1 or 2 or 3,
             3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39,
-            4 or 5 or 6 or 7 or 9 => state.Action == 8,
-            8 => state.Action is 9 or 10 or 11,
-            10 => state.Action == 12,
+            4 or 5 or 6 or 7 => state.Action == 8,
+            8 => state.Action is 9 or 10 or 11 or >= 71 and <= 74,
+            9 => state.Action is 8 or 77,
+            10 => state.Action is 12 or 75 or 76,
             11 => state.Action is >= 13 and <= 20 or >= 28 and <= 30,
             12 => state.Action is 21 or 22 or 23,
             13 => state.Action is 24 or 25 or 31,
             14 => state.Action == 26,
             15 => state.Action == 27,
             16 => state.Action is 32 or 33 or 34,
+            17 => state.Action is >= 40 and <= 70,
             _ => false
         };
         if (!pairIsValid)
             return false;
         if (state.Domain is 3 or 16 && state.SceneId != 0)
             return false;
-        if (state.Action is 32 or 35 or 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
+        if (state.Action is 32 or 35 && (state.Value == 0 || state.Context != 0) ||
+            state.Action is 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
             state.Action == 33 && (state.Value == 0 || state.Context == 0) ||
             state.Action == 36 && (state.Value == 0 || state.Context < 0) ||
             (state.Action is 34 or 37) &&
                 (state.Value == 0 || state.Context is not 0 and not 1))
             return false;
-        if (state.Domain is 4 or 5 or 10 && state.Value is not 0 and not 1)
+        if ((state.Domain is 4 or 5 || state.Domain == 10 && state.Action == 12) &&
+            state.Value is not 0 and not 1)
             return false;
         if (state.Domain == 12 && state.Action == 22 && state.Value is < -1 or > 8)
             return false;
@@ -1217,6 +1649,34 @@ internal static class Protocol
             (state.Value is < 0 or > 64 ||
              BitConverter.Int32BitsToSingle(state.Context) is not (>= 0f and <= 3_600f)))
             return false;
+        if (state.Domain == 17)
+        {
+            if (state.Action is >= 40 and <= 68 &&
+                (state.Value < 0 ||
+                 (state.Context & 0x3fffffff) is <= 0 or > 1_000_000))
+                return false;
+            if (state.Action == 69 &&
+                (state.Value is < 1 or > 6 || state.Context < -1_000_000_000))
+                return false;
+            if (state.Action == 70 && (state.Value < 0 || state.Context is < 0 or > 3))
+                return false;
+        }
+        if (state.Action is >= 71 and <= 77)
+        {
+            var request = state.Action is 71 or 73 or 75 or 77;
+            if (request != (state.Revision == 0))
+                return false;
+            var validTarget = state.Context >= 0 && ((uint)state.Context >> 16) < 2;
+            if (state.Action == 71 && (state.Value is < 0 or > 1 || state.Context != 0) ||
+                state.Action == 72 && (state.Value < 0 || !validTarget) ||
+                state.Action == 73 && (state.Value != 0 || !validTarget) ||
+                state.Action == 74 && (state.Value is not 0 and not 1 || !validTarget) ||
+                state.Action == 75 && (state.Value is < 0 or > 1_000_000 || !validTarget) ||
+                state.Action == 76 && (state.Value is < -1 or > 1_000_000 || !validTarget) ||
+                state.Action == 77 &&
+                    (state.Value is < 0 or > 1 || state.Context is < 1 or > 1000))
+                return false;
+        }
         return true;
     }
 
@@ -1316,10 +1776,11 @@ internal static class Protocol
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.SceneEpoch);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.Id);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.KnownRevision);
-        packet[HeaderSize + 24] = (byte)request.Action;
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 25), request.Damage);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 29), request.Element);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 33), request.AttackType);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 24), request.LeaseId);
+        packet[HeaderSize + 32] = (byte)request.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 33), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 37), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 41), request.AttackType);
         return packet;
     }
 
@@ -1337,15 +1798,99 @@ internal static class Protocol
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 20)),
-            (FishAction)packet[HeaderSize + 24],
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 25)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 29)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 33)));
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 24)),
+            (FishAction)packet[HeaderSize + 32],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 33)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 37)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 41)));
         if (IsValidFishActionRequest(request))
             return true;
         request = default;
         return false;
     }
+
+    internal static byte[] EncodeFishHookPose(uint sequence, FishHookPose pose)
+    {
+        if (!IsValidFishHookPose(pose))
+            throw new ArgumentOutOfRangeException(nameof(pose));
+        var compact = CanCompactFishHookPose(pose);
+        var packet = new byte[compact ? FishHookPoseCompactSize : FishHookPoseFullSize];
+        WriteHeader(packet, PacketType.FishHookPose, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), pose.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), pose.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), pose.FishId);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 12), pose.LeaseId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 20), pose.Tick);
+        packet[HeaderSize + 24] = compact ? (byte)0 : (byte)1;
+        var offset = FishHookPoseFixedSize;
+        if (compact)
+        {
+            WriteQuantized(packet.AsSpan(offset), pose.X, 64f);
+            WriteQuantized(packet.AsSpan(offset + 2), pose.Y, 64f);
+            WriteQuantized(packet.AsSpan(offset + 4), pose.Z, 64f);
+            BinaryPrimitives.WriteUInt16LittleEndian(
+                packet.AsSpan(offset + 6), QuantizeRotation(pose.Rotation));
+            WriteQuantized(packet.AsSpan(offset + 8), pose.VelocityX, 16f);
+            WriteQuantized(packet.AsSpan(offset + 10), pose.VelocityY, 16f);
+        }
+        else
+        {
+            WriteSingle(packet.AsSpan(offset), pose.X);
+            WriteSingle(packet.AsSpan(offset + 4), pose.Y);
+            WriteSingle(packet.AsSpan(offset + 8), pose.Z);
+            WriteSingle(packet.AsSpan(offset + 12), pose.Rotation);
+            WriteSingle(packet.AsSpan(offset + 16), pose.VelocityX);
+            WriteSingle(packet.AsSpan(offset + 20), pose.VelocityY);
+        }
+        return packet;
+    }
+
+    internal static bool TryDecodeFishHookPose(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishHookPose pose)
+    {
+        sequence = 0;
+        pose = default;
+        if (packet.Length < FishHookPoseFixedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishHookPose)
+            return false;
+        var encoding = packet[HeaderSize + 24];
+        if (encoding > 1 || packet.Length != (encoding == 0
+                ? FishHookPoseCompactSize : FishHookPoseFullSize))
+            return false;
+        var offset = FishHookPoseFixedSize;
+        var compact = encoding == 0;
+        pose = new FishHookPose(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            compact ? ReadQuantized(packet.Slice(offset), 64f) : ReadSingle(packet.Slice(offset)),
+            compact ? ReadQuantized(packet.Slice(offset + 2), 64f) : ReadSingle(packet.Slice(offset + 4)),
+            compact ? ReadQuantized(packet.Slice(offset + 4), 64f) : ReadSingle(packet.Slice(offset + 8)),
+            compact ? BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(offset + 6)) *
+                (360f / ushort.MaxValue) : ReadSingle(packet.Slice(offset + 12)),
+            compact ? ReadQuantized(packet.Slice(offset + 8), 16f) : ReadSingle(packet.Slice(offset + 16)),
+            compact ? ReadQuantized(packet.Slice(offset + 10), 16f) : ReadSingle(packet.Slice(offset + 20)));
+        if (IsValidFishHookPose(pose))
+            return true;
+        pose = default;
+        return false;
+    }
+
+    private static bool IsValidFishHookPose(FishHookPose pose) =>
+        pose.SceneId != 0 && pose.SceneEpoch != 0 && pose.FishId > 0 &&
+        pose.LeaseId != 0 && pose.Tick != 0 &&
+        float.IsFinite(pose.X) && float.IsFinite(pose.Y) && float.IsFinite(pose.Z) &&
+        float.IsFinite(pose.Rotation) && float.IsFinite(pose.VelocityX) &&
+        float.IsFinite(pose.VelocityY) && MathF.Abs(pose.X) <= 1_000_000f &&
+        MathF.Abs(pose.Y) <= 1_000_000f && MathF.Abs(pose.Z) <= 1_000_000f &&
+        MathF.Abs(pose.VelocityX) <= 10_000f && MathF.Abs(pose.VelocityY) <= 10_000f;
+
+    private static bool CanCompactFishHookPose(FishHookPose pose) =>
+        CanQuantize(pose.X, 64f) && CanQuantize(pose.Y, 64f) &&
+        CanQuantize(pose.Z, 64f) && CanQuantize(pose.VelocityX, 16f) &&
+        CanQuantize(pose.VelocityY, 16f);
 
     internal static byte[] EncodeFishActionAck(uint sequence, FishActionAck ack)
     {
@@ -1391,6 +1936,110 @@ internal static class Protocol
         return false;
     }
 
+    internal static byte[] EncodeFishLootGrant(uint sequence, FishLootGrant grant)
+    {
+        if (!IsValidFishLootGrant(grant))
+            throw new ArgumentOutOfRangeException(nameof(grant));
+        var packet = new byte[FishLootGrantSize];
+        WriteHeader(packet, PacketType.FishLootGrant, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), grant.TransactionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), grant.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), grant.SceneEpoch);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 16), grant.RequestId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 24), grant.FishId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 28), grant.Revision);
+        packet[HeaderSize + 32] = (byte)grant.Action;
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 33), grant.Index);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 35), grant.EntryCount);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 37), grant.ItemId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 41), grant.Count);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 45), grant.BonusGrade);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 49), grant.LiftType);
+        WriteSingle(packet.AsSpan(HeaderSize + 53), grant.CarriedWeight);
+        return packet;
+    }
+
+    internal static bool TryDecodeFishLootGrant(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishLootGrant grant)
+    {
+        sequence = 0;
+        grant = default;
+        if (packet.Length != FishLootGrantSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishLootGrant)
+            return false;
+        grant = new FishLootGrant(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 24)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 28)),
+            (FishAction)packet[HeaderSize + 32],
+            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 33)),
+            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 35)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 37)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 41)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 45)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 49)),
+            ReadSingle(packet.Slice(HeaderSize + 53)));
+        if (IsValidFishLootGrant(grant))
+            return true;
+        grant = default;
+        return false;
+    }
+
+    private static bool IsValidFishLootGrant(FishLootGrant grant) =>
+        grant.TransactionId != 0 && grant.SceneId != 0 && grant.SceneEpoch != 0 &&
+        grant.RequestId != 0 && grant.FishId > 0 && grant.Revision != 0 &&
+        grant.Action is FishAction.Capture or FishAction.CorpsePickup &&
+        grant.EntryCount is > 0 and <= 64 && grant.Index < grant.EntryCount &&
+        grant.ItemId > 0 && grant.Count is > 0 and <= 9_999 &&
+        grant.BonusGrade is >= 0 and <= 100 && grant.LiftType is >= 0 and <= 3 &&
+        float.IsFinite(grant.CarriedWeight) && grant.CarriedWeight is >= 0f and <= 1_000_000f;
+
+    internal static byte[] EncodeFishLootComplete(uint sequence, FishLootComplete complete)
+    {
+        if (!IsValidFishLootComplete(complete))
+            throw new ArgumentOutOfRangeException(nameof(complete));
+        var packet = new byte[FishLootCompleteSize];
+        WriteHeader(packet, PacketType.FishLootComplete, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), complete.TransactionId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), complete.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), complete.SceneEpoch);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 16), complete.RequestId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 24), complete.FishId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 28), complete.Revision);
+        packet[HeaderSize + 32] = (byte)complete.Action;
+        return packet;
+    }
+
+    internal static bool TryDecodeFishLootComplete(
+        ReadOnlySpan<byte> packet, out uint sequence, out FishLootComplete complete)
+    {
+        sequence = 0;
+        complete = default;
+        if (packet.Length != FishLootCompleteSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.FishLootComplete)
+            return false;
+        complete = new FishLootComplete(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 24)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 28)),
+            (FishAction)packet[HeaderSize + 32]);
+        if (IsValidFishLootComplete(complete))
+            return true;
+        complete = default;
+        return false;
+    }
+
+    private static bool IsValidFishLootComplete(FishLootComplete complete) =>
+        complete.TransactionId != 0 && complete.SceneId != 0 && complete.SceneEpoch != 0 &&
+        complete.RequestId != 0 && complete.FishId > 0 && complete.Revision != 0 &&
+        complete.Action is FishAction.Capture or FishAction.CorpsePickup;
+
     private static bool IsValidFishLifecycle(FishLifecycle state)
     {
         if (state.SceneId == 0 || state.SceneEpoch == 0 || state.Id <= 0 || state.Revision == 0 ||
@@ -1404,6 +2053,9 @@ internal static class Protocol
                 state.Hp == 0f,
             FishLifecycleKind.Phase => state.FishDataTID == 0 && state.Phase != FishPhase.None &&
                 Enum.IsDefined(typeof(FishPhase), state.Phase),
+            FishLifecycleKind.InterestEnter or FishLifecycleKind.InterestLeave =>
+                state.FishDataTID == 0 && state.Phase != FishPhase.None &&
+                Enum.IsDefined(typeof(FishPhase), state.Phase),
             _ => false
         };
     }
@@ -1414,11 +2066,13 @@ internal static class Protocol
             return false;
         return request.Action switch
         {
-            FishAction.Damage => request.Damage is >= 1 and <= 10_000 &&
-                request.Element is >= 0 and <= 32 && request.AttackType is >= 0 and <= 64,
-            FishAction.Qte => request.Damage is >= 1 and <= 10_000 &&
-                request.Element is >= 0 and <= 32 && request.AttackType == 0,
-            FishAction.Hook or FishAction.Release or FishAction.Capture or FishAction.CorpsePickup =>
+            FishAction.Damage => request.LeaseId == 0 && request.Damage is >= 1 and <= 10_000 &&
+                request.Element is >= 0 and <= 64 && request.AttackType is >= 0 and <= 1024,
+            FishAction.Qte => request.LeaseId != 0 && request.Damage is >= 1 and <= 10_000 &&
+                request.Element is >= 0 and <= 64 && request.AttackType == 0,
+            FishAction.Hook or FishAction.CorpsePickup => request.LeaseId == 0 &&
+                request.Damage == 0 && request.Element == 0 && request.AttackType == 0,
+            FishAction.Release or FishAction.Capture => request.LeaseId != 0 &&
                 request.Damage == 0 && request.Element == 0 && request.AttackType == 0,
             _ => false
         };
@@ -1790,6 +2444,95 @@ internal static class Protocol
             return false;
         state = new RoomState(roomId, revision, value);
         return true;
+    }
+
+    internal static byte[] EncodeSaveSnapshotChunk(uint sequence, SaveSnapshotChunk chunk)
+    {
+        var data = chunk.Data ?? throw new ArgumentNullException(nameof(chunk.Data));
+        if (!IsValidSaveSnapshotChunk(chunk, data.Length))
+            throw new ArgumentOutOfRangeException(nameof(chunk));
+        var packet = new byte[SaveSnapshotChunkFixedSize + data.Length];
+        WriteHeader(packet, PacketType.SaveSnapshotChunk, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), chunk.TransferId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), chunk.Fingerprint);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), chunk.TotalBytes);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 16), chunk.ChunkIndex);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 18), chunk.ChunkCount);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 20), (ushort)data.Length);
+        data.CopyTo(packet.AsSpan(SaveSnapshotChunkFixedSize));
+        return packet;
+    }
+
+    internal static bool TryDecodeSaveSnapshotChunk(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out SaveSnapshotChunk chunk)
+    {
+        sequence = 0;
+        chunk = default;
+        if (packet.Length < SaveSnapshotChunkFixedSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.SaveSnapshotChunk)
+            return false;
+        var dataLength = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 20));
+        if (dataLength > MaxSaveSnapshotChunkBytes ||
+            packet.Length != SaveSnapshotChunkFixedSize + dataLength)
+            return false;
+        var candidate = new SaveSnapshotChunk(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 18)),
+            packet.Slice(SaveSnapshotChunkFixedSize).ToArray());
+        if (!IsValidSaveSnapshotChunk(candidate, dataLength))
+            return false;
+        chunk = candidate;
+        return true;
+    }
+
+    internal static byte[] EncodeSaveSnapshotAck(uint sequence, SaveSnapshotAck ack)
+    {
+        if (ack.TransferId == 0 || ack.Fingerprint == 0)
+            throw new ArgumentOutOfRangeException(nameof(ack));
+        var packet = new byte[SaveSnapshotAckSize];
+        WriteHeader(packet, PacketType.SaveSnapshotAck, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), ack.TransferId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), ack.Fingerprint);
+        packet[HeaderSize + 12] = ack.Loaded ? (byte)1 : (byte)0;
+        return packet;
+    }
+
+    internal static bool TryDecodeSaveSnapshotAck(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out SaveSnapshotAck ack)
+    {
+        sequence = 0;
+        ack = default;
+        if (packet.Length != SaveSnapshotAckSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.SaveSnapshotAck ||
+            packet[HeaderSize + 12] > 1)
+            return false;
+        ack = new SaveSnapshotAck(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            packet[HeaderSize + 12] == 1);
+        return ack.TransferId != 0 && ack.Fingerprint != 0;
+    }
+
+    private static bool IsValidSaveSnapshotChunk(SaveSnapshotChunk chunk, int dataLength)
+    {
+        if (chunk.TransferId == 0 || chunk.Fingerprint == 0 ||
+            chunk.TotalBytes <= 0 || chunk.TotalBytes > MaxSaveSnapshotChunkBytes * MaxSaveSnapshotChunks ||
+            chunk.ChunkCount is < 1 or > MaxSaveSnapshotChunks ||
+            chunk.ChunkIndex >= chunk.ChunkCount || dataLength is < 1 or > MaxSaveSnapshotChunkBytes)
+            return false;
+        var expectedChunks = (chunk.TotalBytes + MaxSaveSnapshotChunkBytes - 1) /
+            MaxSaveSnapshotChunkBytes;
+        var start = (long)chunk.ChunkIndex * MaxSaveSnapshotChunkBytes;
+        return chunk.ChunkCount == expectedChunks && start < chunk.TotalBytes &&
+            start + dataLength <= chunk.TotalBytes &&
+            (chunk.ChunkIndex + 1 == chunk.ChunkCount || dataLength == MaxSaveSnapshotChunkBytes);
     }
 
     internal static byte[] EncodeDiveReady(uint sequence, DiveReady ready)
@@ -2485,7 +3228,7 @@ internal static class Protocol
         float.IsFinite(manifest.Z) && float.IsFinite(manifest.Rotation) &&
         float.IsFinite(manifest.Hp) && manifest.Hp is >= 0f and <= 1_000_000_000f &&
         MathF.Abs(manifest.X) <= 1_000_000f && MathF.Abs(manifest.Y) <= 1_000_000f &&
-        MathF.Abs(manifest.Z) <= 1_000_000f && manifest.Flags <= 7;
+        MathF.Abs(manifest.Z) <= 1_000_000f && manifest.Flags <= 15;
 
     private static bool IsValidVisualSprite(VisualSprite sprite) =>
         sprite.SpriteId != 0 && float.IsFinite(sprite.OffsetX) && float.IsFinite(sprite.OffsetY) &&
@@ -2496,9 +3239,12 @@ internal static class Protocol
         sprite.ScaleY is > 0f and <= 100f;
 
     private static bool IsValidProjectileVisualState(ProjectileVisualState state) =>
-        state.SceneId != 0 && state.Id != 0 && IsValidVisualSprite(new VisualSprite(
-            state.SpriteId, state.X, state.Y, state.Z, state.Rotation, state.ScaleX, state.ScaleY,
-            state.SortingLayerId, state.SortingOrder, state.Flipped, false)) &&
+        state.SceneId != 0 && state.Id != 0 && state.SpriteId != 0 &&
+        float.IsFinite(state.X) && float.IsFinite(state.Y) && float.IsFinite(state.Z) &&
+        float.IsFinite(state.Rotation) && float.IsFinite(state.ScaleX) &&
+        float.IsFinite(state.ScaleY) && MathF.Abs(state.X) <= 1_000_000f &&
+        MathF.Abs(state.Y) <= 1_000_000f && MathF.Abs(state.Z) <= 1_000_000f &&
+        state.ScaleX is > 0f and <= 100f && MathF.Abs(state.ScaleY) is > 0f and <= 100f &&
         (!state.HasRope ||
             float.IsFinite(state.RopeStartX) && float.IsFinite(state.RopeStartY) &&
             float.IsFinite(state.RopeStartZ) && float.IsFinite(state.RopeEndX) &&
@@ -2687,12 +3433,36 @@ internal static class Protocol
         };
         var fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 7, 9, expectedFish, 0, expectedFish.Length);
         if (!TryDecodeFishSnapshotBatch(fishPacket, out sequence, out var actualFish) ||
-            sequence != 45 || fishPacket.Length != 113 || actualFish.Length != 2 ||
-            actualFish[0] != expectedFish[0] || actualFish[1] != expectedFish[1])
+            sequence != 45 || fishPacket.Length >= 113 || fishPacket.Length > 1200 ||
+            actualFish.Length != 2 || actualFish[0].Id != expectedFish[0].Id ||
+            actualFish[0].Revision != expectedFish[0].Revision || actualFish[0].FishDataTID != 0 ||
+            MathF.Abs(actualFish[0].X - expectedFish[0].X) > 1f / 128f ||
+            MathF.Abs(actualFish[0].Y - expectedFish[0].Y) > 1f / 128f ||
+            MathF.Abs(actualFish[0].Z - expectedFish[0].Z) > 1f / 128f ||
+            MathF.Abs(actualFish[0].VelocityX - expectedFish[0].VelocityX) > 1f / 32f ||
+            MathF.Abs(actualFish[0].VelocityY - expectedFish[0].VelocityY) > 1f / 32f ||
+            MathF.Abs(actualFish[0].Rotation - expectedFish[0].Rotation) > 360f / ushort.MaxValue ||
+            actualFish[0].Hp != expectedFish[0].Hp || actualFish[0].Flags != expectedFish[0].Flags)
             throw new InvalidOperationException("Fish snapshot batch round-trip failed");
-        fishPacket[^1] = 8;
-        if (TryDecodeFishSnapshotBatch(fishPacket, out _, out _))
-            throw new InvalidOperationException("Protocol accepted invalid fish flags");
+        var fallbackFish = new[]
+        {
+            expectedFish[0] with { X = 600f, VelocityY = 3000f, Rotation = -725.5f }
+        };
+        fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 7, 9, fallbackFish, 0, 1);
+        if (!TryDecodeFishSnapshotBatch(fishPacket, out _, out actualFish) ||
+            actualFish.Length != 1 || actualFish[0].X != fallbackFish[0].X ||
+            actualFish[0].VelocityY != fallbackFish[0].VelocityY ||
+            actualFish[0].Rotation != fallbackFish[0].Rotation)
+            throw new InvalidOperationException("Fish snapshot full-precision fallback failed");
+        var maximumFish = new FishSnapshot[MaxFishSnapshotsPerPacket];
+        for (var index = 0; index < maximumFish.Length; index++)
+            maximumFish[index] = fallbackFish[0] with { Id = index + 1 };
+        fishPacket = EncodeFishSnapshotBatch(
+            45, fishSceneId, 7, 9, maximumFish, 0, maximumFish.Length);
+        if (fishPacket.Length > MaxDatagramSize ||
+            !TryDecodeFishSnapshotBatch(fishPacket, out _, out actualFish) ||
+            actualFish.Length != maximumFish.Length)
+            throw new InvalidOperationException("Fish snapshot datagram budget failed");
         fishPacket = EncodeFishSnapshotBatch(45, fishSceneId, 7, 9, expectedFish, 0, expectedFish.Length);
         BinaryPrimitives.WriteUInt32LittleEndian(fishPacket.AsSpan(HeaderSize + 4), 0);
         if (TryDecodeFishSnapshotBatch(fishPacket, out _, out _))
@@ -2724,17 +3494,64 @@ internal static class Protocol
         WriteSingle(lifecyclePacket.AsSpan(HeaderSize + 22), float.NaN);
         if (TryDecodeFishLifecycle(lifecyclePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid lifecycle HP");
+        var interest = lifecycle with { Kind = FishLifecycleKind.InterestEnter, FishDataTID = 0 };
+        lifecyclePacket = EncodeFishLifecycle(47, interest);
+        if (!TryDecodeFishLifecycle(lifecyclePacket, out _, out actualLifecycle) ||
+            actualLifecycle != interest)
+            throw new InvalidOperationException("Fish interest lifecycle round-trip failed");
+
+        var hookPose = new FishHookPose(
+            fishSceneId, 7, 17, 0x0102030405060708, 19,
+            1.25f, -2.5f, -0.1f, 183f, 2f, -1f);
+        var hookPosePacket = EncodeFishHookPose(48, hookPose);
+        if (!TryDecodeFishHookPose(hookPosePacket, out sequence, out var actualHookPose) ||
+            sequence != 48 || actualHookPose.SceneId != hookPose.SceneId ||
+            actualHookPose.SceneEpoch != hookPose.SceneEpoch ||
+            actualHookPose.FishId != hookPose.FishId || actualHookPose.LeaseId != hookPose.LeaseId ||
+            actualHookPose.Tick != hookPose.Tick ||
+            MathF.Abs(actualHookPose.X - hookPose.X) > 1f / 64f ||
+            MathF.Abs(actualHookPose.Y - hookPose.Y) > 1f / 64f ||
+            MathF.Abs(actualHookPose.Z - hookPose.Z) > 1f / 64f ||
+            MathF.Abs(actualHookPose.VelocityX - hookPose.VelocityX) > 1f / 16f ||
+            MathF.Abs(actualHookPose.VelocityY - hookPose.VelocityY) > 1f / 16f)
+            throw new InvalidOperationException("Fish hook pose round-trip failed");
+        hookPosePacket = EncodeFishHookPose(48, hookPose with { X = 600f });
+        BinaryPrimitives.WriteInt32LittleEndian(
+            hookPosePacket.AsSpan(FishHookPoseFixedSize + 20), unchecked((int)0x7fc00000));
+        if (TryDecodeFishHookPose(hookPosePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish hook pose");
+        hookPosePacket = EncodeFishHookPose(48, hookPose);
+        BinaryPrimitives.WriteUInt32LittleEndian(hookPosePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeFishHookPose(hookPosePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted fish hook pose without scene epoch");
+        hookPosePacket = EncodeFishHookPose(48, hookPose);
+        hookPosePacket[5] = (byte)PacketType.FishActionAck;
+        if (TryDecodeFishHookPose(hookPosePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted wrong fish hook pose packet type");
 
         var actionRequest = new FishActionRequest(
-            0x0102030405060708, fishSceneId, 7, 17, 4,
+            0x0102030405060708, fishSceneId, 7, 17, 4, 0,
             FishAction.Damage, 23, 2, 4);
         var actionRequestPacket = EncodeFishActionRequest(48, actionRequest);
         if (!TryDecodeFishActionRequest(actionRequestPacket, out sequence, out var actualActionRequest) ||
-            sequence != 48 || actionRequestPacket.Length != 55 || actualActionRequest != actionRequest)
+            sequence != 48 || actionRequestPacket.Length != 63 || actualActionRequest != actionRequest)
             throw new InvalidOperationException("Fish action request round-trip failed");
-        actionRequestPacket[HeaderSize + 24] = (byte)FishAction.Release;
+        actionRequestPacket[HeaderSize + 32] = (byte)FishAction.Release;
         if (TryDecodeFishActionRequest(actionRequestPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted payload for payload-free fish action");
+        var releaseRequest = actionRequest with
+        {
+            LeaseId = actionRequest.RequestId,
+            Action = FishAction.Release,
+            Damage = 0,
+            Element = 0,
+            AttackType = 0
+        };
+        var releaseRequestPacket = EncodeFishActionRequest(48, releaseRequest);
+        if (!TryDecodeFishActionRequest(
+                releaseRequestPacket, out _, out var actualReleaseRequest) ||
+            actualReleaseRequest != releaseRequest)
+            throw new InvalidOperationException("Fish lease identity round-trip failed");
         actionRequestPacket = EncodeFishActionRequest(48, actionRequest);
         BinaryPrimitives.WriteUInt64LittleEndian(actionRequestPacket.AsSpan(HeaderSize), 0);
         if (TryDecodeFishActionRequest(actionRequestPacket, out _, out _))
@@ -2754,6 +3571,28 @@ internal static class Protocol
         WriteSingle(actionAckPacket.AsSpan(HeaderSize + 27), float.NaN);
         if (TryDecodeFishActionAck(actionAckPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid authoritative fish HP");
+
+        var lootGrant = new FishLootGrant(
+            0x1112131415161718, fishSceneId, 7, actionRequest.RequestId, 17, 5,
+            FishAction.Capture, 1, 2, 1_011_004, 2, 3, 2, 12.5f);
+        var lootGrantPacket = EncodeFishLootGrant(50, lootGrant);
+        if (!TryDecodeFishLootGrant(lootGrantPacket, out sequence, out var actualLootGrant) ||
+            sequence != 50 || actualLootGrant != lootGrant)
+            throw new InvalidOperationException("Fish loot grant round-trip failed");
+        BinaryPrimitives.WriteUInt16LittleEndian(lootGrantPacket.AsSpan(HeaderSize + 33), 2);
+        if (TryDecodeFishLootGrant(lootGrantPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish loot grant index");
+        var lootComplete = new FishLootComplete(
+            lootGrant.TransactionId, fishSceneId, 7, actionRequest.RequestId,
+            17, 5, FishAction.Capture);
+        var lootCompletePacket = EncodeFishLootComplete(51, lootComplete);
+        if (!TryDecodeFishLootComplete(
+                lootCompletePacket, out sequence, out var actualLootComplete) ||
+            sequence != 51 || actualLootComplete != lootComplete)
+            throw new InvalidOperationException("Fish loot completion round-trip failed");
+        lootCompletePacket[HeaderSize + 32] = byte.MaxValue;
+        if (TryDecodeFishLootComplete(lootCompletePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid fish loot completion");
 
         var expectedBossDamage = new BossDamageRequest(fishSceneId, 0x11223344, 37, 2, 4);
         var bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
@@ -2824,6 +3663,139 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 14), 0);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted identity-free dialogue finish");
+        var progressionEvents = new[]
+        {
+            new ManagerEvent(12, 0, 1243, 17, 40, 100, 1),
+            new ManagerEvent(13, 0, 1244, 17, 69, 1, 250),
+            new ManagerEvent(0, 0, 1245, 17, 69, 1, -100),
+            new ManagerEvent(14, 0, 1246, 17, 70, 10017, 3)
+        };
+        foreach (var progressionEvent in progressionEvents)
+        {
+            managerEventPacket = EncodeManagerEvent(61, progressionEvent);
+            if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+                managerEvent != progressionEvent)
+                throw new InvalidOperationException("Progression manager event round-trip failed");
+        }
+        var sushiActionEvents = new[]
+        {
+            new ManagerEvent(0, fishSceneId, 1247, 8, 71, 0, 0),
+            new ManagerEvent(15, fishSceneId, 1248, 8, 72, 1011001, (1 << 16) | 7),
+            new ManagerEvent(0, fishSceneId, 1249, 8, 73, 0, (1 << 16) | 7),
+            new ManagerEvent(16, fishSceneId, 1250, 8, 74, 1, (1 << 16) | 7),
+            new ManagerEvent(0, fishSceneId, 1251, 10, 75, 100, 7),
+            new ManagerEvent(16, fishSceneId, 1252, 10, 76, 100, 7),
+            new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5)
+        };
+        foreach (var sushiActionEvent in sushiActionEvents)
+        {
+            managerEventPacket = EncodeManagerEvent(62, sushiActionEvent);
+            if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+                managerEvent != sushiActionEvent)
+                throw new InvalidOperationException("Sushi action event round-trip failed");
+        }
+
+        var scenarioBundle = "z";
+        var scenarioKey = unchecked((int)SceneId(scenarioBundle));
+        var scenarioInvocation = new ManagerInvocationDescriptor(
+            ManagerInvocationKind.Scenario, scenarioBundle,
+            new string[] { "alpha", null, string.Empty }, true, false, true,
+            true, false, 0f, 0f, 0f);
+        var describedScenario = new ManagerEvent(
+            12, 0, 1243, 16, 32, scenarioKey, 0, scenarioInvocation);
+        managerEventPacket = EncodeManagerEvent(61, describedScenario);
+        if (scenarioKey >= 0 || managerEventPacket.Length > MaxDatagramSize ||
+            !TryDecodeManagerEvent(managerEventPacket, out sequence, out managerEvent) ||
+            sequence != 61 || managerEvent.Invocation is not { } decodedScenario ||
+            decodedScenario.Kind != ManagerInvocationKind.Scenario ||
+            decodedScenario.BundleId != scenarioBundle || decodedScenario.Arguments == null ||
+            decodedScenario.Arguments.Length != 3 || decodedScenario.Arguments[0] != "alpha" ||
+            decodedScenario.Arguments[1] != null || decodedScenario.Arguments[2] != string.Empty ||
+            !decodedScenario.UseButton || decodedScenario.ShowCurtain ||
+            !decodedScenario.IgnorePlaying)
+            throw new InvalidOperationException("Scenario invocation round-trip failed");
+        var trailingManagerEventPacket = new byte[managerEventPacket.Length + 1];
+        managerEventPacket.CopyTo(trailingManagerEventPacket, 0);
+        if (TryDecodeManagerEvent(trailingManagerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted trailing manager invocation data");
+        managerEventPacket[HeaderSize + 13] = 35;
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted mismatched manager invocation action");
+        managerEventPacket = EncodeManagerEvent(61, describedScenario);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            managerEventPacket.AsSpan(HeaderSize + 14), scenarioKey + 1);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted mismatched invocation content hash");
+        managerEventPacket = EncodeManagerEvent(61, describedScenario);
+        managerEventPacket[ManagerEventSize + 4] = 0xff;
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid invocation UTF-8");
+        var oversizedInvocationRejected = false;
+        try
+        {
+            var oversizedBundle = new string('x', 513);
+            EncodeManagerEvent(61, describedScenario with
+            {
+                Value = unchecked((int)SceneId(oversizedBundle)),
+                Invocation = scenarioInvocation with { BundleId = oversizedBundle }
+            });
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            oversizedInvocationRejected = true;
+        }
+        if (!oversizedInvocationRejected)
+            throw new InvalidOperationException("Protocol accepted oversized manager invocation");
+
+        var dialogueBundle = "dialogue/replay";
+        var dialogueKey = unchecked((int)SceneId(dialogueBundle));
+        var dialogueInvocations = new[]
+        {
+            new ManagerInvocationDescriptor(
+                ManagerInvocationKind.DialogueNormal, dialogueBundle, null,
+                true, false, false, true, false, 0f, 0f, 0f),
+            new ManagerInvocationDescriptor(
+                ManagerInvocationKind.DialogueArguments, dialogueBundle, null,
+                false, true, false, true, false, 0f, 0f, 0f),
+            new ManagerInvocationDescriptor(
+                ManagerInvocationKind.DialogueArguments, dialogueBundle, Array.Empty<string>(),
+                false, false, false, true, false, 0f, 0f, 0f),
+            new ManagerInvocationDescriptor(
+                ManagerInvocationKind.DialogueSmall, dialogueBundle, null,
+                true, true, false, true, false, 0f, 0f, 0f)
+        };
+        for (var index = 0; index < dialogueInvocations.Length; index++)
+        {
+            var describedDialogue = new ManagerEvent(
+                (uint)(13 + index), 0, (uint)(1244 + index), 3, 35,
+                dialogueKey, 0, dialogueInvocations[index]);
+            managerEventPacket = EncodeManagerEvent((uint)(62 + index), describedDialogue);
+            if (dialogueKey >= 0 ||
+                !TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+                managerEvent.Invocation is not { } decodedDialogue ||
+                decodedDialogue.Kind != dialogueInvocations[index].Kind ||
+                (index == 1 && decodedDialogue.Arguments != null) ||
+                (index == 2 && (decodedDialogue.Arguments == null ||
+                    decodedDialogue.Arguments.Length != 0)))
+                throw new InvalidOperationException("Dialogue invocation round-trip failed");
+        }
+
+        var timelineInvocation = new ManagerInvocationDescriptor(
+            ManagerInvocationKind.TimelineByTid, null, null,
+            false, false, false, false, true, 1.25f, -2.5f, 3.75f);
+        managerEventPacket = EncodeManagerEvent(66,
+            new ManagerEvent(17, fishSceneId, 1248, 13, 24, 71,
+                2, timelineInvocation));
+        if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+            managerEvent.Invocation is not { } decodedTimeline ||
+            decodedTimeline.Kind != ManagerInvocationKind.TimelineByTid ||
+            decodedTimeline.ApplyOffset || !decodedTimeline.HasCustomPosition ||
+            decodedTimeline.CustomX != 1.25f || decodedTimeline.CustomY != -2.5f ||
+            decodedTimeline.CustomZ != 3.75f)
+            throw new InvalidOperationException("Timeline invocation round-trip failed");
+        WriteSingle(managerEventPacket.AsSpan(managerEventPacket.Length - 4), float.NaN);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted non-finite timeline position");
 
         var expectedSushiResult = new SushiResultState(5, 1200, 300, 80, 21, 19, 4.5f);
         var sushiResultPacket = EncodeSushiResultState(48, expectedSushiResult);
@@ -2864,7 +3836,7 @@ internal static class Protocol
 
         var expectedFishManifest = new FishManifest(
             SceneId("A02_01_01"), 7, 3, 17, 4, "A02/FishAllocator/3", 2501,
-            1.25f, -2.5f, -0.1f, 183f, 42.5f, 5);
+            1.25f, -2.5f, -0.1f, 183f, 42.5f, 13);
         var fishManifestPacket = EncodeFishManifest(49, expectedFishManifest);
         if (!TryDecodeFishManifest(fishManifestPacket, out sequence, out var actualFishManifest) ||
             sequence != 49 || actualFishManifest != expectedFishManifest)
@@ -2920,6 +3892,31 @@ internal static class Protocol
         if (!TryDecodeRoomState(roomStatePacket, out sequence, out var roomState) ||
             sequence != 60 || roomState != new RoomState(7, 1, false))
             throw new InvalidOperationException("Room state round-trip failed");
+
+        var saveChunk = new SaveSnapshotChunk(
+            0x0102030405060708, 0x11223344, 3, 0, 1, new byte[] { 1, 2, 3 });
+        var saveChunkPacket = EncodeSaveSnapshotChunk(61, saveChunk);
+        if (!TryDecodeSaveSnapshotChunk(saveChunkPacket, out sequence, out var actualSaveChunk) ||
+            sequence != 61 || actualSaveChunk.TransferId != saveChunk.TransferId ||
+            actualSaveChunk.Fingerprint != saveChunk.Fingerprint ||
+            actualSaveChunk.TotalBytes != saveChunk.TotalBytes ||
+            actualSaveChunk.ChunkIndex != saveChunk.ChunkIndex ||
+            actualSaveChunk.ChunkCount != saveChunk.ChunkCount ||
+            actualSaveChunk.Data.Length != saveChunk.Data.Length ||
+            actualSaveChunk.Data[2] != saveChunk.Data[2])
+            throw new InvalidOperationException("Save snapshot chunk round-trip failed");
+        saveChunkPacket[HeaderSize + 16] = 1;
+        if (TryDecodeSaveSnapshotChunk(saveChunkPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid save snapshot chunk index");
+        var saveAckPacket = EncodeSaveSnapshotAck(
+            62, new SaveSnapshotAck(saveChunk.TransferId, saveChunk.Fingerprint, true));
+        if (!TryDecodeSaveSnapshotAck(saveAckPacket, out sequence, out var saveAck) ||
+            sequence != 62 || saveAck.TransferId != saveChunk.TransferId ||
+            saveAck.Fingerprint != saveChunk.Fingerprint || !saveAck.Loaded)
+            throw new InvalidOperationException("Save snapshot ack round-trip failed");
+        saveAckPacket[HeaderSize + 12] = 2;
+        if (TryDecodeSaveSnapshotAck(saveAckPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid save snapshot ack flag");
 
         var diveReadyPacket = EncodeDiveReady(61, new DiveReady(4, true));
         if (!TryDecodeDiveReady(diveReadyPacket, out sequence, out var diveReady) ||
@@ -3122,11 +4119,13 @@ internal static class Protocol
 
         var expectedProjectileVisual = new ProjectileVisualState(
             SceneId("A02_01_01"), 31, SceneId("Harpoon"), 1.25f, -2.5f, 0f, 45f,
-            1f, 1f, 7, 14, false, true, 0f, 0f, 0f, 1.25f, -2.5f, 0f);
+            1f, -1f, 7, 14, false, true, 0f, 0f, 0f, 1.25f, -2.5f, 0f);
         var projectileVisualPacket = EncodeProjectileVisualState(45, expectedProjectileVisual);
         if (!TryDecodeProjectileVisualState(projectileVisualPacket, out sequence, out var actualProjectileVisual) ||
             sequence != 45 || actualProjectileVisual != expectedProjectileVisual)
             throw new InvalidOperationException("Projectile visual round-trip failed");
+        if (IsValidProjectileVisualState(expectedProjectileVisual with { ScaleY = 0f }))
+            throw new InvalidOperationException("Protocol accepted zero projectile visual scale");
         WriteSingle(snapshotPacket.AsSpan(HeaderSize + 16), float.NaN);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid movement data");

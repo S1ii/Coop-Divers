@@ -105,6 +105,23 @@ internal static class TitleOnlineMenu
     private static int _pendingKeyboardLimit;
     private static Action<string> _pendingKeyboardApply;
     private static bool _closing;
+    private static bool _startingCampaign;
+    private static string _lastSaveStatus = string.Empty;
+
+    internal static void SelfTest()
+    {
+        if (!ShouldDisconnectForNativeTitleAction(false, false, SessionRole.Client) ||
+            !ShouldDisconnectForNativeTitleAction(false, false, SessionRole.Host) ||
+            ShouldDisconnectForNativeTitleAction(true, false, SessionRole.Client) ||
+            ShouldDisconnectForNativeTitleAction(false, true, SessionRole.Client) ||
+            ShouldDisconnectForNativeTitleAction(false, false, SessionRole.Offline) ||
+            !ShouldStartCampaign(false, true, true, true) ||
+            ShouldStartCampaign(true, true, true, true) ||
+            ShouldStartCampaign(false, false, true, true) ||
+            ShouldStartCampaign(false, true, false, true) ||
+            ShouldStartCampaign(false, true, true, false))
+            throw new InvalidOperationException("Native title action session cleanup failed");
+    }
 
     internal static void RequestHostDisconnect()
     {
@@ -159,6 +176,10 @@ internal static class TitleOnlineMenu
     internal static bool TryHandle(TitleManager manager, ButtonName action)
     {
         var code = (int)action;
+        var probe = ProbeBehaviour.Instance;
+        if (ShouldDisconnectForNativeTitleAction(
+                _visible, code == Online, ProbeBehaviour.Role) && probe != null)
+            probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
         if (code == Online)
         {
             Open(manager);
@@ -180,7 +201,6 @@ internal static class TitleOnlineMenu
                 return true;
         }
 
-        var probe = ProbeBehaviour.Instance;
         if (probe == null)
             return true;
 
@@ -189,6 +209,7 @@ internal static class TitleOnlineMenu
             case Host:
                 if (!probe.SwitchTitleSession(SessionRole.Host, _address, _port, _name, out _message))
                     break;
+                MultiplayerSaveSync.Reset();
                 _roomId = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
                 _remoteReady = false;
                 _hostStateSent = false;
@@ -199,6 +220,7 @@ internal static class TitleOnlineMenu
             case Join:
                 if (!probe.SwitchTitleSession(SessionRole.Client, _address, _port, _name, out _message))
                     break;
+                MultiplayerSaveSync.Reset();
                 _clientReady = false;
                 _readyRevision = 1;
                 _readySentForRoom = 0;
@@ -207,17 +229,37 @@ internal static class TitleOnlineMenu
                 _clientWasConnected = false;
                 break;
             case Ready:
+                if (!MultiplayerSaveSync.ClientLoaded)
+                {
+                    _message = MultiplayerSaveSync.Status;
+                    MarkDirty();
+                    return true;
+                }
                 _clientReady = !_clientReady;
                 _readyRevision = NextRevision(_readyRevision);
                 _readySentForRoom = 0;
                 break;
             case Start:
+                if (!ShouldStartCampaign(
+                        _startingCampaign,
+                        probe._session != null && probe._session.Connected,
+                        _remoteReady,
+                        MultiplayerSaveSync.HostRemoteLoaded))
+                    return true;
+                if (!MultiplayerSaveSync.LoadHostSlotForCampaign(ProbeBehaviour.Logger))
+                {
+                    _message = MultiplayerSaveSync.Status;
+                    MarkDirty();
+                    return true;
+                }
+                _startingCampaign = true;
                 _message = Text(OnlineText.StartingCampaign, CurrentLanguage());
                 MarkDirty();
                 ProbeBehaviour.Logger?.LogInfo("Online room: host starts the native continue-game flow");
                 manager.OnContinueGame();
                 return true;
             case Back:
+                MultiplayerSaveSync.Reset();
                 probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
                 Close();
                 return true;
@@ -245,6 +287,7 @@ internal static class TitleOnlineMenu
 
         if (!_keyboardVisible && UnityEngine.Input.GetKeyDown(KeyCode.Escape))
         {
+            probe.SwitchTitleSession(SessionRole.Offline, _address, _port, _name, out _);
             Close();
             return;
         }
@@ -252,6 +295,7 @@ internal static class TitleOnlineMenu
         var session = probe._session;
         if (ProbeBehaviour.Role == SessionRole.Host && session != null)
         {
+            MultiplayerSaveSync.UpdateHost(session, ProbeBehaviour.Logger);
             if (_roomId == 0)
                 _roomId = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
             while (session.TryTakeRoomReady(out var ready))
@@ -286,6 +330,7 @@ internal static class TitleOnlineMenu
         }
         else if (ProbeBehaviour.Role == SessionRole.Client && session != null)
         {
+            MultiplayerSaveSync.UpdateClient(session, ProbeBehaviour.Logger);
             if (!session.Connected)
             {
                 _clientWasConnected = false;
@@ -317,7 +362,8 @@ internal static class TitleOnlineMenu
             }
             if (session.Connected && _roomId != 0 && _readySentForRoom != _roomId)
             {
-                session.SendRoomReady(new RoomReady(_roomId, _readyRevision, _clientReady));
+                session.SendRoomReady(new RoomReady(
+                    _roomId, _readyRevision, _clientReady && MultiplayerSaveSync.ClientLoaded));
                 _readySentForRoom = _roomId;
             }
         }
@@ -325,11 +371,14 @@ internal static class TitleOnlineMenu
         var connected = session != null && session.Connected;
         var remoteName = session?.RemoteName ?? string.Empty;
         var language = CurrentLanguage();
-        if (_lastConnected != connected || _lastRemoteName != remoteName || _lastLanguage != language)
+        var saveStatus = MultiplayerSaveSync.Status;
+        if (_lastConnected != connected || _lastRemoteName != remoteName ||
+            _lastLanguage != language || _lastSaveStatus != saveStatus)
         {
             _lastConnected = connected;
             _lastRemoteName = remoteName;
             _lastLanguage = language;
+            _lastSaveStatus = saveStatus;
             MarkDirty();
         }
         if (_dirty && !_keyboardVisible)
@@ -460,6 +509,9 @@ internal static class TitleOnlineMenu
         _pendingKeyboardValue = string.Empty;
         _pendingKeyboardLimit = 0;
         _pendingKeyboardApply = null;
+        _startingCampaign = false;
+        _lastSaveStatus = string.Empty;
+        MultiplayerSaveSync.Reset();
         _closing = false;
     }
 
@@ -487,10 +539,13 @@ internal static class TitleOnlineMenu
                 ? $"{Value(OnlineText.PlayerTwo, session.RemoteName, language)} — {Text(_remoteReady ? OnlineText.Ready : OnlineText.NotReady, language)}"
                 : Value(OnlineText.PlayerTwo, Text(OnlineText.Waiting, language), language));
             AddLabel(language => $"{Text(OnlineText.LocalNetwork, language)}: {probe?.TitleLanAddress ?? "unknown"}:{ProbeBehaviour.Port}");
-            if (session != null && session.Connected && _remoteReady)
+            if (session != null && session.Connected && _remoteReady &&
+                MultiplayerSaveSync.HostRemoteLoaded)
                 AddAction(language => Text(OnlineText.Start, language), Start);
             else
-                AddLabel(language => Text(OnlineText.WaitingForReady, language));
+                AddLabel(language => session != null && session.Connected && _remoteReady
+                    ? MultiplayerSaveSync.Status
+                    : Text(OnlineText.WaitingForReady, language));
             AddAction(language => Text(OnlineText.Back, language), Back);
         }
         else
@@ -499,10 +554,12 @@ internal static class TitleOnlineMenu
                 ? Value(OnlineText.Host, session.RemoteName, language)
                 : Value(OnlineText.Host, Text(OnlineText.Connecting, language), language));
             AddLabel(language => Value(OnlineText.PlayerTwo, DisplayName(), language));
-            if (session != null && session.Connected && _roomId != 0)
+            if (session != null && session.Connected && _roomId != 0 && MultiplayerSaveSync.ClientLoaded)
                 AddAction(language => Text(_clientReady ? OnlineText.NotReady : OnlineText.Ready, language), Ready);
             else
-                AddLabel(language => Text(OnlineText.WaitingForHostRoom, language));
+                AddLabel(language => session != null && session.Connected && _roomId != 0
+                    ? MultiplayerSaveSync.Status
+                    : Text(OnlineText.WaitingForHostRoom, language));
             AddAction(language => Text(OnlineText.Back, language), Back);
         }
 
@@ -818,6 +875,17 @@ internal static class TitleOnlineMenu
         $"{Text(text, language)}: {value}";
 
     private static uint NextRevision(uint revision) => revision == uint.MaxValue ? 1u : revision + 1u;
+
+    private static bool ShouldDisconnectForNativeTitleAction(
+        bool roomVisible, bool openingOnline, SessionRole role) =>
+        !roomVisible && !openingOnline && role != SessionRole.Offline;
+
+    private static bool ShouldStartCampaign(
+        bool startingCampaign,
+        bool connected,
+        bool remoteReady,
+        bool saveReady) =>
+        !startingCampaign && connected && remoteReady && saveReady;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;

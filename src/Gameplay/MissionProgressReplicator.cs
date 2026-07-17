@@ -42,19 +42,54 @@ internal sealed class MissionProgressReplicator
             new[] { new MissionConditionState(100, 4) });
         if (ShouldApplyClientState(local, keyframe) || !ShouldApplyClientState(local, changed))
             throw new InvalidOperationException("Mission client apply decision failed");
-        if (ShouldApplyTerminalState(true, (byte)global::MissionState.Clear) ||
-            !ShouldApplyTerminalState(false, (byte)global::MissionState.Clear) ||
-            !ShouldApplyTerminalState(true, (byte)global::MissionState.InProgress))
-            throw new InvalidOperationException("Mission terminal deferral failed");
-        if (ResolveConditionCount(Array.Empty<MissionConditionState>(), 100) != 0 ||
-            ResolveConditionCount(conditions, 100) != 3 ||
-            ResolveConditionCount(conditions, 200) != 0)
+        if (ResolveConditionCount(Array.Empty<MissionConditionState>(), 100, 7) != 7 ||
+            ResolveConditionCount(conditions, 100, 7) != 3 ||
+            ResolveConditionCount(conditions, 200, 7) != 7)
             throw new InvalidOperationException("Mission condition snapshot merge failed");
         if (!ShouldRetainUnrestoredOriginal(true) || !ShouldRetainUnrestoredOriginal(false))
             throw new InvalidOperationException("Mission original restore retry policy failed");
+        var rosterBeforeTerminal = ShouldRetainAbsentMissionForPendingTerminal(false, 0);
+        var terminalBeforeRoster =
+            ShouldRetainAbsentMissionForPendingTerminal(
+                true, (byte)global::MissionState.Clear) &&
+            ShouldRetainAbsentMissionForPendingTerminal(
+                true, (byte)global::MissionState.Done) &&
+            ShouldRetainAbsentMissionForPendingTerminal(
+                true, (byte)global::MissionState.Fail) &&
+            ShouldRetainAbsentMissionForPendingTerminal(
+                true, (byte)global::MissionState.Failed);
+        if (rosterBeforeTerminal || !terminalBeforeRoster)
+            throw new InvalidOperationException("Mission roster/terminal order policy failed");
+        if (!IsActiveRosterState(global::MissionState.Accept) ||
+            !IsActiveRosterState(global::MissionState.InProgress) ||
+            IsActiveRosterState(global::MissionState.NotStarted) ||
+            IsActiveRosterState(global::MissionState.Clear) ||
+            IsActiveRosterState(global::MissionState.Done) ||
+            !ShouldResetAbsentMission(global::MissionState.Accept) ||
+            !ShouldResetAbsentMission(global::MissionState.InProgress) ||
+            ShouldResetAbsentMission(global::MissionState.NotStarted) ||
+            ShouldResetAbsentMission(global::MissionState.Clear) ||
+            ShouldResetAbsentMission(global::MissionState.Done) ||
+            ShouldResetAbsentMission(global::MissionState.Fail) ||
+            ShouldResetAbsentMission(global::MissionState.Failed) ||
+            !ShouldAcceptStateForRoster(true, false, (byte)global::MissionState.Clear) ||
+            !ShouldAcceptStateForRoster(true, false, (byte)global::MissionState.Done) ||
+            !ShouldAcceptStateForRoster(true, false, (byte)global::MissionState.Fail) ||
+            !ShouldAcceptStateForRoster(true, false, (byte)global::MissionState.Failed) ||
+            ShouldAcceptStateForRoster(true, false, (byte)global::MissionState.Accept) ||
+            !ShouldAcceptStateForRoster(true, true, (byte)global::MissionState.Accept) ||
+            !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.Clear) ||
+            !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.Done) ||
+            !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.Fail) ||
+            !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.Failed) ||
+            !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.InProgress) ||
+            !ShouldRetainPendingStateForRoster(true, (byte)global::MissionState.InProgress) ||
+            ShouldRetainAbsentMissionForPendingTerminal(
+                true, (byte)global::MissionState.InProgress))
+            throw new InvalidOperationException("Mission active roster policy failed");
     }
 
-    internal void Update(SessionRole role, UdpSession session, float now, bool deferTerminalStates)
+    internal void Update(SessionRole role, UdpSession session, float now)
     {
         var connected = session != null && session.Connected;
         if (!connected)
@@ -116,16 +151,8 @@ internal sealed class MissionProgressReplicator
                 _hasPendingClientRoster = true;
             }
         }
-        if (_hasPendingClientRoster && ApplyClientRoster(_pendingClientRoster))
-        {
-            _clientRosterRevision = _pendingClientRoster.Revision;
-            _hasPendingClientRoster = false;
-        }
-
         while (session.TryTakeMissionState(out var state))
         {
-            if (_clientRosterRevision != 0 && !_clientRosterIds.Contains(state.MissionId))
-                continue;
             _clientRevisions.TryGetValue(state.MissionId, out var previous);
             if (_pendingClientStates.TryGetValue(state.MissionId, out var pending) &&
                 IsNewer(pending.Revision, previous))
@@ -134,10 +161,18 @@ internal sealed class MissionProgressReplicator
                 continue;
             _pendingClientStates[state.MissionId] = state;
         }
+        if (_hasPendingClientRoster && ApplyClientRoster(_pendingClientRoster))
+        {
+            _clientRosterRevision = _pendingClientRoster.Revision;
+            _hasPendingClientRoster = false;
+        }
         var changed = false;
         foreach (var pair in new List<KeyValuePair<int, MissionState>>(_pendingClientStates))
         {
-            if (!ShouldApplyTerminalState(deferTerminalStates, pair.Value.State))
+            if (!ShouldAcceptStateForRoster(
+                    _clientRosterRevision != 0,
+                    _clientRosterIds.Contains(pair.Key),
+                    pair.Value.State))
                 continue;
             var mission = MissionManager.Instance?.GetMissionData(pair.Key);
             if (mission == null)
@@ -157,7 +192,7 @@ internal sealed class MissionProgressReplicator
             changed = true;
         }
         if (changed)
-            RefreshClientMissionUI("state");
+            RefreshMissionUI("state");
     }
 
     internal void Clear()
@@ -175,6 +210,12 @@ internal sealed class MissionProgressReplicator
         _nextHostFullKeyframe = 0f;
     }
 
+    internal void RefreshAfterNativeMissionChange()
+    {
+        RefreshMissionUI("host-native-change");
+        ForceHostKeyframe();
+    }
+
     private void PublishHostChanges(UdpSession session, bool keyframe, bool fullKeyframe)
     {
         var manager = MissionManager.Instance;
@@ -187,7 +228,7 @@ internal sealed class MissionProgressReplicator
             {
                 if (mission == null || mission.TID <= 0)
                     continue;
-                if (mission.State != global::MissionState.NotStarted)
+                if (IsActiveRosterState(mission.State))
                     roster.Add(mission.TID);
                 _hostStates.TryGetValue(mission.TID, out var previous);
                 if (mission.State == global::MissionState.NotStarted && previous.MissionId == 0)
@@ -233,6 +274,8 @@ internal sealed class MissionProgressReplicator
             _hostRosterQueued = true;
             _log.LogInfo(
                 $"Mission roster sent: revision={_hostRosterRevision}; missions={missionIds.Length}");
+            _trace?.Write("MISSION-ROSTER-SEND",
+                $"revision={_hostRosterRevision} ids={string.Join(',', missionIds)}");
         }
     }
 
@@ -252,8 +295,15 @@ internal sealed class MissionProgressReplicator
             foreach (var mission in manager.MissionDictionary.Values)
             {
                 if (mission == null || mission.TID <= 0 ||
-                    mission.State == global::MissionState.NotStarted ||
                     _clientRosterIds.Contains(mission.TID))
+                    continue;
+                if (ShouldResetAbsentMission(mission.State) &&
+                    _pendingClientStates.TryGetValue(mission.TID, out var pending) &&
+                    ShouldRetainAbsentMissionForPendingTerminal(true, pending.State))
+                    continue;
+                manager.InProgressList.Remove(mission);
+                manager.NewMissionList.Remove(mission);
+                if (!ShouldResetAbsentMission(mission.State))
                     continue;
                 var state = new MissionState(
                     1, mission.TID, 0, (byte)global::MissionState.NotStarted, 0,
@@ -265,15 +315,18 @@ internal sealed class MissionProgressReplicator
                 }
             }
             foreach (var missionId in new List<int>(_pendingClientStates.Keys))
-                if (!_clientRosterIds.Contains(missionId))
+                if (!ShouldRetainPendingStateForRoster(
+                        _clientRosterIds.Contains(missionId),
+                        _pendingClientStates[missionId].State))
                     _pendingClientStates.Remove(missionId);
             _log.LogInfo(
                 $"Mission roster applied: revision={roster.Revision}; " +
                 $"missions={roster.MissionIds.Length}; reset={reset}");
-            RefreshClientMissionUI("roster");
+            RefreshMissionUI("roster");
             _trace?.Write("MISSION-ROSTER",
                 $"revision={roster.Revision} missions={roster.MissionIds.Length} " +
-                $"reset={reset} ids={string.Join(',', resetIds)}");
+                $"reset={reset} ids={string.Join(',', roster.MissionIds)} " +
+                $"resetIds={string.Join(',', resetIds)}");
             return true;
         }
         catch (Exception exception)
@@ -287,9 +340,9 @@ internal sealed class MissionProgressReplicator
     {
         var task = mission.CurrentTask;
         var conditions = new List<MissionConditionState>();
-        if (task != null)
+        if (task?.ConditionGroup != null)
         {
-            foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
+            foreach (var condition in task.ConditionGroup)
             {
                 if (condition == null || condition.TID <= 0 || condition.NowCount < 0 ||
                     conditions.Count >= Protocol.MaxMissionConditions)
@@ -327,11 +380,13 @@ internal sealed class MissionProgressReplicator
                 mission.ForceUpdateCurrenTask();
                 SelectTask(mission, state.CurrentTaskId);
                 var task = mission.CurrentTask;
-                if (task != null && (state.CurrentTaskId == 0 || task.TID == state.CurrentTaskId))
+                if (task?.ConditionGroup != null &&
+                    (state.CurrentTaskId == 0 || task.TID == state.CurrentTaskId))
                 {
-                    foreach (var condition in mission.GetInProgressMissionTaskConditionList(task.TID))
+                    foreach (var condition in task.ConditionGroup)
                         if (condition != null)
-                            condition.NowCount = ResolveConditionCount(state.Conditions, condition.TID);
+                            condition.NowCount = ResolveConditionCount(
+                                state.Conditions, condition.TID, condition.NowCount);
                 }
                 SetMembership(manager.InProgressList, mission,
                     mission.State == global::MissionState.InProgress);
@@ -379,10 +434,10 @@ internal sealed class MissionProgressReplicator
         foreach (var missionId in restored)
             _clientOriginals.Remove(missionId);
         if (restored.Count > 0)
-            RefreshClientMissionUI("restore");
+            RefreshMissionUI("restore");
     }
 
-    private void RefreshClientMissionUI(string source)
+    private void RefreshMissionUI(string source)
     {
         try
         {
@@ -465,18 +520,32 @@ internal sealed class MissionProgressReplicator
     private static bool ShouldApplyClientState(MissionState local, MissionState remote) =>
         !SameContent(local, remote);
 
-    private static bool ShouldApplyTerminalState(bool deferTerminalStates, byte state) =>
-        !deferTerminalStates || !IsTerminal(state);
+    private static bool IsActiveRosterState(global::MissionState state) =>
+        state is global::MissionState.Accept or global::MissionState.InProgress;
+
+    private static bool ShouldResetAbsentMission(global::MissionState state) =>
+        IsActiveRosterState(state);
+
+    private static bool ShouldAcceptStateForRoster(
+        bool rosterKnown, bool inRoster, byte state) =>
+        !rosterKnown || inRoster || IsTerminal(state);
+
+    private static bool ShouldRetainPendingStateForRoster(bool _, byte __) => true;
+
+    private static bool ShouldRetainAbsentMissionForPendingTerminal(
+        bool hasPendingState, byte pendingState) =>
+        hasPendingState && IsTerminal(pendingState);
 
     private static bool ShouldRetainUnrestoredOriginal(bool _) => true;
 
-    private static int ResolveConditionCount(MissionConditionState[] conditions, int id)
+    private static int ResolveConditionCount(
+        MissionConditionState[] conditions, int id, int fallback)
     {
         // Snapshots cap at 64 conditions; index if that limit grows.
         foreach (var condition in conditions)
             if (condition.Id == id)
                 return condition.Count;
-        return 0;
+        return fallback;
     }
 
     private static bool SameIds(int[] left, int[] right) =>
@@ -485,7 +554,8 @@ internal sealed class MissionProgressReplicator
     private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
 
     private static bool IsTerminal(byte state) =>
-        (global::MissionState)state is global::MissionState.Clear or global::MissionState.Done;
+        (global::MissionState)state is global::MissionState.Clear or global::MissionState.Done or
+            global::MissionState.Fail or global::MissionState.Failed;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;

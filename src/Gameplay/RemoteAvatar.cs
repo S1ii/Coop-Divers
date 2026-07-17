@@ -4,13 +4,34 @@ using UnityEngine;
 
 namespace DaveTheDiverMP;
 
+internal readonly record struct VisibleTransform(
+    float Rotation,
+    float ScaleX,
+    float ScaleY,
+    bool FlipX,
+    bool FlipY);
+
 internal sealed class RemoteAvatar : IDisposable
 {
     internal static void SelfTest()
     {
-        if (ApplyDepthBias(-0.05f) >= -0.05f)
+        var angle = 40f * Mathf.Deg2Rad;
+        var normal = NormalizeVisibleBasis(
+            new Vector2(Mathf.Cos(angle) * 2f, Mathf.Sin(angle) * 2f),
+            new Vector2(-Mathf.Sin(angle) * 3f, Mathf.Cos(angle) * 3f));
+        var reflected = NormalizeVisibleBasis(
+            new Vector2(-Mathf.Cos(angle) * 2f, Mathf.Sin(angle) * 2f),
+            new Vector2(Mathf.Sin(angle) * 3f, Mathf.Cos(angle) * 3f));
+        if (ApplyDepthBias(-0.05f) >= -0.05f || RemoteTint.a != 1f ||
+            NameOffset(true, 0.75f, 2.5f) != 0.95f ||
+            NameOffset(false, 0.75f, 2.5f) != 2.5f || normal.FlipX ||
+            Mathf.Abs(Mathf.DeltaAngle(normal.Rotation, 40f)) > 0.01f ||
+            !reflected.FlipX ||
+            Mathf.Abs(Mathf.DeltaAngle(reflected.Rotation, -40f)) > 0.01f)
             throw new InvalidOperationException("Remote avatar depth bias failed");
     }
+
+    private static readonly Color RemoteTint = new(0.82f, 0.95f, 1f, 1f);
 
     private sealed class RemoteVisual
     {
@@ -30,12 +51,18 @@ internal sealed class RemoteAvatar : IDisposable
     private float _targetRotation;
     private float _timeSinceSnapshot;
     private float _nameOffset = 2.5f;
+    private float _defaultNameOffset = 2.5f;
+    private bool _isDive;
     private bool _initialized;
     private bool _hasVisualState;
 
     internal Transform Transform => _gameObject?.transform;
 
-    internal void Apply(PlayerSnapshot snapshot, SpriteRenderer localRenderer, string playerName)
+    internal void Apply(
+        PlayerSnapshot snapshot,
+        SpriteRenderer localRenderer,
+        string playerName,
+        bool isDive)
     {
         if (_gameObject == null)
             Create(localRenderer, new Vector3(snapshot.X, snapshot.Y, ApplyDepthBias(snapshot.Z)), playerName);
@@ -44,6 +71,7 @@ internal sealed class RemoteAvatar : IDisposable
         _velocity = new Vector3(snapshot.VelocityX, snapshot.VelocityY, 0f);
         _targetRotation = snapshot.Rotation;
         _timeSinceSnapshot = 0f;
+        _isDive = isDive;
         _nameText.text = Protocol.NormalizePlayerName(playerName);
         if (snapshot.SpriteId != 0 && _sprites.TryGetValue(snapshot.SpriteId, out var sprite))
             _renderer.sprite = sprite;
@@ -74,6 +102,7 @@ internal sealed class RemoteAvatar : IDisposable
             CreateVisualRenderer();
 
         var highestOrder = _renderer.sortingOrder;
+        var highestTop = 0f;
         for (var index = 0; index < _visualRenderers.Count; index++)
         {
             var visual = _visualRenderers[index];
@@ -97,7 +126,10 @@ internal sealed class RemoteAvatar : IDisposable
             renderer.transform.rotation = Quaternion.Euler(0f, 0f, visual.Rotation);
             renderer.transform.localScale = new Vector3(sprite.ScaleX, sprite.ScaleY, 1f);
             highestOrder = Mathf.Max(highestOrder, sprite.SortingOrder);
+            highestTop = Mathf.Max(
+                highestTop, visual.Offset.y + renderer.bounds.extents.y);
         }
+        _nameOffset = NameOffset(_isDive, highestTop, _defaultNameOffset);
         var nameRenderer = _nameObject.GetComponent<MeshRenderer>();
         nameRenderer.sortingOrder = highestOrder + 100;
     }
@@ -172,27 +204,50 @@ internal sealed class RemoteAvatar : IDisposable
                 renderer.sprite == null || IsUnder(renderer.transform, attackRange) ||
                 IsUnder(renderer.transform, harpoonAim) || IsUnder(renderer.transform, gunAim))
                 continue;
-            var scale = renderer.transform.lossyScale;
+            var visible = CaptureVisibleTransform(renderer);
             sprites.Add(new VisualSprite(
                 Protocol.SceneId(renderer.sprite.name),
                 renderer.transform.position.x - root.position.x,
                 renderer.transform.position.y - root.position.y,
                 renderer.transform.position.z - root.position.z,
-                renderer.transform.eulerAngles.z,
-                Mathf.Abs(scale.x), Mathf.Abs(scale.y),
+                visible.Rotation,
+                visible.ScaleX, visible.ScaleY,
                 renderer.sortingLayerID, renderer.sortingOrder,
-                renderer.flipX ^ scale.x < 0f,
-                renderer.flipY ^ scale.y < 0f));
+                visible.FlipX, visible.FlipY));
             if (sprites.Count == Protocol.MaxVisualSprites)
                 break;
         }
         return new PlayerVisualState(sceneId, sprites.ToArray());
     }
 
+    internal static VisibleTransform CaptureVisibleTransform(SpriteRenderer renderer)
+    {
+        var right = renderer.transform.TransformVector(Vector3.right);
+        var up = renderer.transform.TransformVector(Vector3.up);
+        if (renderer.flipX)
+            right = -right;
+        if (renderer.flipY)
+            up = -up;
+        return NormalizeVisibleBasis(
+            new Vector2(right.x, right.y), new Vector2(up.x, up.y));
+    }
+
+    private static VisibleTransform NormalizeVisibleBasis(Vector2 right, Vector2 up)
+    {
+        var scaleX = Mathf.Max(right.magnitude, 0.0001f);
+        var scaleY = Mathf.Max(up.magnitude, 0.0001f);
+        var flipX = right.x * up.y - right.y * up.x < 0f;
+        var rotation = Mathf.Atan2(right.y, right.x) * Mathf.Rad2Deg + (flipX ? 180f : 0f);
+        return new VisibleTransform(rotation, scaleX, scaleY, flipX, false);
+    }
+
     private static bool IsUnder(Transform candidate, Transform root) =>
         root != null && (candidate == root || candidate.IsChildOf(root));
 
     private static float ApplyDepthBias(float z) => z - 0.01f;
+
+    private static float NameOffset(bool isDive, float highestTop, float fallback) =>
+        isDive ? Mathf.Max(0.65f, highestTop + 0.2f) : fallback;
 
     private void Create(SpriteRenderer sourceRenderer, Vector3 position, string playerName)
     {
@@ -201,7 +256,7 @@ internal sealed class RemoteAvatar : IDisposable
         var baseVisual = new GameObject("DTMP Remote Base Visual");
         baseVisual.transform.SetParent(_gameObject.transform, false);
         _renderer = baseVisual.AddComponent<SpriteRenderer>();
-        _renderer.color = new Color(0.55f, 0.9f, 1f, 0.85f);
+        _renderer.color = RemoteTint;
 
         if (sourceRenderer != null)
         {
@@ -215,7 +270,11 @@ internal sealed class RemoteAvatar : IDisposable
             if (sourceRoot != null)
                 _renderer.transform.localPosition =
                     sourceRenderer.transform.position - sourceRoot.position;
-            _nameOffset = Mathf.Max(2.5f, _renderer.bounds.extents.y + 1.25f);
+            _defaultNameOffset = Mathf.Max(2.5f, _renderer.bounds.extents.y + 1.25f);
+            _nameOffset = NameOffset(
+                _isDive,
+                _renderer.transform.localPosition.y + _renderer.bounds.extents.y,
+                _defaultNameOffset);
         }
         CacheSprites();
 
@@ -243,7 +302,9 @@ internal sealed class RemoteAvatar : IDisposable
     {
         var visual = new GameObject("DTMP Remote Visual");
         visual.transform.SetParent(_gameObject.transform, false);
-        _visualRenderers.Add(new RemoteVisual { Renderer = visual.AddComponent<SpriteRenderer>() });
+        var renderer = visual.AddComponent<SpriteRenderer>();
+        renderer.color = RemoteTint;
+        _visualRenderers.Add(new RemoteVisual { Renderer = renderer });
     }
 
     private static Transform FindPlayerRoot(SpriteRenderer renderer)

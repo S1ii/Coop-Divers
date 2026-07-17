@@ -98,6 +98,20 @@ internal static class MissionLifecycleAuthorityPatch
     private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
 }
 
+[HarmonyPatch]
+internal static class MissionPresentationCountPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var method in AccessTools.GetDeclaredMethods(typeof(MissionManager)))
+            if (method.Name == nameof(MissionManager.UpdateMissionIntCondition))
+                yield return method;
+    }
+
+    private static bool Prefix() =>
+        ProbeBehaviour.Instance?.IsCompletingClientPresentation != true;
+}
+
 [HarmonyPatch(typeof(FishFarm.FishFarmManager), nameof(FishFarm.FishFarmManager.Save))]
 internal static class FishFarmSaveAuthorityPatch
 {
@@ -135,6 +149,16 @@ internal static class MermanFarmAuthorityPatch
 internal static class RewardAuthorityPatch
 {
     private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
+
+    private static void Postfix(Reward __0) =>
+        ProbeBehaviour.Instance?.ObserveReward(__0);
+}
+
+[HarmonyPatch(typeof(CommonDefine), nameof(CommonDefine.AddPlayerGoods))]
+internal static class SharedWalletAuthorityPatch
+{
+    private static bool Prefix(GoodsType __0, int __1) =>
+        ProbeBehaviour.Instance?.InterceptPlayerGoods(__0, __1) ?? true;
 }
 
 [HarmonyPatch(typeof(ScenarioManager), nameof(ScenarioManager.SetDoneSequenceEvent))]

@@ -47,4 +47,21 @@ if ($markers) {
     throw "Forbidden markers found:`n$($markers -join "`n")"
 }
 
+$projectileVisuals = Get-Content (Join-Path $root 'src\Replication\ProjectileVisualReplicator.cs') -Raw
+if ($projectileVisuals -match '\bParticleSystem\b|CopyParticle|CopyModule|CopyBursts') {
+    throw 'ProjectileVisualReplicator must not copy or create particle systems.'
+}
+$fishReplication = Get-Content (Join-Path $root 'src\Replication\FishReplicator.cs') -Raw
+$missionReplication = Get-Content (Join-Path $root 'src\Gameplay\MissionProgressReplicator.cs') -Raw
+if ($missionReplication -match 'deferTerminalStates|ShouldApplyTerminalState') {
+    throw 'Mission terminal snapshots must apply immediately on clients.'
+}
+if ($fishReplication -match 'HarmonyPatch\(typeof\(FishAISystem\), nameof\(FishAISystem\.SetHPDamageQTE\)') {
+    throw 'SetHPDamageQTE must not be Harmony-patched; IL2CPP re-entry overflows the stack.'
+}
+[xml]$project = Get-Content (Join-Path $root 'DaveTheDiverMP.csproj')
+if ($project.Project.ItemGroup.Reference.Include -contains 'UnityEngine.ParticleSystemModule') {
+    throw 'Unused UnityEngine.ParticleSystemModule reference must not be restored.'
+}
+
 Write-Host 'Repository hygiene checks passed.'

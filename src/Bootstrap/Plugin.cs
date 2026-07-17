@@ -23,6 +23,8 @@ public sealed class Plugin : BasePlugin
         Protocol.SelfTest();
         UdpSession.SelfTest();
         LobbyInput.SelfTest();
+        TitleOnlineMenu.SelfTest();
+        MultiplayerSaveSync.SelfTest();
         FishReplicator.SelfTest();
         DiveCoordinator.SelfTest();
         SceneReplicator.SelfTest();
@@ -34,6 +36,7 @@ public sealed class Plugin : BasePlugin
         RemoteAvatar.SelfTest();
         ManagerEventReplicator.SelfTest();
         NpcInteractionCoordinator.SelfTest();
+        ProjectileVisualReplicator.SelfTest();
 
         _config = Config;
         _roleConfig = Config.Bind("Network", "Role", SessionRole.Offline,

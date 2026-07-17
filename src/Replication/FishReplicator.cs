@@ -7,10 +7,116 @@ using UnityEngine;
 
 namespace DaveTheDiverMP;
 
+internal static class FishBehaviorTreeState
+{
+    private static readonly Dictionary<FishAISystem, bool> States = new();
+
+    internal static void ObserveActive(FishAISystem fish)
+    {
+        if (fish != null && !States.ContainsKey(fish) &&
+            fish.gameObject.activeInHierarchy && fish.IsFishEnable)
+            States[fish] = true;
+    }
+
+    internal static bool TryGet(FishAISystem fish, out bool enabled)
+    {
+        enabled = false;
+        return fish != null && States.TryGetValue(fish, out enabled);
+    }
+
+    internal static void Set(FishAISystem fish, bool enabled)
+    {
+        fish.EnableBehaviorTree(enabled);
+        States[fish] = enabled;
+    }
+
+    internal static void Forget(FishAISystem fish)
+    {
+        if (!ReferenceEquals(fish, null))
+            States.Remove(fish);
+    }
+}
+
 internal sealed class FishReplicator
 {
     private const float SnapshotKeyframeSeconds = 1f;
-    private const float RemoteStimulusInterval = 0.2f;
+    private const float RemoteStimulusInterval = 0.1f;
+    private const int MaxFishControlPacketsPerFrame = 8;
+    private const int ReliableCapacityReserve = 32;
+    private const float ActionTimeoutSeconds = 2f;
+    private const float HookLeaseSeconds = 12f;
+    private const float MinHookActionIntervalSeconds = 0.05f;
+    private const float MinDamageIntervalSeconds = 0.001f;
+    private const float WeaponRangeSquared = 1600f;
+    private const float CaptureRangeSquared = 100f;
+    private const float CorpsePickupRangeSquared = 16f;
+    private const int MaxQueuedActionsPerFish = 8;
+    private const int ProcessedRequestWindow = 256;
+    private const double SnapshotTicksPerSecond = 10d;
+    private const double InterpolationTicks = 3d;
+    private const double MaxExtrapolationTicks = 1.5d;
+    private const int MaxSamples = 8;
+    private const float InterestEnterDistance = 80f;
+    private const float InterestLeaveDistance = 96f;
+    private const int InterestLeaveTicks = 10;
+    private const int SnapshotEntityBudget = 24;
+    private const int SnapshotByteBudget = 1100;
+    private const float RecentDamageSeconds = 2f;
+    private const int MissingAllocatorScanGrace = 3;
+    private const float LeaseCorrectionSeconds = 0.15f;
+    private const float HookPoseIntervalSeconds = 0.05f;
+    private const float HookPosePlayerRangeSquared = 64f;
+    private const float HookPoseMaxSpeed = 40f;
+    private const float RemoteThreatRefreshSeconds = 0.5f;
+    private const float RemoteFearEnterRadius = 4f;
+    private const float RemoteFearExitRadius = 5f;
+
+    private readonly record struct InterestState(bool Interested, int OutsideTicks);
+    private readonly record struct SnapshotCandidate(FishSnapshot Snapshot, HostFish Info, float Priority);
+
+    private struct TimedSample
+    {
+        internal uint Tick;
+        internal long TimeTick;
+        internal float X;
+        internal float Y;
+        internal float Z;
+        internal float VelocityX;
+        internal float VelocityY;
+        internal float Rotation;
+
+        internal TimedSample(
+            uint tick, float x, float y, float z,
+            float velocityX, float velocityY, float rotation)
+        {
+            Tick = tick;
+            TimeTick = tick;
+            X = x;
+            Y = y;
+            Z = z;
+            VelocityX = velocityX;
+            VelocityY = velocityY;
+            Rotation = rotation;
+        }
+    }
+
+    private sealed class ManifestAssembly
+    {
+        internal readonly uint SceneId;
+        internal readonly uint SceneEpoch;
+        internal readonly uint Revision;
+        internal readonly Dictionary<int, FishManifest> Entries = new();
+        internal int Expected = -1;
+
+        internal ManifestAssembly(uint sceneId, uint sceneEpoch, uint revision)
+        {
+            SceneId = sceneId;
+            SceneEpoch = sceneEpoch;
+            Revision = revision;
+        }
+
+        internal bool IsComplete => Expected >= 0 && Entries.Count == Expected;
+    }
 
     private sealed class Target
     {
@@ -20,6 +126,21 @@ internal sealed class FishReplicator
         internal float Hp;
         internal byte Flags;
         internal bool HasSnapshot;
+        internal string AllocatorUid;
+        internal int FishDataTID;
+        internal uint Revision;
+        internal uint Tick;
+        internal FishPhase Phase;
+        internal bool Interested = true;
+        internal bool NativeActive;
+        internal bool NativeBehaviorEnabled;
+        internal readonly List<TimedSample> Samples = new();
+        internal bool AwaitingLeaseSnapshot;
+        internal uint AwaitingLeaseSnapshotTick;
+        internal Vector3 CorrectionFrom;
+        internal float CorrectionRotation;
+        internal float CorrectionStarted;
+        internal bool CorrectingLeasePresentation;
     }
 
     private sealed class HostFish
@@ -31,31 +152,129 @@ internal sealed class FishReplicator
         internal float LastSnapshotSend;
         internal bool HasSnapshot;
         internal bool ManifestQueued;
+        internal uint Revision;
+        internal FishPhase Phase;
+        internal bool InterestKnown;
+        internal bool Interested;
+        internal int OutsideInterestTicks;
+        internal float Priority;
+        internal float LastHp;
+        internal float RecentDamageUntil;
+        internal int MissingScans;
+        internal bool Active;
     }
+
+    private sealed class GrantAssembly
+    {
+        internal readonly Dictionary<ushort, FishLootGrant> Entries = new();
+        internal ushort Expected;
+    }
+
+    private sealed class ClientLootRequest
+    {
+        internal FishActionRequest Request;
+        internal FishActionAck? Ack;
+        internal float Started;
+        internal float NextReplay;
+        internal bool Released;
+        internal bool Presented;
+    }
+
+    private sealed class ClientHookLease
+    {
+        internal ulong RequestId;
+        internal bool HookQueued;
+        internal bool Accepted;
+        internal bool ReleaseQueued;
+        internal bool CaptureQueued;
+        internal bool CleanupDone;
+        internal bool EndedPending;
+        internal bool RecallResolved;
+        internal bool RecallSuccess;
+        internal float Expires;
+        internal float NextPoseSend;
+        internal uint PoseTick;
+
+        internal ClientHookLease(ulong requestId) => RequestId = requestId;
+    }
+
+    private sealed class HostHookLease
+    {
+        internal readonly ulong RequestId;
+        internal readonly bool BehaviorEnabled;
+        internal float Expires;
+        internal float LastPoseTime;
+        internal FishHookPose LastPose;
+        internal bool HasPose;
+
+        internal HostHookLease(ulong requestId, float expires, bool behaviorEnabled = true)
+        {
+            RequestId = requestId;
+            Expires = expires;
+            BehaviorEnabled = behaviorEnabled;
+        }
+    }
+
+    private readonly record struct ThreatDecision(bool Inside, bool Enter, bool Refresh);
+
+    private readonly record struct PendingAction(
+        int Id, FishAISystem Fish, FishAction Action, ulong LeaseId, float Expires,
+        bool TimedOut = false);
+    private readonly record struct QueuedAction(
+        FishAction Action, int Damage, int Element, int AttackType, ulong LeaseId);
 
     private readonly ManualLogSource _log;
     private readonly SessionTrace _trace;
+    private readonly RemoteCatchLedger _ledger;
     private readonly Dictionary<int, FishAISystem> _hostFishById = new();
     private readonly Dictionary<FishAISystem, int> _hostIdsByFish = new();
     private readonly Dictionary<int, HostFish> _hostInfoById = new();
     private readonly Dictionary<int, Target> _targets = new();
     private readonly Dictionary<FishAISystem, int> _clientIdsByFish = new();
-    private readonly HashSet<int> _removedIds = new();
+    private readonly Dictionary<int, uint> _clientTombstones = new();
     private readonly HashSet<int> _pendingClientPickups = new();
-    private readonly HashSet<int> _pendingClientCaptures = new();
-    private readonly HashSet<FishAISystem> _clientDamageScopes = new();
     private readonly HashSet<FishAISystem> _hostRemovedFish = new();
     private readonly HashSet<FishAISystem> _suppressedClientFish = new();
     private readonly HashSet<int> _missingAllocatorIds = new();
-    private readonly Dictionary<uint, HashSet<int>> _clientManifestIds = new();
-    private readonly Dictionary<uint, ushort> _clientManifestCounts = new();
-    private readonly Dictionary<uint, ushort> _finalizedClientManifestCounts = new();
+    private readonly Dictionary<uint, ManifestAssembly> _clientManifestAssemblies = new();
+    private readonly Dictionary<int, FishManifest> _activeClientManifest = new();
     private readonly Dictionary<int, FishManifest> _pendingClientManifests = new();
-    private readonly Dictionary<int, float> _nextRemoteStimulusById = new();
+    private readonly Dictionary<int, FishLifecycle> _pendingClientLifecycles = new();
+    private readonly List<(FishAISystem Fish, int Id, bool NativeActive, bool NativeBehaviorEnabled)>
+        _deferredClientRemovals = new();
     private readonly Dictionary<int, float> _lastRemoteDamageById = new();
+    private readonly Dictionary<int, float> _lastRemoteHookActionById = new();
+    private readonly Dictionary<int, ClientHookLease> _clientHookLeases = new();
+    private readonly Dictionary<int, HostHookLease> _hostHookLeases = new();
+    private readonly HashSet<int> _scheduledClientHookCleanup = new();
+    private readonly Dictionary<ulong, PendingAction> _pendingClientActions = new();
+    private readonly Dictionary<int, ulong> _pendingClientActionByFish = new();
+    private readonly Dictionary<int, Queue<QueuedAction>> _queuedClientActions = new();
+    private readonly Dictionary<ulong, FishActionAck> _hostActionAcks = new();
+    private readonly Dictionary<ulong, GrantAssembly> _clientLootGrants = new();
+    private readonly Dictionary<ulong, FishAction> _clientGrantActions = new();
+    private readonly Dictionary<ulong, int> _clientGrantFish = new();
+    private readonly Dictionary<ulong, ClientLootRequest> _clientLootRequests = new();
+    private readonly HashSet<ulong> _hostProcessedRequests = new();
     private readonly HashSet<int> _remoteStimulatedIds = new();
+    private readonly Dictionary<int, float> _nextRemoteThreatById = new();
+    private readonly Queue<FishLifecycle> _pendingHostLifecycles = new();
     private readonly List<FishSnapshot> _snapshotBuffer = new();
+    private readonly List<SnapshotCandidate> _snapshotCandidates = new(SnapshotEntityBudget);
+    private readonly List<SnapshotCandidate> _overdueSnapshotCandidates = new(SnapshotEntityBudget);
+    private readonly List<FishAllocator> _allocatorScratch = new();
+    private readonly Dictionary<FishAISystem, FishAllocator> _allocatorByFishScratch = new();
+    private readonly Dictionary<string, FishAllocator> _clientAllocatorByUidScratch = new();
+    private readonly Dictionary<(string AllocatorUid, int FishDataTID), List<FishAISystem>>
+        _availableClientFishScratch = new();
+    private readonly List<FishAISystem> _staleFishScratch = new();
+    private readonly List<int> _idScratch = new();
+    private readonly List<uint> _revisionScratch = new();
+    private readonly List<FishManifest> _manifestScratch = new();
+    private readonly List<(FishAISystem Fish, int Id, bool NativeActive, bool NativeBehaviorEnabled)>
+        _removalScratch = new();
     private float _nextHostScan;
+    private float _nextRemoteStimulus;
     private float _nextSend;
     private bool _manifestStateQueued;
     private int _nextHostId = 1;
@@ -65,26 +284,348 @@ internal sealed class FishReplicator
     private uint _fishTick;
     private uint _latestClientManifestRevision;
     private float _nextTraceSummary;
+    private float _nextClientBind;
+    private long _latestClientTick;
+    private double _clientLatestTick;
+    private double _clientRenderTick;
+    private bool _hasClientClock;
+    private bool _applyingClientState;
+    private bool _clientAuthorityActive;
+    private int _lastClientHookId;
+    private bool _suppressingNativeRecallOutcome;
+    private int _clientSnapshotsAccepted;
+    private int _clientSnapshotsRejected;
+    private int _clientTeleports;
+    private uint _appliedClientSceneId;
+    private uint _appliedClientSceneEpoch;
+    private ulong _nextClientRequestId;
+    private ulong _highestHostRequestId;
+    private ulong _nextHostTransactionId;
+    private bool _hostTransactionalPickup;
+    private int _pendingClientFishLootScopeDepth;
+    private long _fishSnapshotBytes;
+    private int _fishSnapshotsSent;
+    private int _fishSnapshotPackets;
+    private int _fishInterestEnters;
+    private int _fishInterestLeaves;
+    private int _fishOverdueSnapshots;
+    private int _fishControlPacketsDeferred;
+    private float _nextFishTrafficTrace;
 
-    internal FishReplicator(ManualLogSource log, SessionTrace trace)
+    internal FishReplicator(ManualLogSource log, SessionTrace trace, RemoteCatchLedger ledger = null)
     {
         _log = log;
         _trace = trace;
+        _ledger = ledger;
     }
 
     internal static void SelfTest()
     {
         var patchFlags = System.Reflection.BindingFlags.NonPublic |
             System.Reflection.BindingFlags.Static;
-        var finalizer = typeof(FishAddDropLootTracePatch).GetMethod("Finalizer", patchFlags);
+        var ordered = new List<TimedSample>();
+        InsertSample(ordered, new TimedSample(uint.MaxValue, 0f, 0f, 0f, 0f, 0f, 0f));
+        InsertSample(ordered, new TimedSample(1, 2f, 0f, 0f, 0f, 0f, 0f));
+        InsertSample(ordered, new TimedSample(0, 1f, 0f, 0f, 0f, 0f, 0f));
+        var bounded = new List<TimedSample>();
+        for (uint tick = 1; tick <= 40; tick++)
+            InsertSample(bounded, new TimedSample(tick, tick, 0f, 0f, 0f, 0f, 0f));
+        var interpolation = SampleAt(
+            new TimedSample(10, 0f, 0f, 0f, 10f, 0f, 350f),
+            new TimedSample(20, 6f, 0f, 0f, 10f, 0f, 10f), 15d);
+        var extrapolation = SampleAt(
+            new TimedSample(20, 10f, 0f, 0f, 10f, 0f, 10f), default, 30d);
+        var teleport = SampleAt(
+            new TimedSample(10, 0f, 0f, 0f, 0f, 0f, 0f),
+            new TimedSample(20, 9f, 0f, 0f, 0f, 0f, 0f), 15d);
+        var assembly = new ManifestAssembly(7, 9, 11);
+        assembly.Entries[1] = default;
+        assembly.Expected = 2;
+        var allocatorUids = new HashSet<string> { "allocator-a" };
+        var fishIndex = new Dictionary<(string AllocatorUid, int FishDataTID), int>
+        {
+            [ManifestFishKey("allocator-a", 10)] = 1
+        };
+        var snappedClock = CorrectRenderClock(90d, 100d, 0.1f);
+        var fastClock = CorrectRenderClock(95d, 100d, 0.1f);
+        var slowClock = CorrectRenderClock(99d, 100d, 0.1f);
+        var steadyClock = CorrectRenderClock(96.8d, 100d, 0.1f);
+        var cappedClock = CorrectRenderClock(96d, 100d, 1f);
+        var missingScans = 0;
+        missingScans = NextMissingScans(missingScans, false);
+        missingScans = NextMissingScans(missingScans, false);
+        var retainedMissingFish = missingScans < MissingAllocatorScanGrace;
+        missingScans = NextMissingScans(missingScans, false);
+        var despawnedMissingFish = missingScans >= MissingAllocatorScanGrace;
+        var resetMissingScans = NextMissingScans(missingScans, true);
+        var liveMissingRetained = !ShouldRemoveMissingFish(false, 2);
+        var liveMissingRemoved = ShouldRemoveMissingFish(false, 3);
+        var destroyedMissingRemoved = ShouldRemoveMissingFish(true, 1);
+        ulong requestId = 0;
+        var firstRequestId = NextRequestId(ref requestId);
+        requestId = ulong.MaxValue;
+        var wrappedRequestId = NextRequestId(ref requestId);
+        ulong highestRequestId = 0;
+        var processedRequests = new HashSet<ulong>();
+        var wrappedRequests = new HashSet<ulong>();
+        ulong wrappedHighest = 0;
+        var actionQueue = new Queue<int>();
+        for (var value = 1; value <= MaxQueuedActionsPerFish + 1; value++)
+            TryEnqueueBounded(actionQueue, value, MaxQueuedActionsPerFish);
+        var delayedQueue = new Queue<QueuedAction>();
+        delayedQueue.Enqueue(new QueuedAction(FishAction.Damage, 1, 0, 2, 0));
+        delayedQueue.Enqueue(new QueuedAction(FishAction.Damage, 2, 0, 2, 0));
+        var timedActions = new Dictionary<ulong, PendingAction>
+        {
+            [1] = new PendingAction(7, null, FishAction.Damage, 0, 2f)
+        };
+        var timedActionByFish = new Dictionary<int, ulong> { [7] = 1 };
+        var expiredInFlight = TryExpirePendingAction(
+            timedActions, timedActionByFish, 1, 2f, out _);
+        var retainedTimedOutIdentity = timedActions.Count == 1 && timedActionByFish.Count == 1 &&
+            timedActions[1].TimedOut;
+        var timedOutAction = timedActions[1];
+        var acceptedLateAck = TryConsumeAck(timedActions, 1);
+        ClearPendingFish(timedActionByFish, timedOutAction, 1);
+        var pendingAcks = new HashSet<ulong> { firstRequestId };
+        var clientLeases = new Dictionary<int, ClientHookLease>();
+        BeginClientHookLease(clientLeases, 7, 41);
+        var pendingLease = clientLeases[7];
+        var pendingBeforeAck = !pendingLease.Accepted;
+        var wrongHookAck = AcceptClientHookLease(clientLeases, 7, 40, 10f);
+        var acceptedHookAck = AcceptClientHookLease(clientLeases, 7, 41, 10f);
+        var renewedHookLease = RenewClientHookLease(clientLeases, 7, 41, 20f);
+        var activeHookLease = HasActiveClientHookLease(clientLeases, 7, 21.9f);
+        var expiredHookLease = HasActiveClientHookLease(clientLeases, 7, 32f);
+        var hostLeases = new Dictionary<int, HostHookLease>
+        {
+            [7] = new HostHookLease(41, 22f)
+        };
+        var wrongHostRenewal = RenewHostHookLease(hostLeases, 7, 40, 20f);
+        var hostRenewed = RenewHostHookLease(hostLeases, 7, 41, 20f);
+        var firstCleanup = TryMarkClientHookCleanup(pendingLease);
+        var duplicateCleanup = TryMarkClientHookCleanup(pendingLease);
+        var releaseRejectedCleanup = new ClientHookLease(51);
+        var releaseCleanup = TryMarkClientHookCleanup(releaseRejectedCleanup);
+        var releaseCleanupAgain = TryMarkClientHookCleanup(releaseRejectedCleanup);
+        var queueFlags = new ClientHookLease(61);
+        var failedRecall = new ClientHookLease(62);
+        var failedReleaseQueue = TryMarkLeaseActionQueued(
+            queueFlags, FishAction.Release, false);
+        var successfulReleaseQueue = TryMarkLeaseActionQueued(
+            queueFlags, FishAction.Release, true);
+        var failedCaptureQueue = TryMarkLeaseActionQueued(
+            queueFlags, FishAction.Capture, false);
+        var successfulCaptureQueue = TryMarkLeaseActionQueued(
+            queueFlags, FishAction.Capture, true);
+        var successfulHookQueue = TryMarkLeaseActionQueued(
+            queueFlags, FishAction.Hook, true);
+        var interest = UpdateInterest(false, 0, 79.9f, false);
+        var heldInterest = UpdateInterest(true, 0, 96.1f, false);
+        for (var tick = 1; tick < 9; tick++)
+            heldInterest = UpdateInterest(heldInterest.Interested, heldInterest.OutsideTicks, 96.1f, false);
+        var leftInterest = UpdateInterest(
+            heldInterest.Interested, heldInterest.OutsideTicks, 96.1f, false);
+        var forcedInterest = UpdateInterest(false, 9, float.PositiveInfinity, true);
+        var frozenInterest = UpdateInterestForRemote(false, 7, 0f, false, false);
+        var initialWithoutRemote = UpdateInterestForRemote(false, 0, 0f, false, true);
+        var inactivePooled = CreateHostFish(null, "allocator", 7, false);
+        var inactivePooledHidden = !inactivePooled.Active && !inactivePooled.InterestKnown &&
+            !inactivePooled.Interested &&
+            !ManifestInterested(BuildManifestFlags(0, inactivePooled.Interested));
+        var poolActivation = UpdatePoolActive(inactivePooled, true);
+        var duplicatePoolActivation = UpdatePoolActive(inactivePooled, true);
+        var activatedPooledVisible = inactivePooled.Active && inactivePooled.InterestKnown &&
+            inactivePooled.Interested;
+        var poolDeactivation = UpdatePoolActive(inactivePooled, false);
+        var duplicatePoolDeactivation = UpdatePoolActive(inactivePooled, false);
+        var lateNativeReactivationHidden = ShouldHideClientTarget(false, true);
+        var sampleBracket = new List<TimedSample>();
+        for (uint tick = 1; tick <= 12; tick++)
+            InsertSample(sampleBracket, new TimedSample(tick, tick, 0f, 0f, 0f, 0f, 0f));
+        PruneSamples(sampleBracket, 9.5d);
+        if (!renewedHookLease || !activeHookLease || expiredHookLease ||
+            wrongHostRenewal || !hostRenewed || hostLeases[7].Expires != 32f)
+            throw new InvalidOperationException("Fish hook lease renewal failed");
+        if (ShouldAllowProxyWrite(true, false, true) ||
+            !ShouldAllowProxyWrite(true, true, true) ||
+            !ShouldAllowProxyWrite(true, false, false) ||
+            ShouldAllowSimulation(true, false, true, false) ||
+            !ShouldAllowSimulation(true, false, true, true) ||
+            !ShouldAllowSimulation(true, true, true, false) ||
+            !ShouldAllowSimulation(false, false, true, false))
+            throw new InvalidOperationException("Fish client proxy authority gate failed");
         if (!AllocatorUidMatches("A02/FishAllocator/3", "A02/FishAllocator/3") ||
             AllocatorUidMatches("A02/FishAllocator/3", "A02/FishAllocator/4") ||
             FishTidFromItem(1_011_004) != 2_010_004 || FishTidFromItem(10) != 0 ||
-            finalizer == null || finalizer.ReturnType != typeof(Exception) ||
-            finalizer.GetParameters().Length != 1 ||
-            finalizer.GetParameters()[0].ParameterType != typeof(Exception) ||
+            ordered.Count != 3 || ordered[0].Tick != uint.MaxValue || ordered[1].Tick != 0 ||
+            ordered[2].Tick != 1 || bounded.Count != MaxSamples || bounded[0].Tick != 33 ||
+            !IsNewer(1, uint.MaxValue) || IsNewer(uint.MaxValue, 1) ||
+            MathF.Abs(interpolation.X - 3f) > 0.001f ||
+            MathF.Abs(Mathf.DeltaAngle(interpolation.Rotation, 0f)) > 0.001f ||
+            MathF.Abs(extrapolation.X - 11.5f) > 0.001f || teleport.X != 0f ||
+            CanActivateManifest(assembly, 5) || AddManifestTestEntry(assembly, 2) != 2 ||
+            !CanActivateManifest(assembly, 5) || CanActivateManifest(assembly, 12) ||
+            !RemovalWins(20, 20) || !RemovalWins(21, 20) || RemovalWins(19, 20) ||
+             !ManifestEntryEligible(false) || ManifestEntryEligible(true) ||
+            !ShouldSuppressAllocator("allocator-a", allocatorUids) ||
+            ShouldSuppressAllocator("allocator-b", allocatorUids) ||
+            !fishIndex.ContainsKey(("allocator-a", 10)) ||
+            fishIndex.ContainsKey(("allocator-a", 11)) ||
+            !ManifestRetryDue(10f, 10f) || ManifestRetryDue(9.99f, 10f) ||
+            !SceneScopeChanged(7, 9, 7, 10) || SceneScopeChanged(7, 9, 7, 9) ||
+            Math.Abs(snappedClock - 97d) > 0.001d ||
+             Math.Abs(fastClock - 96.1d) > 0.001d ||
+             Math.Abs(slowClock - 99.9d) > 0.001d ||
+             Math.Abs(steadyClock - 97.8d) > 0.001d ||
+             Math.Abs(cappedClock - 101.5d) > 0.001d ||
+             !retainedMissingFish || !despawnedMissingFish || resetMissingScans != 0 ||
+             !liveMissingRetained || !liveMissingRemoved || !destroyedMissingRemoved)
+            throw new InvalidOperationException(
+                $"Fish snapshot interpolation failed: ordered={ordered.Count} bounded={bounded.Count} " +
+                $"interp={interpolation.X} extrap={extrapolation.X} teleport={teleport.X} " +
+                $"clock={snappedClock}/{fastClock}/{slowClock}");
+        if (
+            firstRequestId != 1 || wrappedRequestId != 1 ||
+            !TryMarkProcessedRequest(processedRequests, ref highestRequestId, 10, 4) ||
+            !TryMarkProcessedRequest(processedRequests, ref highestRequestId, 8, 4) ||
+            TryMarkProcessedRequest(processedRequests, ref highestRequestId, 8, 4) ||
+            TryMarkProcessedRequest(processedRequests, ref highestRequestId, 5, 4) ||
+            !RequestIsNewer(1, ulong.MaxValue) ||
+            !TryMarkProcessedRequest(wrappedRequests, ref wrappedHighest, ulong.MaxValue, 4) ||
+            !TryMarkProcessedRequest(wrappedRequests, ref wrappedHighest, 1, 4) ||
+            actionQueue.Count != MaxQueuedActionsPerFish || actionQueue.Peek() != 1 ||
+            delayedQueue.Count != 2 || delayedQueue.Peek().Damage != 1 ||
+            !expiredInFlight || !retainedTimedOutIdentity || !acceptedLateAck ||
+            timedActions.Count != 0 || timedActionByFish.Count != 0 ||
+            BoundDamage(0) != 0 || BoundDamage(20_000) != 10_000 ||
+            !RevisionMatches(9, 9) || RevisionMatches(8, 9) || RevisionMatches(10, 9))
+            throw new InvalidOperationException("Fish request ordering failed");
+        if (
+            !TryConsumeAck(pendingAcks, firstRequestId) ||
+            TryConsumeAck(pendingAcks, firstRequestId) ||
+            !pendingBeforeAck || wrongHookAck || !acceptedHookAck ||
+            !firstCleanup || duplicateCleanup ||
+            !releaseCleanup || releaseCleanupAgain ||
+            failedReleaseQueue || !successfulReleaseQueue || !queueFlags.ReleaseQueued ||
+            failedCaptureQueue || !successfulCaptureQueue || !queueFlags.CaptureQueued ||
+             !successfulHookQueue || !queueFlags.HookQueued ||
+             !MarkHookEndedPending(queueFlags) || !queueFlags.EndedPending ||
+             !ResolveHookRecall(queueFlags, true) || !queueFlags.RecallSuccess ||
+             ResolveHookRecall(queueFlags, false) ||
+             !ResolveHookRecall(failedRecall, false) || failedRecall.RecallSuccess ||
+             ShouldApplyAfterPresentation(true, true, true, false) ||
+             ShouldApplyAfterPresentation(true, true, false, true) ||
+             !ShouldApplyAfterPresentation(true, true, false, false) ||
+            !interest.Interested || interest.OutsideTicks != 0 ||
+            !heldInterest.Interested || heldInterest.OutsideTicks != 9 ||
+            leftInterest.Interested || leftInterest.OutsideTicks != 10 ||
+            !forcedInterest.Interested || forcedInterest.OutsideTicks != 0 ||
+            frozenInterest.Interested || frozenInterest.OutsideTicks != 7 ||
+             !initialWithoutRemote.Interested || initialWithoutRemote.OutsideTicks != 0 ||
+             !inactivePooledHidden || !activatedPooledVisible ||
+             poolActivation != FishLifecycleKind.InterestEnter || duplicatePoolActivation != null ||
+             poolDeactivation != FishLifecycleKind.InterestLeave ||
+             duplicatePoolDeactivation != null || inactivePooled.Active ||
+             inactivePooled.InterestKnown || inactivePooled.Interested ||
+             !lateNativeReactivationHidden || ShouldHideClientTarget(true, true) ||
+             ShouldHideClientTarget(true, false) || ShouldHideClientTarget(false, false) ||
+             FishControlSendBudget(256) != 8 || FishControlSendBudget(39) != 7 ||
+            FishControlSendBudget(32) != 0 ||
+            !SnapshotDeadlineReached(10f, 11f) || SnapshotDeadlineReached(10f, 10.99f) ||
+            !ManifestInterested(BuildManifestFlags(4, true)) ||
+            ManifestInterested(BuildManifestFlags(4, false)) ||
+            sampleBracket.Count != 4 || sampleBracket[0].Tick != 9 ||
+            sampleBracket[^1].Tick != 12 ||
+            !LeaseIdentityMatches(FishAction.Hook, 0, 0) ||
+            !LeaseIdentityMatches(FishAction.Qte, 41, 41) ||
+            LeaseIdentityMatches(FishAction.Qte, 41, 40) ||
+            !ShouldCancelLeaseOnReject(FishAction.Qte, true) ||
+            !ShouldCancelLeaseOnReject(FishAction.Release, true) ||
+            !ShouldCancelLeaseOnReject(FishAction.Capture, true) ||
+            ShouldCancelLeaseOnReject(FishAction.Damage, true) ||
+            ActionRangeSquared(FishAction.Hook) != 1600f ||
+            ActionRangeSquared(FishAction.Damage) != 1600f ||
+            ActionRangeSquared(FishAction.Capture) >= 1600f ||
+            ActionRangeSquared(FishAction.Qte).HasValue ||
+            ActionRangeSquared(FishAction.Release).HasValue ||
+            !HostActionStateValid(FishAction.Hook, FishPhase.Alive, false) ||
+            HostActionStateValid(FishAction.Hook, FishPhase.Hooked, true) ||
+            !HostActionStateValid(FishAction.Qte, FishPhase.Hooked, true) ||
+            HostActionStateValid(FishAction.Qte, FishPhase.Hooked, false) ||
+            !HostActionStateValid(FishAction.Capture, FishPhase.Qte, true) ||
+            !HostActionStateValid(FishAction.CorpsePickup, FishPhase.Corpse, false) ||
+            HostActionStateValid(FishAction.CorpsePickup, FishPhase.Alive, false) ||
+            !HostActionStateValid(FishAction.Release, FishPhase.Hooked, true) ||
+            HostActionStateValid(FishAction.Release, FishPhase.Alive, false) ||
             typeof(FishAddDropLootTracePatch).GetMethod("Postfix", patchFlags) != null)
-            throw new InvalidOperationException("Fish allocator identity matching failed");
+            throw new InvalidOperationException("Fish action state self-test failed");
+
+        var grantSet = new[]
+        {
+            new FishLootGrant(9, 7, 8, 10, 11, 12, FishAction.Capture, 0, 2, 101, 1, 2, 3, 4f),
+            new FishLootGrant(9, 7, 8, 10, 11, 12, FishAction.Capture, 1, 2, 102, 2, 2, 3, 4f)
+        };
+        var manifestTarget = new Target();
+        ApplyManifestBaseline(manifestTarget, new FishManifest(
+            1, 2, 3, 4, 5, "allocator", 6, 7f, 8f, 9f, 10f, 11f, 4));
+        var committed = new CommittedFishLoot
+        {
+            Ack = new FishActionAck(
+                10, 7, 8, 11, 12, FishAction.Capture, FishActionResult.Accepted,
+                FishActionRejectReason.None, 0f, FishPhase.Captured),
+            Grants = new List<FishLootGrant>(grantSet)
+        };
+        var enqueueCount = 0;
+        var partialSend = TrySendCommittedFishLoot(
+            committed, 9, 9, _ => ++enqueueCount < 2, _ => true);
+        var epochAfterPartial = committed.LastSentSessionId;
+        var ackFailure = TrySendCommittedFishLoot(committed, 9, 9, _ => true, _ => false);
+        var epochAfterAckFailure = committed.LastSentSessionId;
+        var completeSend = TrySendCommittedFishLoot(committed, 9, 9, _ => true, _ => true);
+        if (!RemoteCatchLedger.ExactGrantSet(grantSet) ||
+            RemoteCatchLedger.ExactGrantSet(new[] { grantSet[1], grantSet[0] }) ||
+            manifestTarget.Samples.Count != 0 || manifestTarget.Tick != 0 ||
+            manifestTarget.Interested ||
+            manifestTarget.HasSnapshot || manifestTarget.Revision != 5 ||
+            partialSend || epochAfterPartial != 0 || ackFailure || epochAfterAckFailure != 0 ||
+            !completeSend ||
+            committed.LastSentSessionId != 9)
+            throw new InvalidOperationException("Fish loot exact entry matching failed");
+        var pose = new FishHookPose(1, 2, 7, 41, 10, 3f, 4f, 0f, 90f, 2f, 1f);
+        if (!HookPoseIdentityValid(pose, 1, 2, 7, 41) ||
+            HookPoseIdentityValid(pose, 1, 2, 7, 42) ||
+            !HookPoseWithinPlayer(pose, new PlayerSnapshot(1, 2, 0f, 0f, 0f, 0f, 0f, 0f, 0, 1f, 1f, false)) ||
+            HookPoseWithinPlayer(pose with { X = 8.01f, Y = 0f }, new PlayerSnapshot(1, 2, 0f, 0f, 0f, 0f, 0f, 0f, 0, 1f, 1f, false)) ||
+            !HookPoseMotionPlausible(pose, pose with { Tick = 11, X = 5f }, 0.05f) ||
+            HookPoseMotionPlausible(pose, pose with { Tick = 11, X = 5.1f }, 0.05f) ||
+            HookPoseMotionPlausible(pose, pose with { Tick = 10 }, 1f) ||
+            !HookPoseFromCurrentPlausible(new Vector3(1f, 4f, 0f), pose, 0.05f) ||
+            HookPoseFromCurrentPlausible(new Vector3(0.9f, 4f, 0f), pose, 0.05f))
+            throw new InvalidOperationException("Fish hook pose policy failed");
+        var fearEnter = RemoteThreatPolicy(false, 0.7f, 3.9f, false, 1f, 0f);
+        var fearHeld = RemoteThreatPolicy(false, 0.7f, 4.5f, true, 1.2f, 1.5f);
+        var fearRefresh = RemoteThreatPolicy(false, 0.7f, 4.5f, true, 1.5f, 1.5f);
+        var fearExit = RemoteThreatPolicy(false, 0.7f, 5.1f, true, 1.6f, 1.5f);
+        var aggressiveOutside = RemoteThreatPolicy(true, 0.7f, 0.8f, false, 1f, 0f);
+        if (!fearEnter.Inside || !fearEnter.Enter || !fearEnter.Refresh || fearHeld.Enter ||
+            !fearHeld.Inside || fearHeld.Refresh ||
+            fearRefresh.Enter || !fearRefresh.Refresh ||
+            fearExit.Inside || aggressiveOutside.Inside)
+            throw new InvalidOperationException("Remote fish threat policy failed");
+        var ended = 0;
+        var leaseTest = new Dictionary<int, HostHookLease>
+        {
+            [7] = new HostHookLease(41, 2f, true)
+        };
+        if (!TryEndHostHookLease(leaseTest, 7, _ => ended++) ||
+            TryEndHostHookLease(leaseTest, 7, _ => ended++) || ended != 1)
+            throw new InvalidOperationException("Fish hook lease restore-once policy failed");
+        if (!ShouldSuppressPendingClientFishLootPolicy(false, true, true, true, false) ||
+            !ShouldSuppressPendingClientFishLootPolicy(true, false, false, false, false) ||
+            ShouldSuppressPendingClientFishLootPolicy(false, true, false, true, true) ||
+            ShouldSuppressPendingClientFishLootPolicy(false, false, true, true, true))
+            throw new InvalidOperationException("Pending client fish loot policy failed");
     }
 
     internal void Update(
@@ -98,6 +639,17 @@ internal sealed class FishReplicator
     {
         if (role == SessionRole.Host)
         {
+            _clientLootRequests.Clear();
+            _clientLootGrants.Clear();
+            _clientGrantActions.Clear();
+            _clientGrantFish.Clear();
+            if (_clientHookLeases.Count > 0 || _pendingClientActions.Count > 0 ||
+                _queuedClientActions.Count > 0)
+            {
+                ReleaseClientTargets();
+                ResetClientManifest();
+            }
+            _clientAuthorityActive = false;
             while (session.TryTakeFishSnapshot(out _))
             {
             }
@@ -111,6 +663,15 @@ internal sealed class FishReplicator
             {
             }
             while (session.TryTakeFishManifestState(out _))
+            {
+            }
+            while (session.TryTakeFishLifecycle(out _))
+            {
+            }
+            while (session.TryTakeFishActionAck(out _))
+            {
+            }
+            while (session.TryTakeFishLootGrant(out _))
             {
             }
             UpdateHost(session, sceneId, now, hostPlayer, remotePlayerTransform);
@@ -123,9 +684,13 @@ internal sealed class FishReplicator
         while (session.TryTakeFishPickupRequest(out _))
         {
         }
+        if (_hostHookLeases.Count > 0 || _hostActionAcks.Count > 0 ||
+            _hostProcessedRequests.Count > 0)
+            ResetHostActions();
 
         if (role != SessionRole.Client || !session.SceneMatches(sceneId))
         {
+            _clientAuthorityActive = false;
             while (session.TryTakeFishSnapshot(out _))
             {
             }
@@ -141,34 +706,95 @@ internal sealed class FishReplicator
             while (session.TryTakeFishManifestState(out _))
             {
             }
+            while (session.TryTakeFishLifecycle(out _))
+            {
+            }
+            while (session.TryTakeFishActionAck(out _))
+            {
+            }
+            while (session.TryTakeFishLootGrant(out _))
+            {
+            }
+            while (session.TryTakeFishActionRequest(out _))
+            {
+            }
             ReleaseClientTargets();
             ResetClientManifest();
             return;
         }
 
-        // Fish AI is deeply local: sensors, behavior trees and hook state don't
-        // survive proxying. Let the client use native fish; loot sync handles results.
-        DrainClientFishMessages(session);
-        ReleaseClientTargets();
-        ResetClientManifest();
+        _clientAuthorityActive = true;
+        UpdateClient(session, sceneId, session.RemoteSceneEpoch, now, deltaTime, hostPlayer);
     }
 
-    private void DrainClientFishMessages(UdpSession session)
+    private void UpdateClient(
+        UdpSession session,
+        uint sceneId,
+        uint sceneEpoch,
+        float now,
+        float deltaTime,
+        PlayerCharacter player)
     {
-        while (session.TryTakeFishSnapshot(out _))
+        foreach (var requestId in new List<ulong>(_clientLootRequests.Keys))
+            if (_clientLootRequests[requestId].Request.SceneId != sceneId)
+            {
+                _clientLootRequests.Remove(requestId);
+                _clientLootGrants.Remove(requestId);
+                _clientGrantActions.Remove(requestId);
+                _clientGrantFish.Remove(requestId);
+            }
+        if (SceneScopeChanged(
+                _appliedClientSceneId, _appliedClientSceneEpoch, sceneId, sceneEpoch))
+        {
+            ReleaseClientTargets();
+            ResetClientManifest();
+            _appliedClientSceneId = sceneId;
+            _appliedClientSceneEpoch = sceneEpoch;
+            _trace?.Write("FISH-EPOCH", $"scene={sceneId:X8} epoch={sceneEpoch}");
+        }
+        while (session.TryTakeFishManifest(out var manifest))
+            ReceiveClientManifest(sceneId, sceneEpoch, manifest);
+        while (session.TryTakeFishManifestState(out var state))
+            ReceiveClientManifestState(sceneId, sceneEpoch, state);
+        while (session.TryTakeFishLifecycle(out var lifecycle))
+            ApplyClientLifecycle(sceneId, sceneEpoch, lifecycle);
+        while (session.TryTakeFishRemoved(out var removed))
+            ApplyClientRemoval(sceneId, sceneEpoch, removed.Id, removed.Revision, "removed");
+        while (session.TryTakeFishSnapshot(out var snapshot))
+            ApplyClientSnapshot(sceneId, sceneEpoch, snapshot);
+        while (session.TryTakeFishPickupResult(out var result))
+        {
+            if (result.SceneId == sceneId && result.SceneEpoch == sceneEpoch)
+                ApplyClientPickupResult(result, player);
+        }
+        while (session.TryTakeFishActionAck(out var ack))
+            ApplyClientActionAck(session, sceneId, sceneEpoch, now, ack, player);
+        while (session.TryTakeFishLootGrant(out var grant))
+            ApplyClientLootGrant(session, sceneId, sceneEpoch, grant, player);
+        while (session.TryTakeFishLootComplete(out _))
         {
         }
-        while (session.TryTakeFishRemoved(out _))
+        UpdateClientLootRequests(session, sceneId, sceneEpoch, now, player);
+        ExpireClientActions(session, sceneId, now);
+
+        if (RetryPendingClientManifests(now) && _latestClientManifestRevision != 0)
+            SuppressUnboundClientFish();
+        AdvanceClientClock(deltaTime);
+        EnforceClientVisibility();
+        WriteClientSummary(now);
+    }
+
+    private void EnforceClientVisibility()
+    {
+        foreach (var pair in _targets)
         {
-        }
-        while (session.TryTakeFishPickupResult(out _))
-        {
-        }
-        while (session.TryTakeFishManifest(out _))
-        {
-        }
-        while (session.TryTakeFishManifestState(out _))
-        {
+            var target = pair.Value;
+            var fish = target.Fish;
+            if (fish == null || !ShouldHideClientTarget(
+                    target.Interested, fish.gameObject.activeInHierarchy))
+                continue;
+            fish.gameObject.SetActive(false);
+            _trace?.Write("INTEREST-REHIDE", $"id={pair.Key} revision={target.Revision}");
         }
     }
 
@@ -180,7 +806,8 @@ internal sealed class FishReplicator
         EElement element,
         AttackType attackType)
     {
-        if (fish == null || damage <= 0 || !IsPlayerAttack(attackType))
+        if (fish == null || damage <= 0 || !IsPlayerAttack(attackType) ||
+            !Enum.IsDefined(typeof(EElement), element))
             return false;
         if (!_clientIdsByFish.TryGetValue(fish, out var id))
         {
@@ -189,51 +816,283 @@ internal sealed class FishReplicator
                 $"damage={damage} attack={attackType}");
             return false;
         }
-        session.SendFishDamageRequest(new FishDamageRequest(
-            sceneId, session.RemoteSceneEpoch, id, 0,
-            Mathf.Clamp(damage, 1, 10_000), (int)element, (int)attackType));
-        _trace?.Write("DAMAGE-SEND",
-            $"id={id} type={fish.FishDataTID} damage={damage} element={element} attack={attackType}");
+        if (!_targets.TryGetValue(id, out var target) || target.Revision == 0)
+            return false;
+        var action = attackType == AttackType.QTE_Damage ? FishAction.Qte : FishAction.Damage;
+        if (action == FishAction.Qte &&
+            !HasActiveClientHookLease(_clientHookLeases, id, Time.realtimeSinceStartup))
+            return false;
+        var queued = EnqueueClientAction(
+            session, sceneId, id, fish, action, BoundDamage(damage), (int)element,
+            action == FishAction.Qte ? 0 : (int)attackType, Time.realtimeSinceStartup);
+        if (!queued && action == FishAction.Qte)
+            CancelClientHook(session, sceneId, id, fish, Time.realtimeSinceStartup);
+        return queued;
+    }
+
+    internal void ObserveClientHook(
+        UdpSession session, uint sceneId, FishAISystem fish)
+    {
+        if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id) ||
+            _clientHookLeases.ContainsKey(id))
+            return;
+        BeginClientHookLease(_clientHookLeases, id, 0);
+        _lastClientHookId = id;
+        var queued = EnqueueClientAction(
+                session, sceneId, id, fish, FishAction.Hook, 0, 0, 0,
+                Time.realtimeSinceStartup);
+        if (!TryMarkLeaseActionQueued(_clientHookLeases[id], FishAction.Hook, queued))
+        {
+            ScheduleClientHookCleanup(id);
+        }
+    }
+
+    internal void ObserveClientRelease(
+        UdpSession session, uint sceneId, FishAISystem fish)
+    {
+        if (_applyingClientState || fish == null ||
+            !_clientIdsByFish.TryGetValue(fish, out var id) ||
+            !_clientHookLeases.TryGetValue(id, out var lease) || lease.CleanupDone)
+            return;
+        if (MarkHookEndedPending(lease))
+        {
+            _suppressingNativeRecallOutcome = true;
+            _trace?.Write("HOOK-END-PENDING", $"id={id} lease={lease.RequestId}");
+        }
+    }
+
+    internal void BeginClientHarpoonRecall(
+        UdpSession session, uint sceneId, bool isSuccess)
+    {
+        if (!_clientAuthorityActive)
+            return;
+        _suppressingNativeRecallOutcome = true;
+        if (_lastClientHookId == 0 ||
+            !_clientHookLeases.TryGetValue(_lastClientHookId, out var lease) ||
+            !ResolveHookRecall(lease, isSuccess))
+            return;
+        var fish = FindClientFish(_lastClientHookId);
+        if (fish == null)
+            return;
+        var action = isSuccess ? FishAction.Capture : FishAction.Release;
+        var queued = EnqueueClientAction(
+            session, sceneId, _lastClientHookId, fish, action, 0, 0, 0,
+            Time.realtimeSinceStartup);
+        TryMarkLeaseActionQueued(lease, action, queued);
+        _trace?.Write("HARPOON-OUTCOME",
+            $"id={_lastClientHookId} lease={lease.RequestId} success={isSuccess} queued={queued}");
+        if (!queued)
+            CancelClientHook(
+                session, sceneId, _lastClientHookId, fish, Time.realtimeSinceStartup);
+    }
+
+    internal void EndClientHarpoonRecall() => _suppressingNativeRecallOutcome = false;
+
+    internal void ResetClientHarpoon(
+        UdpSession session, uint sceneId)
+    {
+        _suppressingNativeRecallOutcome = false;
+        if (_lastClientHookId == 0 ||
+            !_clientHookLeases.TryGetValue(_lastClientHookId, out var lease) ||
+            lease.RecallResolved)
+            return;
+        var fish = FindClientFish(_lastClientHookId);
+        if (fish != null)
+            CancelClientHook(
+                session, sceneId, _lastClientHookId, fish, Time.realtimeSinceStartup);
+        _lastClientHookId = 0;
+    }
+
+    internal bool SuppressingNativeRecallOutcome => _suppressingNativeRecallOutcome;
+
+    internal bool HasPendingClientCapture(FishAISystem fish)
+    {
+        if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id))
+            return false;
+        if (_clientHookLeases.TryGetValue(id, out var lease) && lease.CaptureQueued)
+            return true;
+        foreach (var request in _clientLootRequests.Values)
+            if (!request.Released && request.Request.Id == id &&
+                request.Request.Action == FishAction.Capture)
+                return true;
+        return false;
+    }
+
+    internal bool BeginPendingClientFishLootScope(FishAISystem fish)
+    {
+        if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id) ||
+            !_clientHookLeases.TryGetValue(id, out var lease) ||
+            !lease.EndedPending && !lease.CaptureQueued && !HasClientLootRequestForFish(id))
+            return false;
+        _pendingClientFishLootScopeDepth++;
         return true;
     }
 
-    internal bool BeginClientDamage(
+    internal void EndPendingClientFishLootScope()
+    {
+        if (_pendingClientFishLootScopeDepth > 0)
+            _pendingClientFishLootScopeDepth--;
+    }
+
+    internal bool ShouldSuppressPendingClientFishLoot(int itemId)
+    {
+        var matchingFish = false;
+        var endedPending = false;
+        var capturePending = false;
+        if (_lastClientHookId != 0 &&
+            _clientHookLeases.TryGetValue(_lastClientHookId, out var lease))
+        {
+            endedPending = lease.EndedPending;
+            capturePending = lease.CaptureQueued || HasClientLootRequestForFish(_lastClientHookId);
+            var fishTid = FishTidFromItem(itemId);
+            matchingFish = fishTid > 0 &&
+                (_targets.TryGetValue(_lastClientHookId, out var target)
+                    ? target.FishDataTID == fishTid
+                    : FindClientFish(_lastClientHookId)?.FishDataTID == fishTid);
+        }
+        return ShouldSuppressPendingClientFishLootPolicy(
+            _pendingClientFishLootScopeDepth > 0, _suppressingNativeRecallOutcome,
+            matchingFish, endedPending, capturePending);
+    }
+
+    internal bool RequestClientCapture(
+        UdpSession session, uint sceneId, FishAISystem fish)
+    {
+        if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id))
+            return true;
+        if (!HasActiveClientHookLease(_clientHookLeases, id, Time.realtimeSinceStartup))
+        {
+            CleanupClientHook(id, fish);
+            return false;
+        }
+        if (HasClientLootRequestForFish(id))
+            return false;
+        var lease = _clientHookLeases[id];
+        if (lease.CaptureQueued)
+            return false;
+        var queued = EnqueueClientAction(
+            session, sceneId, id, fish, FishAction.Capture, 0, 0, 0,
+            Time.realtimeSinceStartup);
+        if (!TryMarkLeaseActionQueued(lease, FishAction.Capture, queued))
+            CancelClientHook(session, sceneId, id, fish, Time.realtimeSinceStartup);
+        return false;
+    }
+
+    private bool EnqueueClientAction(
+        UdpSession session,
+        uint sceneId,
+        int id,
+        FishAISystem fish,
+        FishAction action,
+        int damage,
+        int element,
+        int attackType,
+        float now)
+    {
+        if (!_queuedClientActions.TryGetValue(id, out var queue))
+        {
+            queue = new Queue<QueuedAction>();
+            _queuedClientActions[id] = queue;
+        }
+        var leaseId = action is FishAction.Qte or FishAction.Release or FishAction.Capture &&
+            _clientHookLeases.TryGetValue(id, out var lease) ? lease.RequestId : 0;
+        if (!TryEnqueueBounded(queue, new QueuedAction(
+                action, damage, element, attackType, leaseId),
+                MaxQueuedActionsPerFish))
+            return false;
+        TrySendNextClientAction(session, sceneId, id, fish, now);
+        return true;
+    }
+
+    private bool TrySendNextClientAction(
+        UdpSession session, uint sceneId, int id, FishAISystem fish, float now)
+    {
+        if (_pendingClientActionByFish.ContainsKey(id) ||
+            !_queuedClientActions.TryGetValue(id, out var queue))
+            return false;
+        if (queue.Count == 0 || !_targets.TryGetValue(id, out var target) || target.Revision == 0)
+        {
+            _queuedClientActions.Remove(id);
+            return false;
+        }
+        var queued = queue.Peek();
+        var requestId = NextRequestId(ref _nextClientRequestId);
+        var request = new FishActionRequest(
+            requestId, sceneId, session.RemoteSceneEpoch, id, target.Revision, queued.LeaseId,
+            queued.Action, queued.Damage, queued.Element, queued.AttackType);
+        if (!session.SendFishActionRequest(request))
+            return false;
+        if (queued.Action is FishAction.Capture or FishAction.CorpsePickup)
+        {
+            _clientLootRequests[requestId] = new ClientLootRequest
+            {
+                Request = request,
+                Started = now,
+                NextReplay = now + ActionTimeoutSeconds
+            };
+            _clientGrantActions[requestId] = queued.Action;
+            _clientGrantFish[requestId] = id;
+        }
+        queue.Dequeue();
+        if (queue.Count == 0)
+            _queuedClientActions.Remove(id);
+        _pendingClientActions[requestId] = new PendingAction(
+            id, fish, queued.Action, queued.LeaseId, now + ActionTimeoutSeconds);
+        _pendingClientActionByFish[id] = requestId;
+        if (queued.Action == FishAction.Hook)
+        {
+            if (_clientHookLeases.TryGetValue(id, out var lease))
+            {
+                if (lease.RequestId == 0)
+                    lease.RequestId = requestId;
+            }
+            else
+                BeginClientHookLease(_clientHookLeases, id, requestId);
+        }
+        _trace?.Write("FISH-ACTION-SEND",
+            $"request={requestId} id={id} revision={target.Revision} action={queued.Action} " +
+            $"damage={queued.Damage} element={queued.Element} attack={queued.AttackType}");
+        return true;
+    }
+
+    internal void ObserveClientDamage(
         UdpSession session,
         uint sceneId,
         FishAISystem fish,
         AttackData attackData)
     {
         if (fish == null || attackData == null || !IsPlayerAttack(attackData.attackType))
-            return false;
+            return;
         if (!IsClientProxy(fish))
         {
             _trace?.Write("DAMAGE-BLOCK",
                 $"unmapped OnTakeDamage type={fish.FishDataTID} instance={fish.GetInstanceID()}");
-            return false;
+            return;
         }
-        RequestDamage(
-            session, sceneId, fish, Math.Max(1, attackData.damage),
+        var sent = RequestDamage(
+            session, sceneId, fish, attackData.damage,
             attackData.element, attackData.attackType);
-        _clientDamageScopes.Add(fish);
-        return true;
+        if (!sent)
+            _trace?.Write("DAMAGE-BLOCK", $"request-send-failed type={fish.FishDataTID}");
     }
 
-    internal void EndClientDamage(FishAISystem fish) => _clientDamageScopes.Remove(fish);
+    internal bool ShouldAllowClientDamageWrite(FishAISystem fish) =>
+        ShouldAllowProxyWrite(_clientAuthorityActive, _applyingClientState, IsClientProxy(fish));
 
-    internal bool IsClientDamageScoped(FishAISystem fish) =>
-        fish != null && _clientDamageScopes.Contains(fish);
+    internal bool ShouldAllowDirectClientProxyWrite(FishAISystem fish) =>
+        ShouldAllowProxyWrite(_clientAuthorityActive, _applyingClientState, IsClientProxy(fish));
+
+    internal bool ShouldAllowClientSimulation(FishAISystem fish) =>
+        ShouldAllowSimulation(
+            _clientAuthorityActive, _applyingClientState, IsClientProxy(fish),
+            fish != null && _clientIdsByFish.TryGetValue(fish, out var id) &&
+            HasActiveClientHookLease(_clientHookLeases, id, Time.realtimeSinceStartup));
+
+    internal bool ApplyingClientState => _applyingClientState;
+
+    internal bool ClientAuthorityActive => _clientAuthorityActive;
 
     internal bool RequestPickup(UdpSession session, uint sceneId, FishAISystem fish)
-        => RequestPickup(session, sceneId, fish, false);
-
-    internal bool RequestCapture(UdpSession session, uint sceneId, FishAISystem fish)
-        => RequestPickup(session, sceneId, fish, true);
-
-    private bool RequestPickup(
-        UdpSession session,
-        uint sceneId,
-        FishAISystem fish,
-        bool capture)
     {
         if (fish == null || !_clientIdsByFish.TryGetValue(fish, out var id))
         {
@@ -242,28 +1101,30 @@ internal sealed class FishReplicator
                 $"unmapped type={fish.FishDataTID} instance={fish.GetInstanceID()}");
             return false;
         }
-        if (capture)
-            _pendingClientCaptures.Add(id);
-        if (!_pendingClientPickups.Add(id))
+        if (_pendingClientActionByFish.ContainsKey(id))
             return true;
-        session.SendFishPickupRequest(new FishPickupRequest(
-            sceneId, session.RemoteSceneEpoch, id, 0));
-        _trace?.Write(capture ? "CAPTURE-SEND" : "PICKUP-SEND",
+        if (HasClientLootRequestForFish(id))
+            return true;
+        if (!_targets.TryGetValue(id, out var target) || target.Revision == 0)
+            return false;
+        var queued = EnqueueClientAction(
+            session, sceneId, id, fish, FishAction.CorpsePickup, 0, 0, 0,
+            Time.realtimeSinceStartup);
+        _trace?.Write(queued ? "PICKUP-SEND" : "PICKUP-BLOCK",
             $"id={id} type={fish.FishDataTID}");
-        return true;
+        return queued;
     }
 
     internal bool ApplyingClientPickup => _applyingClientPickup;
 
     internal void ObserveHostPickup(UdpSession session, uint sceneId, FishAISystem fish)
     {
-        if (fish == null)
+        if (fish == null || _hostTransactionalPickup)
             return;
         _hostRemovedFish.Add(fish);
         if (!_hostIdsByFish.TryGetValue(fish, out var id))
             return;
-        session.SendFishRemoved(new FishRemoved(
-            sceneId, session.LocalSceneEpoch, id, NextRevision(_fishTick)));
+        var revision = SendHostDespawn(session, sceneId, id);
         RemoveHostFish(id);
         _log.LogInfo($"Network host fish pickup completed: id={id}");
         _trace?.Write("HOST-PICKUP", $"id={id} type={fish.FishDataTID}");
@@ -271,6 +1132,15 @@ internal sealed class FishReplicator
 
     internal bool IsClientProxy(FishAISystem fish) =>
         fish != null && _clientIdsByFish.ContainsKey(fish);
+
+    internal bool CanClientInteract(FishInteractionBody body, bool nativeAvailable)
+    {
+        var fish = body?.GetComponentInParent<FishAISystem>();
+        if (!_clientIdsByFish.TryGetValue(fish, out var id) ||
+            !_targets.TryGetValue(id, out var target))
+            return nativeAvailable;
+        return target.Phase is FishPhase.Captured or FishPhase.Corpse || target.Hp <= 0f;
+    }
 
     internal bool CanClientPickupFish(FishInteractionBody body)
     {
@@ -298,7 +1168,7 @@ internal sealed class FishReplicator
             return false;
         var fishTid = FishTidFromItem(request.ItemId);
         FishAISystem nearest = null;
-        var nearestDistance = 36f;
+        var nearestDistance = CorpsePickupRangeSquared;
         foreach (var fish in UnityEngine.Object.FindObjectsByType<FishAISystem>(
                      FindObjectsInactive.Exclude, FindObjectsSortMode.None))
         {
@@ -331,7 +1201,7 @@ internal sealed class FishReplicator
 
         var playerPosition = player.transform.position;
         FishAISystem nearest = null;
-        var nearestDistance = 16f;
+        var nearestDistance = CorpsePickupRangeSquared;
         foreach (var fish in UnityEngine.Object.FindObjectsByType<FishAISystem>(
                      FindObjectsInactive.Exclude, FindObjectsSortMode.None))
         {
@@ -369,17 +1239,34 @@ internal sealed class FishReplicator
 
     internal void Clear()
     {
+        _clientAuthorityActive = false;
+        _lastClientHookId = 0;
+        _suppressingNativeRecallOutcome = false;
+        _pendingClientFishLootScopeDepth = 0;
+        ResetHostActions();
         ReleaseClientTargets();
+        foreach (var fish in _hostFishById.Values)
+            FishBehaviorTreeState.Forget(fish);
         _hostFishById.Clear();
         _hostIdsByFish.Clear();
         _hostInfoById.Clear();
         _hostRemovedFish.Clear();
-        _clientDamageScopes.Clear();
+        _pendingClientActions.Clear();
+        _pendingClientActionByFish.Clear();
+        _queuedClientActions.Clear();
+        _clientHookLeases.Clear();
+        _hostActionAcks.Clear();
+        _hostProcessedRequests.Clear();
         _lastRemoteDamageById.Clear();
-        _nextRemoteStimulusById.Clear();
+        _lastRemoteHookActionById.Clear();
+        _clientHookLeases.Clear();
+        _scheduledClientHookCleanup.Clear();
         _remoteStimulatedIds.Clear();
+        _nextRemoteThreatById.Clear();
+        _pendingHostLifecycles.Clear();
         ResetClientManifest();
         _nextHostScan = 0f;
+        _nextRemoteStimulus = 0f;
         _nextSend = 0f;
         _manifestStateQueued = false;
         _nextHostId = 1;
@@ -388,6 +1275,73 @@ internal sealed class FishReplicator
         _fishTick = 0;
         _latestClientManifestRevision = 0;
         _nextTraceSummary = 0f;
+        _nextClientBind = 0f;
+        _latestClientTick = 0;
+        _clientRenderTick = 0d;
+        _hasClientClock = false;
+        _applyingClientState = false;
+        _clientSnapshotsAccepted = 0;
+        _clientSnapshotsRejected = 0;
+        _clientTeleports = 0;
+        _appliedClientSceneId = 0;
+        _appliedClientSceneEpoch = 0;
+        _highestHostRequestId = 0;
+        _fishSnapshotBytes = 0;
+        _fishSnapshotsSent = 0;
+        _fishSnapshotPackets = 0;
+        _fishInterestEnters = 0;
+        _fishInterestLeaves = 0;
+        _fishOverdueSnapshots = 0;
+        _fishControlPacketsDeferred = 0;
+        _nextFishTrafficTrace = 0f;
+    }
+
+    internal void LateUpdate()
+    {
+        if (_scheduledClientHookCleanup.Count > 0)
+        {
+            _idScratch.Clear();
+            _idScratch.AddRange(_scheduledClientHookCleanup);
+            foreach (var id in _idScratch)
+            {
+                _scheduledClientHookCleanup.Remove(id);
+                var fish = FindClientFish(id);
+                if (fish != null)
+                    CleanupClientHook(id, fish);
+                if (_clientHookLeases.TryGetValue(id, out var lease) &&
+                    (lease.RequestId == 0 || lease.CleanupDone && lease.ReleaseQueued))
+                    _clientHookLeases.Remove(id);
+            }
+        }
+        if (_deferredClientRemovals.Count == 0)
+            return;
+        _removalScratch.Clear();
+        _removalScratch.AddRange(_deferredClientRemovals);
+        _deferredClientRemovals.Clear();
+        _applyingClientState = true;
+        try
+        {
+            foreach (var removal in _removalScratch)
+            {
+                if (removal.Fish == null)
+                    continue;
+                try
+                {
+                    ReleaseClientHook(removal.Fish, removal.Id);
+                    removal.Fish.DestroySelf();
+                }
+                catch (Exception exception)
+                {
+                    removal.Fish.gameObject.SetActive(false);
+                    _trace?.Write("REMOVE-ERROR",
+                        $"id={removal.Id} error={exception.GetType().Name}:{exception.Message}");
+                }
+            }
+        }
+        finally
+        {
+            _applyingClientState = false;
+        }
     }
 
     private void UpdateHost(
@@ -405,31 +1359,61 @@ internal sealed class FishReplicator
             while (session.TryTakeFishPickupRequest(out _))
             {
             }
+            while (session.TryTakeFishActionRequest(out _))
+            {
+            }
+            while (session.TryTakeFishHookPose(out _))
+            {
+            }
+            ResetHostActions();
             foreach (var info in _hostInfoById.Values)
                 info.ManifestQueued = false;
             _manifestStateQueued = false;
+            _pendingHostLifecycles.Clear();
             return;
         }
         if (now >= _nextHostScan)
             RefreshHostFish(session, sceneId, now);
+        ExpireHostHookLeases(session, sceneId, now);
 
-        StimulateHostFishForRemotePlayer(
-            session, sceneId, now, remotePlayerTransform);
+        if (now >= _nextRemoteStimulus)
+        {
+            _nextRemoteStimulus = now + RemoteStimulusInterval;
+            StimulateHostFishForRemotePlayer(
+                session, sceneId, now, remotePlayerTransform);
+        }
 
-        while (session.TryTakeFishDamageRequest(out var damageRequest))
-            ApplyHostDamage(session, sceneId, now, remotePlayerTransform, damageRequest);
+        while (session.TryTakeFishDamageRequest(out _))
+        {
+        }
+        while (session.TryTakeFishActionRequest(out var actionRequest))
+            ApplyHostAction(session, sceneId, now, remotePlayerTransform, actionRequest);
+        while (session.TryTakeFishHookPose(out var pose))
+            ApplyHostHookPose(session, sceneId, now, pose);
+        while (session.TryTakeFishLootComplete(out var complete))
+            if (_ledger?.CompleteFishTransaction(complete) == true)
+                _trace?.Write("FISH-LOOT-COMPLETE",
+                    $"transaction={complete.TransactionId} request={complete.RequestId}");
         while (session.TryTakeFishPickupRequest(out var pickupRequest))
             ApplyHostPickup(session, sceneId, now, hostPlayer, pickupRequest);
 
+        if (_ledger != null)
+            foreach (var transaction in _ledger.FishLootNeedingReplay(
+                         sceneId, session.ConnectionId))
+                SendCommittedFishLoot(session, transaction);
+
         WriteHostSummary(now);
 
-        SendFishManifests(session, sceneId);
+        SendFishControl(session, sceneId);
         if (now < _nextSend)
             return;
 
         _nextSend = now + 0.1f;
         _fishTick = NextRevision(_fishTick);
         _snapshotBuffer.Clear();
+        _snapshotCandidates.Clear();
+        _overdueSnapshotCandidates.Clear();
+        var hasRemotePlayer = TryGetRemotePlayer(session, sceneId, now, out var remotePlayer);
         foreach (var pair in _hostFishById)
         {
             var fish = pair.Value;
@@ -437,62 +1421,156 @@ internal sealed class FishReplicator
                 continue;
             var position = fish.transform.position;
             var velocity = fish.Velocity;
-            var snapshot = new FishSnapshot(
-                sceneId, session.LocalSceneEpoch, _fishTick, pair.Key, _fishTick, fish.FishDataTID,
-                position.x, position.y, position.z, fish.Rotation,
-                velocity.x, velocity.y, Mathf.Max(0f, fish.HP), BuildFlags(fish));
             var info = _hostInfoById[pair.Key];
+            var phase = ObservedHostPhase(pair.Key, info, fish, now);
+            var phaseChanged = phase != info.Phase;
+            if (phase != info.Phase)
+            {
+                info.Phase = phase;
+                info.Revision = NextRevision(info.Revision);
+                SendHostLifecycle(session, sceneId, pair.Key, info, FishLifecycleKind.Phase);
+            }
+            var hp = Mathf.Max(0f, fish.HP);
+            if (info.LastHp != 0f && hp < info.LastHp)
+                info.RecentDamageUntil = now + RecentDamageSeconds;
+            info.LastHp = hp;
+            var distance = hasRemotePlayer
+                ? Vector2.Distance(new Vector2(position.x, position.y), new Vector2(remotePlayer.X, remotePlayer.Y))
+                : 0f;
+            var forced = IsForcedRelevant(
+                fish, info, now, hostPlayer?.transform, remotePlayerTransform);
+            var interest = UpdateInterestForRemote(
+                info.Interested, info.OutsideInterestTicks, distance, forced,
+                hasRemotePlayer || !info.InterestKnown);
+            var interestChanged = !info.InterestKnown || interest.Interested != info.Interested;
+            info.InterestKnown = true;
+            info.Interested = interest.Interested;
+            info.OutsideInterestTicks = interest.OutsideTicks;
+            if (interestChanged)
+            {
+                info.Revision = NextRevision(info.Revision);
+                SendHostLifecycle(session, sceneId, pair.Key, info,
+                    info.Interested ? FishLifecycleKind.InterestEnter : FishLifecycleKind.InterestLeave);
+                if (info.Interested)
+                {
+                    info.HasSnapshot = false;
+                    _fishInterestEnters++;
+                }
+                else
+                    _fishInterestLeaves++;
+            }
+            if (!info.Interested)
+                continue;
+            var snapshot = new FishSnapshot(
+                sceneId, session.LocalSceneEpoch, _fishTick, pair.Key, info.Revision, fish.FishDataTID,
+                position.x, position.y, position.z, fish.Rotation,
+                velocity.x, velocity.y, hp, BuildFlags(fish, info.Phase));
+            if (phaseChanged || interestChanged)
+            {
+                SendImmediateHostSnapshot(session, sceneId, pair.Key, info, snapshot);
+                continue;
+            }
             if (!ShouldSendSnapshot(info, snapshot, now))
                 continue;
-            info.LastSnapshot = snapshot;
-            info.LastSnapshotSend = now;
-            info.HasSnapshot = true;
-            _snapshotBuffer.Add(snapshot);
+            info.Priority = Math.Min(12f, info.Priority + 1f);
+            if (SnapshotDeadlineReached(info.LastSnapshotSend, now))
+                InsertSnapshotCandidate(_overdueSnapshotCandidates,
+                    new SnapshotCandidate(snapshot, info, now - info.LastSnapshotSend));
+            else
+            {
+                var bonus = Math.Min(8f,
+                    Math.Max(0f, InterestLeaveDistance - distance) * 0.05f +
+                    (forced ? 4f : 0f));
+                InsertSnapshotCandidate(_snapshotCandidates,
+                    new SnapshotCandidate(snapshot, info, info.Priority + bonus));
+            }
         }
+        _snapshotBuffer.Clear();
+        var bytes = Protocol.FishSnapshotBatchOverhead;
+        AddSnapshotCandidates(_overdueSnapshotCandidates, true, now, ref bytes);
+        AddSnapshotCandidates(_snapshotCandidates, false, now, ref bytes);
         if (_snapshotBuffer.Count > 0)
-            session.SendFishSnapshots(sceneId, _fishTick, _snapshotBuffer);
+        {
+            _fishSnapshotBytes += session.SendFishSnapshots(sceneId, _fishTick, _snapshotBuffer);
+            _fishSnapshotsSent += _snapshotBuffer.Count;
+            _fishSnapshotPackets++;
+        }
+    }
+
+    private void AddSnapshotCandidates(
+        List<SnapshotCandidate> candidates, bool overdue, float now, ref int bytes)
+    {
+        foreach (var candidate in candidates)
+        {
+            var recordBytes = Protocol.FishSnapshotRecordSize(candidate.Snapshot);
+            if (_snapshotBuffer.Count >= SnapshotEntityBudget ||
+                bytes + recordBytes > SnapshotByteBudget)
+                break;
+            candidate.Info.LastSnapshot = candidate.Snapshot;
+            candidate.Info.LastSnapshotSend = now;
+            candidate.Info.HasSnapshot = true;
+            candidate.Info.Priority = 0f;
+            _snapshotBuffer.Add(candidate.Snapshot);
+            bytes += recordBytes;
+            if (overdue)
+                _fishOverdueSnapshots++;
+        }
     }
 
     private void RefreshHostFish(UdpSession session, uint sceneId, float now)
     {
         _nextHostScan = now + 1f;
-        var allocators = new List<FishAllocator>();
-        foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(FindObjectsSortMode.None))
+        _allocatorScratch.Clear();
+        foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
             if (allocator != null)
-                allocators.Add(allocator);
+                _allocatorScratch.Add(allocator);
         }
 
-        var allocatorByFish = new Dictionary<FishAISystem, FishAllocator>();
-        foreach (var allocator in allocators)
+        _allocatorByFishScratch.Clear();
+        foreach (var allocator in _allocatorScratch)
         {
             var fishs = allocator.GetInstancedFishs;
             if (fishs == null)
                 continue;
             foreach (var fish in fishs)
             {
-                if (fish != null && !fish.IsFishCaptured && !_hostRemovedFish.Contains(fish))
-                    allocatorByFish.TryAdd(fish, allocator);
+                if (fish != null && ManifestEntryEligible(fish.IsFishCaptured) &&
+                    !_hostRemovedFish.Contains(fish))
+                    _allocatorByFishScratch.TryAdd(fish, allocator);
             }
         }
 
         var topologyChanged = false;
-        var staleFish = new List<FishAISystem>();
+        _staleFishScratch.Clear();
         foreach (var pair in _hostIdsByFish)
         {
-            if (!allocatorByFish.ContainsKey(pair.Key))
-                staleFish.Add(pair.Key);
+            var id = pair.Value;
+            if (pair.Key == null)
+                _staleFishScratch.Add(pair.Key);
+            else if (_allocatorByFishScratch.ContainsKey(pair.Key))
+            {
+                if (_hostInfoById.TryGetValue(id, out var seenInfo))
+                    seenInfo.MissingScans = 0;
+            }
+            else if (!_hostInfoById.TryGetValue(id, out var missingInfo))
+                _staleFishScratch.Add(pair.Key);
+            else
+            {
+                missingInfo.MissingScans = NextMissingScans(missingInfo.MissingScans, false);
+                if (ShouldRemoveMissingFish(false, missingInfo.MissingScans))
+                    _staleFishScratch.Add(pair.Key);
+            }
         }
-        foreach (var fish in staleFish)
+        foreach (var fish in _staleFishScratch)
         {
             var id = _hostIdsByFish[fish];
-            session.SendFishRemoved(new FishRemoved(
-                sceneId, session.LocalSceneEpoch, id, NextRevision(_fishTick)));
+            SendHostDespawn(session, sceneId, id);
             RemoveHostFish(id);
-            topologyChanged = true;
         }
 
-        foreach (var pair in allocatorByFish)
+        foreach (var pair in _allocatorByFishScratch)
         {
             var fish = pair.Key;
             var allocator = pair.Value;
@@ -500,6 +1578,7 @@ internal sealed class FishReplicator
             if (fishDataTID <= 0)
                 continue;
             var uid = GetNetworkAllocatorUid(sceneId, allocator);
+            var active = fish.gameObject.activeInHierarchy;
 
             if (!_hostIdsByFish.TryGetValue(fish, out var id))
             {
@@ -509,7 +1588,10 @@ internal sealed class FishReplicator
             _hostFishById[id] = fish;
             if (!_hostInfoById.TryGetValue(id, out var info))
             {
-                info = new HostFish();
+                info = CreateHostFish(fish, uid, fishDataTID, active);
+                info.Revision = 1;
+                info.Phase = HostPhase(fish);
+                info.LastHp = Mathf.Max(0f, fish.HP);
                 _hostInfoById.Add(id, info);
                 topologyChanged = true;
             }
@@ -518,6 +1600,22 @@ internal sealed class FishReplicator
             info.Fish = fish;
             info.AllocatorUid = uid;
             info.FishDataTID = fishDataTID;
+            info.MissingScans = 0;
+            FishBehaviorTreeState.ObserveActive(fish);
+            var poolLifecycle = UpdatePoolActive(info, active);
+            if (poolLifecycle.HasValue)
+            {
+                info.Revision = NextRevision(info.Revision);
+                SendHostLifecycle(session, sceneId, id, info, poolLifecycle.Value);
+                if (active)
+                {
+                    _fishInterestEnters++;
+                    SendImmediateHostSnapshot(session, sceneId, id, info);
+                }
+                else
+                    _fishInterestLeaves++;
+                _trace?.Write("POOL-ACTIVE", $"id={id} active={active}");
+            }
         }
 
         if (_lastHostCount != _hostFishById.Count)
@@ -528,12 +1626,7 @@ internal sealed class FishReplicator
             _lastHostCount = _hostFishById.Count;
         }
         if (_manifestRevision == 0 || topologyChanged)
-        {
-            _manifestRevision = NextRevision(_manifestRevision);
-            foreach (var info in _hostInfoById.Values)
-                info.ManifestQueued = false;
-            _manifestStateQueued = false;
-        }
+            MarkHostTopologyChanged();
     }
 
     private void StimulateHostFishForRemotePlayer(
@@ -544,23 +1637,35 @@ internal sealed class FishReplicator
     {
         if (remotePlayerTransform == null ||
             !TryGetRemotePlayer(session, sceneId, now, out var remotePlayer))
+        {
+            _remoteStimulatedIds.Clear();
+            _nextRemoteThreatById.Clear();
             return;
+        }
 
         foreach (var pair in _hostFishById)
         {
             var id = pair.Key;
             var fish = pair.Value;
             if (fish == null || !fish.gameObject.activeInHierarchy || fish.IsCorpse ||
-                fish.IsFishCaptured ||
-                _nextRemoteStimulusById.TryGetValue(id, out var next) && now < next)
+                fish.IsFishCaptured)
                 continue;
-            _nextRemoteStimulusById[id] = now + RemoteStimulusInterval;
 
             try
             {
-                if (!IsInsideEnemySensor(fish, remotePlayer, out var distance))
+                var center = fish.SensorCenterPoint;
+                var distance = Vector2.Distance(
+                    center, new Vector2(remotePlayer.X, remotePlayer.Y));
+                var aggressive = fish.IsAggressive;
+                var active = _remoteStimulatedIds.Contains(id);
+                var nextRefresh = _nextRemoteThreatById.TryGetValue(id, out var due) ? due : 0f;
+                var decision = RemoteThreatPolicy(
+                    aggressive, NativeSensorRadius(fish), distance, active, now, nextRefresh);
+                if (!decision.Inside || aggressive &&
+                    !IsInsideEnemySensor(fish, remotePlayer, out distance))
                 {
                     _remoteStimulatedIds.Remove(id);
+                    _nextRemoteThreatById.Remove(id);
                     continue;
                 }
 
@@ -575,18 +1680,58 @@ internal sealed class FishReplicator
                 }
 
                 WakeHostFish(fish, id);
-                if (currentTarget != remotePlayerTransform)
+                if (aggressive)
                 {
-                    fish.OnEnemyDetected(new EnemyDetectSensorData(
-                        remotePlayerTransform,
-                        new Vector2(remotePlayer.X, remotePlayer.Y),
-                        distance,
-                        EnumDectectionType.Player));
+                    if (currentTarget != remotePlayerTransform)
+                        fish.OnEnemyDetected(new EnemyDetectSensorData(
+                            remotePlayerTransform,
+                            new Vector2(remotePlayer.X, remotePlayer.Y),
+                            distance,
+                            EnumDectectionType.Player));
+                    else if (current != null)
+                    {
+                        current.Distance = distance;
+                        current.HitPoint = new Vector2(remotePlayer.X, remotePlayer.Y);
+                    }
                 }
-                else if (current != null)
+                else if (decision.Enter)
                 {
-                    current.Distance = distance;
-                    current.HitPoint = new Vector2(remotePlayer.X, remotePlayer.Y);
+                    fish.OnUnderAttack(remotePlayerTransform);
+                    if (currentTarget == remotePlayerTransform && current != null)
+                    {
+                        current.Distance = distance;
+                        current.HitPoint = new Vector2(remotePlayer.X, remotePlayer.Y);
+                    }
+                    else
+                        fish.OnEnemyDetected(new EnemyDetectSensorData(
+                            remotePlayerTransform,
+                            new Vector2(remotePlayer.X, remotePlayer.Y),
+                            distance,
+                            EnumDectectionType.Player));
+                    _nextRemoteThreatById[id] = now + RemoteThreatRefreshSeconds;
+                    _trace?.Write("THREAT-REMOTE",
+                        $"id={id} type={fish.FishDataTID} distance={distance:F2} " +
+                        $"radius={Mathf.Max(NativeSensorRadius(fish), RemoteFearEnterRadius):F2} " +
+                        "refresh=false");
+                }
+                else if (decision.Refresh)
+                {
+                    if (currentTarget == remotePlayerTransform && current != null)
+                    {
+                        current.Distance = distance;
+                        current.HitPoint = new Vector2(remotePlayer.X, remotePlayer.Y);
+                    }
+                    else
+                        fish.OnEnemyDetected(new EnemyDetectSensorData(
+                            remotePlayerTransform,
+                            new Vector2(remotePlayer.X, remotePlayer.Y),
+                            distance,
+                            EnumDectectionType.Player));
+                    _nextRemoteThreatById[id] = now + RemoteThreatRefreshSeconds;
+                    _trace?.Write("THREAT-REMOTE",
+                        $"id={id} type={fish.FishDataTID} distance={distance:F2} " +
+                        $"radius={Mathf.Max(NativeSensorRadius(fish), RemoteFearEnterRadius):F2} " +
+                        "refresh=true");
                 }
 
                 if (_remoteStimulatedIds.Add(id))
@@ -646,8 +1791,21 @@ internal sealed class FishReplicator
             Mathf.Abs(dx) <= size.x * 0.5f && Mathf.Abs(dy) <= size.y * 0.5f;
     }
 
+    private static float NativeSensorRadius(FishAISystem fish)
+    {
+        if (!fish.IsEnableEnemyDetectSensor)
+            return 0f;
+        var spec = fish.GetFishSpecData;
+        if (spec == null || spec.EnemyDetectType == EnumEnemyDetectType.None)
+            return 0f;
+        return spec.EnemyDetectType == EnumEnemyDetectType.CircleOverlap
+            ? Mathf.Max(0f, spec.EnemyCircleSensorRadius)
+            : Mathf.Max(0f, Mathf.Max(spec.EnemyBoxSensorSize.x, spec.EnemyBoxSensorSize.y) * 0.5f);
+    }
+
     private void WriteHostSummary(float now)
     {
+        WriteFishTraffic(now);
         if (now < _nextTraceSummary)
             return;
         _nextTraceSummary = now + 2f;
@@ -667,97 +1825,573 @@ internal sealed class FishReplicator
         }
         _trace?.Write("FISH-SUMMARY",
             $"known={_hostFishById.Count} active={active} enabled={enabled} " +
-            $"sleeping={sleeping} remoteTargets={_remoteStimulatedIds.Count}");
+            $"sleeping={sleeping} remoteTargets={_remoteStimulatedIds.Count} " +
+            $"manifestRevision={_manifestRevision} queued={CountQueuedManifests()}");
     }
 
-    private void SendFishManifests(UdpSession session, uint sceneId)
+    private void WriteFishTraffic(float now)
     {
+        if (now < _nextFishTrafficTrace)
+            return;
+        _nextFishTrafficTrace = now + 5f;
+        _trace?.Write("FISH-TRAFFIC",
+            $"bytes={_fishSnapshotBytes} packets={_fishSnapshotPackets} " +
+            $"entities={_fishSnapshotsSent} overdue={_fishOverdueSnapshots} " +
+            $"controlDeferred={_fishControlPacketsDeferred} " +
+            $"enters={_fishInterestEnters} leaves={_fishInterestLeaves}");
+        _fishSnapshotBytes = 0;
+        _fishSnapshotPackets = 0;
+        _fishSnapshotsSent = 0;
+        _fishInterestEnters = 0;
+        _fishInterestLeaves = 0;
+        _fishOverdueSnapshots = 0;
+        _fishControlPacketsDeferred = 0;
+    }
+
+    private void SendFishControl(UdpSession session, uint sceneId)
+    {
+        var budget = FishControlSendBudget(session.ReliableCapacityRemaining);
+        while (budget > 0 && _pendingHostLifecycles.Count > 0)
+        {
+            if (!session.SendFishLifecycle(_pendingHostLifecycles.Peek()))
+                break;
+            _pendingHostLifecycles.Dequeue();
+            budget--;
+        }
+
         foreach (var pair in _hostInfoById)
         {
+            if (budget == 0)
+                break;
             var info = pair.Value;
             var fish = info.Fish;
-            if (fish == null || !fish.gameObject.activeInHierarchy || info.ManifestQueued)
+            if (info.ManifestQueued || fish == null)
                 continue;
             var position = fish.transform.position;
             var manifest = new FishManifest(
                 sceneId, session.LocalSceneEpoch, _manifestRevision, pair.Key,
-                _fishTick == 0 ? 1u : _fishTick, info.AllocatorUid, info.FishDataTID,
+                info.Revision, info.AllocatorUid, info.FishDataTID,
                 position.x, position.y, position.z, fish.Rotation,
-                Mathf.Max(0f, fish.HP), BuildFlags(fish));
+                Mathf.Max(0f, fish.HP),
+                BuildManifestFlags(BuildFlags(fish, info.Phase), info.Interested));
             if (!session.SendFishManifest(manifest))
-                return;
+                break;
             info.ManifestQueued = true;
+            budget--;
         }
-        if (!_manifestStateQueued && AllCurrentManifestsQueued() &&
+        var queuedCount = CountQueuedManifests();
+        if (budget > 0 && !_manifestStateQueued && queuedCount == _hostInfoById.Count &&
+            queuedCount <= ushort.MaxValue &&
             session.SendFishManifestState(new FishManifestState(
                 sceneId, session.LocalSceneEpoch, _manifestRevision,
-                (ushort)Math.Min(ushort.MaxValue, _hostInfoById.Count))))
+                (ushort)queuedCount)))
+        {
             _manifestStateQueued = true;
+            budget--;
+        }
+        if (_pendingHostLifecycles.Count > 0 || !_manifestStateQueued)
+            _fishControlPacketsDeferred++;
     }
 
-    private void ApplyHostDamage(
+    private void ApplyHostAction(
         UdpSession session,
         uint sceneId,
         float now,
         Transform remotePlayerTransform,
-        FishDamageRequest request)
+        FishActionRequest request)
     {
-        if (request.SceneId != sceneId)
+        if (_ledger?.TryGetCommittedFishLoot(request.RequestId, out var committed) == true)
         {
-            _trace?.Write("DAMAGE-REJECT",
-                $"id={request.Id} reason=scene request={request.SceneId:X8} local={sceneId:X8}");
+            SendCommittedFishLoot(session, committed);
             return;
         }
-        if (!TryGetRemotePlayer(session, sceneId, now, out var remotePlayer))
+        if (_hostActionAcks.TryGetValue(request.RequestId, out var cached))
         {
-            _trace?.Write("DAMAGE-REJECT", $"id={request.Id} reason=stale-player");
+            session.SendFishActionAck(cached);
             return;
         }
+        if (!TryMarkProcessedRequest(
+                _hostProcessedRequests, ref _highestHostRequestId,
+                request.RequestId, ProcessedRequestWindow))
+        {
+            SendHostActionAck(session, now, BuildHostActionAck(
+                session, sceneId, request, FishActionResult.Rejected,
+                FishActionRejectReason.Duplicate));
+            return;
+        }
+        foreach (var requestId in new List<ulong>(_hostActionAcks.Keys))
+            if (!_hostProcessedRequests.Contains(requestId))
+            {
+                _hostActionAcks.Remove(requestId);
+            }
+
+        var scopeValid = request.SceneId == sceneId &&
+            request.SceneEpoch == session.LocalSceneEpoch;
         if (!_hostFishById.TryGetValue(request.Id, out var fish))
         {
             RefreshHostFish(session, sceneId, now);
             _hostFishById.TryGetValue(request.Id, out fish);
         }
-        var rejectReason = fish == null ? "missing" :
-            fish.IsCorpse ? "corpse" :
-            fish.IsFishCaptured ? "captured" :
-            !Enum.IsDefined(typeof(EElement), request.Element) ? "element" :
-            !Enum.IsDefined(typeof(AttackType), request.AttackType) ||
-            !IsPlayerAttack((AttackType)request.AttackType) ? "attack" :
-            !InRange(fish.transform.position, remotePlayer, 1600f) ? "range" : null;
-        if (rejectReason != null)
+        _hostInfoById.TryGetValue(request.Id, out var info);
+        if (info != null && fish != null)
+            info.Phase = ObservedHostPhase(request.Id, info, fish, now);
+
+        var leaseActive = _hostHookLeases.TryGetValue(request.Id, out var hookLease) &&
+            now < hookLease.Expires;
+        var leaseMatches = LeaseIdentityMatches(
+            request.Action, leaseActive ? hookLease.RequestId : 0, request.LeaseId);
+        var isHookAction = request.Action is FishAction.Hook or FishAction.Qte or
+            FishAction.Release or FishAction.Capture;
+        FishActionRejectReason rejectReason;
+        if (!scopeValid)
+            rejectReason = FishActionRejectReason.SceneMismatch;
+        else if (fish == null || info == null)
+            rejectReason = FishActionRejectReason.MissingFish;
+        else if (!RevisionMatches(request.KnownRevision, info.Revision))
+            rejectReason = FishActionRejectReason.StaleRevision;
+        else if (request.Action is FishAction.Damage or FishAction.Qte
+                      ? !ValidDamagePayload(request)
+                      : request.Action is not (FishAction.Hook or FishAction.Release or
+                          FishAction.Capture or FishAction.CorpsePickup))
+            rejectReason = FishActionRejectReason.InvalidAction;
+        else if (request.Action == FishAction.Damage && !IsDamageablePhase(info.Phase) ||
+                 request.Action == FishAction.CorpsePickup &&
+                     info.Phase is not (FishPhase.Corpse or FishPhase.Captured) ||
+                 isHookAction && (!leaseMatches ||
+                     !HostActionStateValid(request.Action, info.Phase, leaseActive)))
+            rejectReason = FishActionRejectReason.InvalidState;
+        else if (ActionRangeSquared(request.Action) is { } range &&
+                 (!TryGetRemotePlayer(session, sceneId, now, out var remotePlayer) ||
+                  !InRange(fish.transform.position, remotePlayer, range)) ||
+                 (request.Action is FishAction.Damage or FishAction.Qte
+                      ? _lastRemoteDamageById.TryGetValue(request.Id, out var lastDamage) &&
+                        now - lastDamage < MinDamageIntervalSeconds
+                      : _lastRemoteHookActionById.TryGetValue(request.Id, out var lastAction) &&
+                        now - lastAction < MinHookActionIntervalSeconds))
+            rejectReason = FishActionRejectReason.OutOfRange;
+        else
+            rejectReason = FishActionRejectReason.None;
+
+        if (rejectReason != FishActionRejectReason.None)
         {
-            _log.LogWarning($"Network fish damage rejected: id={request.Id}");
-            _trace?.Write("DAMAGE-REJECT", $"id={request.Id} reason={rejectReason}");
+            if (info != null && ShouldCancelLeaseOnReject(request.Action, leaseMatches))
+                CancelHostHookLease(session, sceneId, request.Id, info);
+            var rejected = BuildHostActionAck(
+                session, sceneId, request, FishActionResult.Rejected, rejectReason);
+            SendHostActionAck(session, now, rejected);
+            _trace?.Write("DAMAGE-REJECT",
+                $"request={request.RequestId} id={request.Id} reason={rejectReason}");
+            return;
+        }
+
+        if (request.Action is FishAction.Capture or FishAction.CorpsePickup)
+        {
+            ApplyHostLootAction(session, sceneId, request, fish, info);
             return;
         }
 
         var hpBefore = fish.HP;
         try
         {
-            WakeHostFish(fish, request.Id);
-            if (remotePlayerTransform != null)
-                fish.OnUnderAttack(remotePlayerTransform);
-            if ((AttackType)request.AttackType == AttackType.QTE_Damage)
-                fish.SetHPDamageQTE(request.Damage, (EElement)request.Element);
+            if (request.Action is FishAction.Damage or FishAction.Qte)
+            {
+                WakeHostFish(fish, request.Id);
+                if (remotePlayerTransform != null)
+                    fish.OnUnderAttack(remotePlayerTransform);
+                if (request.Action == FishAction.Qte)
+                    fish.SetHPDamageQTE(request.Damage, (EElement)request.Element);
+                else
+                    fish.SetHPDamage(
+                        request.Damage, (EElement)request.Element, (AttackType)request.AttackType);
+                _lastRemoteDamageById[request.Id] = now;
+            }
             else
-                fish.SetHPDamage(
-                    request.Damage, (EElement)request.Element, (AttackType)request.AttackType);
+                _lastRemoteHookActionById[request.Id] = now;
+
+            switch (request.Action)
+            {
+                case FishAction.Hook:
+                    if (!BeginHostHookLease(request.Id, request.RequestId, fish, now))
+                        throw new InvalidOperationException("fish behavior tree state is unavailable");
+                    info.Phase = FishPhase.Hooked;
+                    break;
+                case FishAction.Qte:
+                    RenewHostHookLease(
+                        _hostHookLeases, request.Id, request.LeaseId, now);
+                    info.Phase = fish.HP <= 0f ? FishPhase.Corpse : FishPhase.Qte;
+                    break;
+                case FishAction.Release:
+                    EndHostHookLease(request.Id);
+                    info.Phase = FishPhase.Alive;
+                    break;
+                default:
+                    info.Phase = ObservedHostPhase(request.Id, info, fish, now);
+                    break;
+            }
             _nextSend = 0f;
+            _fishTick = NextRevision(_fishTick);
+            info.Revision = NextRevision(info.Revision);
+            var accepted = BuildHostActionAck(
+                session, sceneId, request, FishActionResult.Accepted,
+                FishActionRejectReason.None);
+            SendHostActionAck(session, now, accepted);
+            SendHostLifecycle(session, sceneId, request.Id, info, FishLifecycleKind.Phase);
+            SendImmediateHostSnapshot(session, sceneId, request.Id, info);
             _log.LogDebug(
                 $"Network fish damage: id={request.Id}; damage={request.Damage}; hp={fish.HP:F1}");
-            _trace?.Write("DAMAGE-APPLY",
+            _trace?.Write("FISH-ACTION-APPLY",
                 $"id={request.Id} type={fish.FishDataTID} damage={request.Damage} " +
                 $"attack={(AttackType)request.AttackType} hp={hpBefore:F1}->{fish.HP:F1} " +
                 $"corpse={fish.IsCorpse} enabled={fish.IsFishEnable}");
-            _lastRemoteDamageById[request.Id] = now;
         }
         catch (Exception exception)
         {
+            if (request.Action == FishAction.Hook)
+            {
+                EndHostHookLease(request.Id);
+                if (info != null)
+                    info.Phase = FishPhase.Alive;
+            }
+            else if (info != null && ShouldCancelLeaseOnReject(request.Action, leaseMatches))
+                CancelHostHookLease(session, sceneId, request.Id, info);
+            SendHostActionAck(session, now, BuildHostActionAck(
+                session, sceneId, request, FishActionResult.Rejected,
+                FishActionRejectReason.InternalError));
             _log.LogWarning($"Network fish damage failed: id={request.Id}; {exception.Message}");
             _trace?.Write("DAMAGE-ERROR",
                 $"id={request.Id} hp={hpBefore:F1} error={exception.GetType().Name}:{exception.Message}");
         }
+    }
+
+    private void ApplyHostLootAction(
+        UdpSession session,
+        uint sceneId,
+        FishActionRequest request,
+        FishAISystem fish,
+        HostFish info)
+    {
+        var revision = NextRevision(info.Revision);
+        var hp = Math.Max(0f, fish.HP);
+        var transactionId = NextRequestId(ref _nextHostTransactionId);
+        if (_ledger == null ||
+            session.ReliableCapacityRemaining < RemoteCatchLedger.MaxFishGrantEntries + 1 ||
+            !_ledger.CanBeginFishTransaction())
+        {
+            if (request.Action == FishAction.Capture)
+                CancelHostHookLease(session, sceneId, request.Id, info);
+            SendHostActionAck(session, Time.realtimeSinceStartup, BuildHostActionAck(
+                session, sceneId, request, FishActionResult.Rejected,
+                FishActionRejectReason.Capacity));
+            return;
+        }
+        CommittedFishLoot transaction;
+        _hostTransactionalPickup = true;
+        try
+        {
+            if (!_ledger.CaptureFishTransaction(
+                    transactionId, sceneId, session.LocalSceneEpoch, request.RequestId,
+                    request.Id, revision, request.Action, hp,
+                    request.Action == FishAction.Capture ? FishPhase.Captured : FishPhase.Corpse,
+                    fish, () => fish.SuccessNetPickupFish(true), out transaction))
+            {
+                if (request.Action == FishAction.Capture)
+                    CancelHostHookLease(session, sceneId, request.Id, info);
+                SendHostActionAck(session, Time.realtimeSinceStartup, BuildHostActionAck(
+                    session, sceneId, request, FishActionResult.Rejected,
+                    FishActionRejectReason.InternalError));
+                return;
+            }
+        }
+        finally
+        {
+            _hostTransactionalPickup = false;
+        }
+
+        EndHostHookLease(request.Id);
+        info.Revision = revision;
+        info.Phase = request.Action == FishAction.Capture
+            ? FishPhase.Captured : FishPhase.Corpse;
+        _hostRemovedFish.Add(fish);
+        SendCommittedFishLoot(session, transaction);
+        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+            sceneId, session.LocalSceneEpoch, request.Id, revision,
+            FishLifecycleKind.Despawn, 0, FishPhase.None, 0f));
+        RemoveHostFish(request.Id);
+        ProbeBehaviour.Instance?.RefreshMissionAfterNativeChange();
+        _trace?.Write("FISH-LOOT-COMMIT",
+            $"transaction={transactionId} request={request.RequestId} id={request.Id} " +
+            $"action={request.Action} entries={transaction.Grants.Count}");
+    }
+
+    private static bool SendCommittedFishLoot(UdpSession session, CommittedFishLoot transaction) =>
+        TrySendCommittedFishLoot(
+            transaction, session.LocalSceneEpoch, session.ConnectionId,
+            session.SendFishLootGrant, session.SendFishActionAck);
+
+    private static bool TrySendCommittedFishLoot(
+        CommittedFishLoot transaction,
+        uint sceneEpoch,
+        ulong sessionId,
+        Func<FishLootGrant, bool> sendGrant,
+        Func<FishActionAck, bool> sendAck)
+    {
+        if (sessionId == 0)
+            return false;
+        foreach (var grant in RemoteCatchLedger.RebaseGrants(transaction, sceneEpoch))
+            if (!sendGrant(grant))
+                return false;
+        if (!sendAck(RemoteCatchLedger.RebaseAck(transaction, sceneEpoch)))
+            return false;
+        RemoteCatchLedger.MarkSent(transaction, sessionId);
+        return true;
+    }
+
+    private FishActionAck BuildHostActionAck(
+        UdpSession session,
+        uint sceneId,
+        FishActionRequest request,
+        FishActionResult result,
+        FishActionRejectReason reason)
+    {
+        if (!_hostInfoById.TryGetValue(request.Id, out var info) || info.Fish == null)
+            return new FishActionAck(
+                request.RequestId, sceneId, session.LocalSceneEpoch, request.Id, 0,
+                request.Action, FishActionResult.Rejected, FishActionRejectReason.MissingFish,
+                0f, FishPhase.None);
+        return new FishActionAck(
+            request.RequestId, sceneId, session.LocalSceneEpoch, request.Id, info.Revision,
+                request.Action, result, reason, Mathf.Max(0f, info.Fish.HP), info.Phase);
+    }
+
+    private void SendHostActionAck(UdpSession session, float now, FishActionAck ack)
+    {
+        _hostActionAcks[ack.RequestId] = ack;
+        session.SendFishActionAck(ack);
+    }
+
+    private static bool ValidDamagePayload(FishActionRequest request)
+    {
+        if (request.Damage is < 1 or > 10_000 ||
+            !Enum.IsDefined(typeof(EElement), request.Element))
+            return false;
+        return request.Action == FishAction.Qte
+            ? request.AttackType == 0
+            : Enum.IsDefined(typeof(AttackType), request.AttackType) &&
+              IsPlayerAttack((AttackType)request.AttackType) &&
+              (AttackType)request.AttackType != AttackType.QTE_Damage;
+    }
+
+    private static bool IsDamageablePhase(FishPhase phase) =>
+        phase is FishPhase.Alive or FishPhase.Hooked or FishPhase.Qte;
+
+    private static FishPhase HostPhase(FishAISystem fish) =>
+        fish.IsFishCaptured ? FishPhase.Captured :
+        fish.IsCorpse || fish.HP <= 0f ? FishPhase.Corpse :
+        fish.IsFishHooked || fish.IsFishHookedSequence ? FishPhase.Hooked : FishPhase.Alive;
+
+    private FishPhase ObservedHostPhase(
+        int id, HostFish info, FishAISystem fish, float now)
+    {
+        var native = HostPhase(fish);
+        if (native is FishPhase.Corpse or FishPhase.Captured)
+            return native;
+        if (info.Phase == FishPhase.Captured)
+            return info.Phase;
+        return _hostHookLeases.TryGetValue(id, out var lease) && now < lease.Expires
+            ? info.Phase
+            : native;
+    }
+
+    private void ExpireHostHookLeases(UdpSession session, uint sceneId, float now)
+    {
+        foreach (var pair in new List<KeyValuePair<int, HostHookLease>>(_hostHookLeases))
+        {
+            if (now < pair.Value.Expires)
+                continue;
+            EndHostHookLease(pair.Key);
+            if (!_hostInfoById.TryGetValue(pair.Key, out var info) ||
+                info.Phase is not (FishPhase.Hooked or FishPhase.Qte))
+                continue;
+            info.Phase = FishPhase.Alive;
+            info.Revision = NextRevision(info.Revision);
+            SendHostLifecycle(session, sceneId, pair.Key, info, FishLifecycleKind.Phase);
+        }
+    }
+
+    private void CancelHostHookLease(
+        UdpSession session, uint sceneId, int id, HostFish info)
+    {
+        var removed = EndHostHookLease(id);
+        if (!removed && info.Phase is not FishPhase.Captured)
+            return;
+        if (info.Phase is FishPhase.Hooked or FishPhase.Qte or FishPhase.Captured)
+            info.Phase = FishPhase.Alive;
+        info.Revision = NextRevision(info.Revision);
+        _nextSend = 0f;
+        SendHostLifecycle(session, sceneId, id, info, FishLifecycleKind.Phase);
+    }
+
+    private void ResetHostActions()
+    {
+        foreach (var id in new List<int>(_hostHookLeases.Keys))
+        {
+            if (_hostInfoById.TryGetValue(id, out var info) &&
+                info.Phase is FishPhase.Hooked or FishPhase.Qte)
+                info.Phase = FishPhase.Alive;
+            EndHostHookLease(id);
+        }
+        _hostActionAcks.Clear();
+        _hostProcessedRequests.Clear();
+        _lastRemoteDamageById.Clear();
+        _lastRemoteHookActionById.Clear();
+        _highestHostRequestId = 0;
+    }
+
+    private bool BeginHostHookLease(
+        int id, ulong requestId, FishAISystem fish, float now)
+    {
+        EndHostHookLease(id);
+        FishBehaviorTreeState.ObserveActive(fish);
+        if (!FishBehaviorTreeState.TryGet(fish, out var behaviorEnabled))
+            return false;
+        try
+        {
+            if (behaviorEnabled)
+                FishBehaviorTreeState.Set(fish, false);
+        }
+        catch (Exception exception)
+        {
+            _trace?.Write("HOOK-POSE-SUSPEND-ERROR",
+                $"id={id} error={exception.GetType().Name}:{exception.Message}");
+            try
+            {
+                FishBehaviorTreeState.Set(fish, behaviorEnabled);
+            }
+            catch (Exception restoreException)
+            {
+                _trace?.Write("HOOK-POSE-RESTORE-ERROR",
+                    $"id={id} error={restoreException.GetType().Name}:{restoreException.Message}");
+            }
+            return false;
+        }
+        var lease = new HostHookLease(requestId, now + HookLeaseSeconds, behaviorEnabled)
+        {
+            LastPoseTime = now
+        };
+        _hostHookLeases[id] = lease;
+        return true;
+    }
+
+    private bool EndHostHookLease(int id)
+    {
+        return TryEndHostHookLease(_hostHookLeases, id, lease =>
+        {
+            if (!_hostFishById.TryGetValue(id, out var fish) || fish == null)
+                return;
+            try
+            {
+                FishBehaviorTreeState.Set(fish, lease.BehaviorEnabled);
+            }
+            catch (Exception exception)
+            {
+                _trace?.Write("HOOK-POSE-RESTORE-ERROR",
+                    $"id={id} error={exception.GetType().Name}:{exception.Message}");
+            }
+        });
+    }
+
+    private static bool TryEndHostHookLease(
+        Dictionary<int, HostHookLease> leases, int id, Action<HostHookLease> restore)
+    {
+        if (!leases.Remove(id, out var lease))
+            return false;
+        restore(lease);
+        return true;
+    }
+
+    private void ApplyHostHookPose(
+        UdpSession session, uint sceneId, float now, FishHookPose pose)
+    {
+        if (!_hostHookLeases.TryGetValue(pose.FishId, out var lease) ||
+            !_hostFishById.TryGetValue(pose.FishId, out var fish) || fish == null ||
+            !HookPoseIdentityValid(
+                pose, sceneId, session.LocalSceneEpoch, pose.FishId, lease.RequestId) ||
+            now >= lease.Expires ||
+            !TryGetRemotePlayer(session, sceneId, now, out var remotePlayer) ||
+            !HookPoseWithinPlayer(pose, remotePlayer) ||
+            !HookPoseVelocityPlausible(pose) ||
+            (lease.HasPose
+                ? !HookPoseMotionPlausible(lease.LastPose, pose, now - lease.LastPoseTime)
+                : !HookPoseFromCurrentPlausible(
+                    fish.transform.position, pose, now - lease.LastPoseTime)))
+            return;
+
+        fish.transform.position = new Vector3(pose.X, pose.Y, pose.Z);
+        fish.Rotation = pose.Rotation;
+        var body = fish.GetComponent<Rigidbody2D>();
+        if (body != null)
+            body.velocity = new Vector2(pose.VelocityX, pose.VelocityY);
+        lease.LastPose = pose;
+        lease.LastPoseTime = now;
+        lease.HasPose = true;
+        _nextSend = 0f;
+    }
+
+    private void SendHostLifecycle(
+        UdpSession session,
+        uint sceneId,
+        int id,
+        HostFish info,
+        FishLifecycleKind kind)
+    {
+        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+            sceneId, session.LocalSceneEpoch, id, info.Revision, kind,
+            0,
+            info.Phase, Mathf.Max(0f, info.Fish.HP)));
+    }
+
+    private uint SendHostDespawn(UdpSession session, uint sceneId, int id)
+    {
+        var revision = NextHostRevision(id);
+        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+            sceneId, session.LocalSceneEpoch, id, revision, FishLifecycleKind.Despawn,
+            0, FishPhase.None, 0f));
+        return revision;
+    }
+
+    private uint NextHostRevision(int id)
+    {
+        if (!_hostInfoById.TryGetValue(id, out var info))
+            return 1;
+        info.Revision = NextRevision(info.Revision);
+        return info.Revision;
+    }
+
+    private void SendImmediateHostSnapshot(
+        UdpSession session, uint sceneId, int id, HostFish info)
+    {
+        var fish = info.Fish;
+        var position = fish.transform.position;
+        var velocity = fish.Velocity;
+        var snapshot = new FishSnapshot(
+            sceneId, session.LocalSceneEpoch, _fishTick, id, info.Revision, info.FishDataTID,
+            position.x, position.y, position.z, fish.Rotation,
+            velocity.x, velocity.y, Mathf.Max(0f, fish.HP), BuildFlags(fish, info.Phase));
+        SendImmediateHostSnapshot(session, sceneId, id, info, snapshot);
+    }
+
+    private void SendImmediateHostSnapshot(
+        UdpSession session, uint sceneId, int id, HostFish info, FishSnapshot snapshot)
+    {
+        _snapshotBuffer.Clear();
+        _snapshotBuffer.Add(snapshot);
+        _fishSnapshotBytes += session.SendFishSnapshots(sceneId, _fishTick, _snapshotBuffer);
+        _fishSnapshotsSent++;
+        _fishSnapshotPackets++;
+        info.LastSnapshot = snapshot;
+        info.LastSnapshotSend = Time.realtimeSinceStartup;
+        info.HasSnapshot = true;
+        info.Priority = 0f;
     }
 
     private void ApplyHostPickup(
@@ -786,18 +2420,13 @@ internal sealed class FishReplicator
         var body = fish != null ? fish.GetInteractionBody : null;
         var normalPickup = fish != null && body != null && body.IsEnableInteraction &&
             body.InteractionType == FishInteractionBody.FishInteractionType.Pickup &&
-            InRange(fish.transform.position, remotePlayer, 16f);
-        var recentCapture = fish != null &&
-            _lastRemoteDamageById.TryGetValue(request.Id, out var lastDamage) &&
-            now - lastDamage is >= 0f and <= 12f &&
-            InRange(fish.transform.position, remotePlayer, 1600f);
-        if (!normalPickup && !recentCapture)
+            InRange(fish.transform.position, remotePlayer, CorpsePickupRangeSquared);
+        if (!normalPickup)
         {
             _log.LogWarning($"Network fish pickup rejected: id={request.Id}");
             _trace?.Write("PICKUP-REJECT",
                 $"id={request.Id} reason=state fish={fish != null} body={body != null} " +
-                $"enabled={body?.IsEnableInteraction} type={body?.InteractionType} " +
-                $"recentDamage={recentCapture}");
+                $"enabled={body?.IsEnableInteraction} type={body?.InteractionType}");
             RejectHostPickup(session, request);
             return;
         }
@@ -806,12 +2435,12 @@ internal sealed class FishReplicator
         {
             _hostRemovedFish.Add(fish);
             fish.DestroySelf();
+            var revision = SendHostDespawn(session, sceneId, request.Id);
             session.SendFishPickupResult(new FishPickupResult(
-                sceneId, session.LocalSceneEpoch, request.Id, NextRevision(_fishTick), true));
+                sceneId, session.LocalSceneEpoch, request.Id, revision, true));
             RemoveHostFish(request.Id);
             _log.LogInfo($"Network client fish pickup approved: id={request.Id}");
-            _trace?.Write(recentCapture && !normalPickup ? "CAPTURE-ACCEPT" : "PICKUP-ACCEPT",
-                $"id={request.Id} type={fish.FishDataTID}");
+            _trace?.Write("PICKUP-ACCEPT", $"id={request.Id} type={fish.FishDataTID}");
         }
         catch (Exception exception)
         {
@@ -830,17 +2459,6 @@ internal sealed class FishReplicator
     private void ApplyClientPickupResult(FishPickupResult result, PlayerCharacter player)
     {
         _pendingClientPickups.Remove(result.Id);
-        if (_pendingClientCaptures.Remove(result.Id))
-        {
-            if (result.Accepted)
-            {
-                _removedIds.Add(result.Id);
-                RemoveClientTarget(result.Id, true);
-            }
-            _trace?.Write("CAPTURE-RESULT",
-                $"id={result.Id} accepted={result.Accepted}");
-            return;
-        }
         if (!result.Accepted)
         {
             player?.SuccessInteraction();
@@ -849,7 +2467,7 @@ internal sealed class FishReplicator
             return;
         }
 
-        _removedIds.Add(result.Id);
+        RecordTombstone(result.Id, result.Revision);
         if (!_targets.TryGetValue(result.Id, out var target) || target.Fish == null || player == null)
         {
             player?.SuccessInteraction();
@@ -884,17 +2502,390 @@ internal sealed class FishReplicator
         }
     }
 
-    private void ApplyClientManifest(FishManifest manifest, bool trackManifest = true)
+    private void ApplyClientActionAck(
+        UdpSession session, uint sceneId, uint sceneEpoch, float now, FishActionAck ack,
+        PlayerCharacter player)
     {
-        if (_removedIds.Contains(manifest.Id))
+        if (ack.Action is FishAction.Capture or FishAction.CorpsePickup &&
+            _clientLootRequests.TryGetValue(ack.RequestId, out var lootRequest))
         {
-            _pendingClientManifests.Remove(manifest.Id);
+            if (ack.SceneId != sceneId || ack.SceneEpoch != sceneEpoch ||
+                lootRequest.Request.Id != ack.Id || lootRequest.Request.Action != ack.Action)
+                return;
+            if (_pendingClientActions.Remove(ack.RequestId, out var lootPending))
+                ClearPendingFish(_pendingClientActionByFish, lootPending, ack.RequestId);
+            if (ack.Result == FishActionResult.Rejected)
+            {
+                ReleaseClientLootInteraction(lootRequest, player);
+                _clientLootRequests.Remove(ack.RequestId);
+                _clientLootGrants.Remove(ack.RequestId);
+                _clientGrantActions.Remove(ack.RequestId);
+                _clientGrantFish.Remove(ack.RequestId);
+                if (_targets.TryGetValue(ack.Id, out var rejectedTarget) &&
+                    rejectedTarget.Fish != null && ack.Revision != 0)
+                {
+                    rejectedTarget.Revision = ack.Revision;
+                    rejectedTarget.Hp = ack.Hp;
+                    rejectedTarget.Phase = ack.Phase;
+                    rejectedTarget.Flags = FlagsForPhase(rejectedTarget.Flags, ack.Phase);
+                    ApplyClientState(rejectedTarget);
+                }
+                return;
+            }
+            lootRequest.Ack = ack;
+            if (ack.Action == FishAction.Capture)
+            {
+                _suppressingNativeRecallOutcome = false;
+                var fish = FindClientFish(ack.Id);
+                if (fish != null)
+                    CleanupClientHook(ack.Id, fish);
+                _clientHookLeases.Remove(ack.Id);
+                _queuedClientActions.Remove(ack.Id);
+            }
+            TryApplyClientLootGrant(session, ack.RequestId, player);
             return;
         }
-        if (_targets.TryGetValue(manifest.Id, out var existing) && existing.Fish != null)
+        if (ack.SceneId != sceneId || ack.SceneEpoch != sceneEpoch ||
+            !_pendingClientActions.TryGetValue(ack.RequestId, out var pending) ||
+            pending.Id != ack.Id || pending.Action != ack.Action ||
+            !TryConsumeAck(_pendingClientActions, ack.RequestId))
+            return;
+        ClearPendingFish(_pendingClientActionByFish, pending, ack.RequestId);
+        if (ack.Result == FishActionResult.Rejected &&
+            ack.RejectReason == FishActionRejectReason.MissingFish)
         {
-            if (trackManifest)
-                MarkClientManifestEntry(manifest.Revision, manifest.Id);
+            CleanupClientHook(ack.Id, pending.Fish);
+            _clientHookLeases.Remove(ack.Id);
+            _queuedClientActions.Remove(ack.Id);
+            RemoveClientTarget(ack.Id, true);
+            return;
+        }
+        if (ack.Result == FishActionResult.Accepted && ack.Action == FishAction.Hook)
+        {
+            if (pending.TimedOut)
+                CancelClientHook(session, sceneId, ack.Id, pending.Fish, now);
+            else
+                AcceptClientHookLease(
+                    _clientHookLeases, ack.Id, ack.RequestId, now);
+        }
+        else if (ack.Result == FishActionResult.Accepted && ack.Action == FishAction.Qte)
+            RenewClientHookLease(_clientHookLeases, ack.Id, pending.LeaseId, now);
+        var finishHook = ack.Action is FishAction.Release or FishAction.Capture ||
+            ack.Result == FishActionResult.Rejected &&
+            ack.Action is FishAction.Hook or FishAction.Qte;
+        if (finishHook)
+        {
+            CleanupClientHook(ack.Id, pending.Fish);
+            _clientHookLeases.Remove(ack.Id);
+            _queuedClientActions.Remove(ack.Id);
+        }
+        if (!_targets.TryGetValue(ack.Id, out var target) || target.Fish == null ||
+            target.Revision != 0 && ack.Revision != target.Revision &&
+            !IsNewer(ack.Revision, target.Revision))
+        {
+            TrySendNextClientAction(session, sceneId, pending.Id, pending.Fish, now);
+            return;
+        }
+        target.Revision = ack.Revision;
+        target.Hp = ack.Hp;
+        target.Phase = ack.Phase;
+        target.Flags = FlagsForPhase(target.Flags, ack.Phase);
+        if (!HasActiveClientHookLease(_clientHookLeases, ack.Id, now))
+            ApplyClientState(target);
+        _trace?.Write("FISH-ACTION-ACK",
+            $"request={ack.RequestId} id={ack.Id} result={ack.Result} " +
+            $"reason={ack.RejectReason} revision={ack.Revision} hp={ack.Hp:F1}");
+        TrySendNextClientAction(session, sceneId, pending.Id, pending.Fish, now);
+    }
+
+    private void ApplyClientLootGrant(
+        UdpSession session, uint sceneId, uint sceneEpoch, FishLootGrant grant,
+        PlayerCharacter player)
+    {
+        if (grant.SceneId != sceneId || grant.SceneEpoch != sceneEpoch)
+            return;
+        if (!_clientLootRequests.TryGetValue(grant.RequestId, out var request))
+        {
+            if (_ledger?.HasAppliedFishTransaction(grant.TransactionId) != true)
+                return;
+            request = new ClientLootRequest
+            {
+                Request = new FishActionRequest(
+                    grant.RequestId, grant.SceneId, grant.SceneEpoch, grant.FishId,
+                    grant.Revision, grant.Action == FishAction.Capture ? grant.RequestId : 0,
+                    grant.Action, 0, 0, 0),
+                Started = Time.realtimeSinceStartup,
+                NextReplay = Time.realtimeSinceStartup + ActionTimeoutSeconds,
+                Released = true,
+                Presented = true
+            };
+            _clientLootRequests[grant.RequestId] = request;
+            _clientGrantActions[grant.RequestId] = grant.Action;
+            _clientGrantFish[grant.RequestId] = grant.FishId;
+        }
+        if (request.Request.Id != grant.FishId || request.Request.Action != grant.Action)
+            return;
+        if (!_clientLootGrants.TryGetValue(grant.RequestId, out var assembly))
+        {
+            assembly = new GrantAssembly { Expected = grant.EntryCount };
+            _clientLootGrants[grant.RequestId] = assembly;
+        }
+        if (assembly.Expected != grant.EntryCount)
+            return;
+        var isNew = !assembly.Entries.ContainsKey(grant.Index);
+        assembly.Entries[grant.Index] = grant;
+        if (isNew)
+            request.NextReplay = Time.realtimeSinceStartup + ActionTimeoutSeconds;
+        TryApplyClientLootGrant(session, grant.RequestId, player);
+    }
+
+    private void TryApplyClientLootGrant(
+        UdpSession session, ulong requestId, PlayerCharacter player)
+    {
+        if (!_clientLootRequests.TryGetValue(requestId, out var request) ||
+            request.Ack is not { } ack ||
+            !_clientLootGrants.TryGetValue(requestId, out var assembly) ||
+            assembly.Entries.Count != assembly.Expected)
+            return;
+        var grants = new List<FishLootGrant>(assembly.Expected);
+        for (ushort index = 0; index < assembly.Expected; index++)
+            if (!assembly.Entries.TryGetValue(index, out var grant))
+                return;
+            else
+                grants.Add(grant);
+        if (!RemoteCatchLedger.ExactGrantSet(grants) ||
+            grants[0].RequestId != request.Request.RequestId ||
+            grants[0].FishId != request.Request.Id ||
+            grants[0].Action != request.Request.Action || grants[0].Revision != ack.Revision ||
+            ack.Id != request.Request.Id || ack.Action != request.Request.Action)
+            return;
+
+        if (!request.Presented &&
+            _targets.TryGetValue(grants[0].FishId, out var target) && target.Fish != null)
+        {
+            request.Presented = true;
+            var fish = target.Fish;
+            _ledger?.BeginFishPresentation();
+            ProbeBehaviour.Instance?.BeginClientPresentationLifecycle();
+            _applyingClientPickup = true;
+            try
+            {
+                if (request.Request.Action == FishAction.Capture)
+                    fish.WinFromProjectileinFight();
+                else if (fish.GetInteractionBody != null && player != null)
+                    fish.GetInteractionBody.SuccessInteract(player);
+                else
+                    fish.SuccessNetPickupFish(true);
+            }
+            catch (Exception exception)
+            {
+                _trace?.Write("FISH-PRESENTATION-ERROR",
+                    $"transaction={grants[0].TransactionId} error={exception.Message}");
+            }
+            finally
+            {
+                _applyingClientPickup = false;
+                ProbeBehaviour.Instance?.EndClientPresentationLifecycle();
+                _ledger?.EndFishPresentation();
+            }
+        }
+        if (_ledger?.ApplyFishTransaction(grants) != true)
+            return;
+        var complete = new FishLootComplete(
+            grants[0].TransactionId, grants[0].SceneId, grants[0].SceneEpoch,
+            grants[0].RequestId, grants[0].FishId, grants[0].Revision, grants[0].Action);
+        if (!session.SendFishLootComplete(complete))
+            return;
+        _clientLootGrants.Remove(requestId);
+        _clientGrantActions.Remove(requestId);
+        _clientGrantFish.Remove(requestId);
+        _clientLootRequests.Remove(requestId);
+        RecordTombstone(grants[0].FishId, grants[0].Revision);
+        RemoveClientTarget(grants[0].FishId, true);
+        _trace?.Write("FISH-LOOT-APPLY",
+            $"transaction={grants[0].TransactionId} request={requestId} " +
+            $"id={grants[0].FishId} entries={grants.Count} weight={grants[0].CarriedWeight:F2}");
+    }
+
+    private void UpdateClientLootRequests(
+        UdpSession session, uint sceneId, uint sceneEpoch, float now, PlayerCharacter player)
+    {
+        foreach (var pair in new List<KeyValuePair<ulong, ClientLootRequest>>(_clientLootRequests))
+        {
+            var request = pair.Value;
+            TryApplyClientLootGrant(session, pair.Key, player);
+            if (!_clientLootRequests.ContainsKey(pair.Key))
+                continue;
+            if (!request.Released && now >= request.Started + ActionTimeoutSeconds)
+            {
+                ReleaseClientLootInteraction(request, player);
+                if (_clientTombstones.ContainsKey(request.Request.Id))
+                    RemoveClientTarget(request.Request.Id, true);
+            }
+            if (now < request.NextReplay)
+                continue;
+            request.NextReplay = now + 1f;
+            var replay = request.Request with { SceneEpoch = sceneEpoch };
+            request.Request = replay;
+            session.SendFishActionRequest(replay);
+            _trace?.Write("FISH-LOOT-REPLAY",
+                $"request={pair.Key} id={replay.Id} action={replay.Action}");
+        }
+    }
+
+    private void ReleaseClientLootInteraction(
+        ClientLootRequest request, PlayerCharacter player)
+    {
+        if (request.Released)
+            return;
+        request.Released = true;
+        if (request.Request.Action == FishAction.Capture)
+        {
+            var fish = FindClientFish(request.Request.Id);
+            if (fish != null)
+                CleanupClientHook(request.Request.Id, fish);
+            _clientHookLeases.Remove(request.Request.Id);
+            _queuedClientActions.Remove(request.Request.Id);
+        }
+        player?.SuccessInteraction();
+    }
+
+    private void ExpireClientActions(UdpSession session, uint sceneId, float now)
+    {
+        foreach (var pair in new List<KeyValuePair<ulong, PendingAction>>(_pendingClientActions))
+        {
+            if (!TryExpirePendingAction(
+                    _pendingClientActions, _pendingClientActionByFish,
+                    pair.Key, now, out var expired))
+                continue;
+            _trace?.Write("FISH-ACTION-TIMEOUT", $"request={pair.Key} id={expired.Id}");
+            if (expired.Action == FishAction.Hook)
+            {
+                _queuedClientActions.Remove(expired.Id);
+                ScheduleClientHookCleanup(expired.Id);
+            }
+        }
+        foreach (var pair in new List<KeyValuePair<int, ClientHookLease>>(_clientHookLeases))
+            if (pair.Value.Accepted && now >= pair.Value.Expires && !pair.Value.ReleaseQueued)
+            {
+                if (!_targets.TryGetValue(pair.Key, out var target) || target.Fish == null)
+                {
+                    _clientHookLeases.Remove(pair.Key);
+                    continue;
+                }
+                var queued = EnqueueClientAction(
+                    session, sceneId, pair.Key, target.Fish, FishAction.Release,
+                    0, 0, 0, now);
+                if (TryMarkLeaseActionQueued(pair.Value, FishAction.Release, queued))
+                    ScheduleClientHookCleanup(pair.Key);
+                else
+                    CancelClientHook(session, sceneId, pair.Key, target.Fish, now);
+            }
+        foreach (var pair in new List<KeyValuePair<int, Queue<QueuedAction>>>(_queuedClientActions))
+            if (!_pendingClientActionByFish.ContainsKey(pair.Key) &&
+                _targets.TryGetValue(pair.Key, out var target) && target.Fish != null)
+                TrySendNextClientAction(session, sceneId, pair.Key, target.Fish, now);
+    }
+
+    private void ReceiveClientManifest(uint sceneId, uint sceneEpoch, FishManifest manifest)
+    {
+        if (manifest.SceneId != sceneId || manifest.SceneEpoch != sceneEpoch ||
+            _latestClientManifestRevision != 0 &&
+            manifest.Revision != _latestClientManifestRevision &&
+            !IsNewer(manifest.Revision, _latestClientManifestRevision))
+            return;
+        var assembly = GetManifestAssembly(manifest.SceneId, manifest.SceneEpoch, manifest.Revision);
+        assembly.Entries[manifest.Id] = manifest;
+        TryActivateClientManifest(assembly);
+    }
+
+    private void ReceiveClientManifestState(uint sceneId, uint sceneEpoch, FishManifestState state)
+    {
+        if (state.SceneId != sceneId || state.SceneEpoch != sceneEpoch ||
+            _latestClientManifestRevision != 0 &&
+            state.Revision != _latestClientManifestRevision &&
+            !IsNewer(state.Revision, _latestClientManifestRevision))
+            return;
+        var assembly = GetManifestAssembly(state.SceneId, state.SceneEpoch, state.Revision);
+        assembly.Expected = state.EntryCount;
+        TryActivateClientManifest(assembly);
+    }
+
+    private ManifestAssembly GetManifestAssembly(uint sceneId, uint sceneEpoch, uint revision)
+    {
+        if (!_clientManifestAssemblies.TryGetValue(revision, out var assembly) ||
+            assembly.SceneId != sceneId || assembly.SceneEpoch != sceneEpoch)
+        {
+            assembly = new ManifestAssembly(sceneId, sceneEpoch, revision);
+            _clientManifestAssemblies[revision] = assembly;
+        }
+        return assembly;
+    }
+
+    private void TryActivateClientManifest(ManifestAssembly assembly)
+    {
+        if (!CanActivateManifest(assembly, _latestClientManifestRevision))
+            return;
+
+        RestoreSuppressedClientFish();
+        _latestClientManifestRevision = assembly.Revision;
+        _activeClientManifest.Clear();
+        _pendingClientManifests.Clear();
+        foreach (var pair in assembly.Entries)
+        {
+            _activeClientManifest[pair.Key] = pair.Value;
+            _pendingClientManifests[pair.Key] = pair.Value;
+        }
+        foreach (var id in new List<int>(_targets.Keys))
+            if (!_activeClientManifest.ContainsKey(id))
+                RemoveClientTarget(id, true);
+        var retried = RetryPendingClientManifests(Time.realtimeSinceStartup);
+        var suppressed = retried ? SuppressUnboundClientFish() : 0;
+        foreach (var revision in new List<uint>(_clientManifestAssemblies.Keys))
+            if (revision != assembly.Revision)
+                _clientManifestAssemblies.Remove(revision);
+        _log.LogInfo(
+            $"Network fish manifest applied: scene={assembly.SceneId:X8}; epoch={assembly.SceneEpoch}; " +
+            $"revision={assembly.Revision}; fish={assembly.Expected}; " +
+            $"bound={_targets.Count}; suppressed={suppressed}");
+        _trace?.Write("MANIFEST-COMPLETE",
+            $"scene={assembly.SceneId:X8} epoch={assembly.SceneEpoch} revision={assembly.Revision} " +
+            $"expected={assembly.Expected} bound={_targets.Count} suppressed={suppressed}");
+    }
+
+    private void ApplyClientManifest(
+        FishManifest manifest,
+        Dictionary<(string AllocatorUid, int FishDataTID), List<FishAISystem>> availableFish)
+    {
+        if (_clientTombstones.TryGetValue(manifest.Id, out var removalRevision))
+        {
+            if (RemovalWins(removalRevision, manifest.FishRevision))
+            {
+                _pendingClientManifests.Remove(manifest.Id);
+                return;
+            }
+            _clientTombstones.Remove(manifest.Id);
+        }
+        if (_targets.TryGetValue(manifest.Id, out var existing) && existing.Fish != null &&
+            existing.AllocatorUid == manifest.AllocatorUid &&
+            existing.FishDataTID == manifest.FishDataTID)
+        {
+            if (existing.Revision != 0 && manifest.FishRevision != existing.Revision &&
+                !IsNewer(manifest.FishRevision, existing.Revision))
+            {
+                _pendingClientManifests.Remove(manifest.Id);
+                return;
+            }
+            var revisionAdvanced = existing.Revision == 0 ||
+                IsNewer(manifest.FishRevision, existing.Revision);
+            ApplyManifestBaseline(existing, manifest);
+            ApplySnapshotPhase(existing, manifest.Flags, manifest.Hp, revisionAdvanced);
+            if (ShouldHideClientTarget(
+                    existing.Interested, existing.Fish.gameObject.activeInHierarchy))
+                existing.Fish.gameObject.SetActive(false);
+            if (!HasActiveClientHookLease(
+                    _clientHookLeases, manifest.Id, Time.realtimeSinceStartup))
+                ApplyClientState(existing);
             _pendingClientManifests.Remove(manifest.Id);
             return;
         }
@@ -904,10 +2895,10 @@ internal sealed class FishReplicator
         // Bind only fish created by the game's allocator. Creating or destroying
         // allocator entries while its async spawn routine is enumerating the pool
         // corrupts the native collection and causes a per-frame exception storm.
-        var fish = TakeUnboundFish(manifest);
+        var fish = TakeUnboundFish(manifest, availableFish);
         if (fish == null)
         {
-            if (trackManifest && manifest.Revision != 0)
+            if (manifest.Revision != 0)
                 _pendingClientManifests[manifest.Id] = manifest;
             if (_missingAllocatorIds.Add(manifest.Id))
             {
@@ -920,119 +2911,842 @@ internal sealed class FishReplicator
         }
 
         var localPosition = fish.transform.position;
+        FishBehaviorTreeState.ObserveActive(fish);
+        FishBehaviorTreeState.TryGet(fish, out var nativeBehaviorEnabled);
         var target = new Target
         {
             Fish = fish,
-            Position = new Vector3(manifest.X, manifest.Y, manifest.Z),
-            Rotation = manifest.Rotation,
-            Hp = manifest.Hp,
-            Flags = manifest.Flags,
-            HasSnapshot = true
+            AllocatorUid = manifest.AllocatorUid,
+            FishDataTID = manifest.FishDataTID,
+            Phase = PhaseFromFlags(manifest.Flags, manifest.Hp),
+            NativeActive = fish.gameObject.activeInHierarchy,
+            NativeBehaviorEnabled = nativeBehaviorEnabled
         };
-        fish.transform.position = target.Position;
-        fish.Rotation = target.Rotation;
-        fish.SetHP(target.Hp);
-        ApplyFlags(target);
+        ApplyManifestBaseline(target, manifest);
+        _applyingClientState = true;
+        try
+        {
+            fish.transform.position = target.Position;
+            fish.Rotation = target.Rotation;
+            ApplyClientState(target);
+        }
+        finally
+        {
+            _applyingClientState = false;
+        }
         SetClientSimulation(fish, false, manifest.Id);
+        if (ShouldHideClientTarget(target.Interested, fish.gameObject.activeInHierarchy))
+            fish.gameObject.SetActive(false);
         _targets[manifest.Id] = target;
         _clientIdsByFish[fish] = manifest.Id;
         _pendingClientManifests.Remove(manifest.Id);
         _missingAllocatorIds.Remove(manifest.Id);
-        if (trackManifest)
-            MarkClientManifestEntry(manifest.Revision, manifest.Id);
         _log.LogDebug($"Network fish manifest bound: id={manifest.Id}; type={manifest.FishDataTID}");
         _trace?.Write("BIND",
             $"id={manifest.Id} uid={manifest.AllocatorUid} type={manifest.FishDataTID} " +
             $"instance={fish.GetInstanceID()} " +
             $"offset={Vector3.Distance(localPosition, target.Position):F2} revision={manifest.Revision}");
+        if (_pendingClientLifecycles.TryGetValue(manifest.Id, out var lifecycle))
+            ApplyClientLifecycle(manifest.SceneId, manifest.SceneEpoch, lifecycle);
     }
 
-    private void RetryPendingClientManifests()
+    private bool RetryPendingClientManifests(float now)
     {
-        if (_pendingClientManifests.Count == 0)
-            return;
-        foreach (var manifest in new List<FishManifest>(_pendingClientManifests.Values))
-            ApplyClientManifest(manifest);
-    }
-
-    private void ApplyClientManifestState(FishManifestState state)
-    {
-        if (_latestClientManifestRevision != 0 && state.Revision != _latestClientManifestRevision &&
-            !IsNewer(state.Revision, _latestClientManifestRevision))
-            return;
-        if (_latestClientManifestRevision != state.Revision)
-            RestoreSuppressedClientFish();
-        _latestClientManifestRevision = state.Revision;
-        _clientManifestCounts[state.Revision] = state.EntryCount;
-        if (!_clientManifestIds.ContainsKey(state.Revision))
-            _clientManifestIds.Add(state.Revision, new HashSet<int>());
-        TryFinalizeClientManifest(state.Revision);
-    }
-
-    private void MarkClientManifestEntry(uint revision, int id)
-    {
-        if (!_clientManifestIds.TryGetValue(revision, out var ids))
-        {
-            ids = new HashSet<int>();
-            _clientManifestIds.Add(revision, ids);
-        }
-        ids.Add(id);
-        TryFinalizeClientManifest(revision);
-    }
-
-    private void TryFinalizeClientManifest(uint revision)
-    {
-        if (revision != _latestClientManifestRevision ||
-            !_clientManifestCounts.TryGetValue(revision, out var expected) ||
-            !_clientManifestIds.TryGetValue(revision, out var received) || received.Count < expected ||
-            (_finalizedClientManifestCounts.TryGetValue(revision, out var finalized) && finalized == expected))
-            return;
-
-        _finalizedClientManifestCounts[revision] = expected;
-        var pruned = PruneClientFish(received);
-        var suppressed = SuppressUnboundClientFish();
-        _log.LogInfo(
-            $"Network fish manifest applied: revision={revision}; fish={expected}; " +
-            $"pruned={pruned}; suppressed={suppressed}");
-        _trace?.Write("MANIFEST-COMPLETE",
-            $"revision={revision} expected={expected} bound={received.Count} " +
-            $"pruned={pruned} suppressed={suppressed}");
-    }
-
-    private int PruneClientFish(HashSet<int> manifestIds)
-    {
-        var pruned = 0;
-        foreach (var id in new List<int>(_targets.Keys))
-        {
-            if (manifestIds.Contains(id))
-                continue;
-            RemoveClientTarget(id, true);
-            pruned++;
-        }
-        return pruned;
+        if (_pendingClientManifests.Count == 0 || !ManifestRetryDue(now, _nextClientBind))
+            return false;
+        _nextClientBind = now + 0.1f;
+        IndexAvailableClientFish(_appliedClientSceneId);
+        _manifestScratch.Clear();
+        _manifestScratch.AddRange(_pendingClientManifests.Values);
+        foreach (var manifest in _manifestScratch)
+            ApplyClientManifest(manifest, _availableClientFishScratch);
+        return true;
     }
 
     private void ReleaseClientTargets()
     {
+        foreach (var pair in new List<KeyValuePair<int, ClientHookLease>>(_clientHookLeases))
+        {
+            var fish = FindClientFish(pair.Key);
+            if (fish != null)
+                CleanupClientHook(pair.Key, fish);
+        }
+        _clientHookLeases.Clear();
+        _scheduledClientHookCleanup.Clear();
         foreach (var pair in _targets)
             if (pair.Value.Fish != null)
-                SetClientSimulation(pair.Value.Fish, true, pair.Key);
+                RestoreNativeTarget(pair.Value, pair.Key);
         _targets.Clear();
         _clientIdsByFish.Clear();
+        foreach (var removal in _deferredClientRemovals)
+            if (removal.Fish != null)
+            {
+                SetClientSimulation(
+                    removal.Fish, removal.NativeBehaviorEnabled, removal.Id);
+                removal.Fish.gameObject.SetActive(removal.NativeActive);
+            }
+        _deferredClientRemovals.Clear();
         RestoreSuppressedClientFish();
+    }
+
+    private FishAISystem FindClientFish(int id)
+    {
+        if (_targets.TryGetValue(id, out var target) && target.Fish != null)
+            return target.Fish;
+        foreach (var removal in _deferredClientRemovals)
+            if (removal.Id == id && removal.Fish != null)
+                return removal.Fish;
+        if (_pendingClientActionByFish.TryGetValue(id, out var requestId) &&
+            _pendingClientActions.TryGetValue(requestId, out var pending))
+            return pending.Fish;
+        return null;
     }
 
     private void ResetClientManifest()
     {
-        _removedIds.Clear();
+        _pendingClientActions.Clear();
+        _pendingClientActionByFish.Clear();
+        _queuedClientActions.Clear();
+        _clientHookLeases.Clear();
+        _scheduledClientHookCleanup.Clear();
+        _clientTombstones.Clear();
         _pendingClientPickups.Clear();
-        _pendingClientCaptures.Clear();
         _missingAllocatorIds.Clear();
         _pendingClientManifests.Clear();
-        _clientManifestIds.Clear();
-        _clientManifestCounts.Clear();
-        _finalizedClientManifestCounts.Clear();
+        _pendingClientLifecycles.Clear();
+        _clientManifestAssemblies.Clear();
+        _activeClientManifest.Clear();
         _latestClientManifestRevision = 0;
+        _nextClientBind = 0f;
+        _latestClientTick = 0;
+        _clientLatestTick = 0d;
+        _clientRenderTick = 0d;
+        _hasClientClock = false;
+        _appliedClientSceneId = 0;
+        _appliedClientSceneEpoch = 0;
+    }
+
+    private void ApplyClientSnapshot(uint sceneId, uint sceneEpoch, FishSnapshot snapshot)
+    {
+        if (snapshot.SceneId != sceneId || snapshot.SceneEpoch != sceneEpoch ||
+            !_targets.TryGetValue(snapshot.Id, out var target) || target.Fish == null ||
+            target.Revision != 0 && snapshot.Revision != target.Revision &&
+                !IsNewer(snapshot.Revision, target.Revision) ||
+            target.Tick != 0 && !IsNewer(snapshot.Tick, target.Tick))
+        {
+            _clientSnapshotsRejected++;
+            return;
+        }
+
+        var previous = target.Samples.Count == 0 ? default : target.Samples[^1];
+        var sample = new TimedSample(
+            snapshot.Tick, snapshot.X, snapshot.Y, snapshot.Z,
+            snapshot.VelocityX, snapshot.VelocityY, snapshot.Rotation);
+        var revisionAdvanced = target.Revision == 0 || IsNewer(snapshot.Revision, target.Revision);
+        AddSnapshot(target, sample);
+        target.Revision = snapshot.Revision;
+        target.Tick = snapshot.Tick;
+        target.Hp = snapshot.Hp;
+        target.Flags = snapshot.Flags;
+        if (!target.Interested)
+        {
+            target.Interested = true;
+            target.Fish.gameObject.SetActive(true);
+            SetClientSimulation(target.Fish, false, snapshot.Id);
+        }
+        ApplySnapshotPhase(target, snapshot.Flags, snapshot.Hp, revisionAdvanced);
+        target.HasSnapshot = true;
+        if (target.AwaitingLeaseSnapshot &&
+            (target.AwaitingLeaseSnapshotTick == 0 ||
+             IsNewer(snapshot.Tick, target.AwaitingLeaseSnapshotTick)))
+        {
+            target.AwaitingLeaseSnapshot = false;
+            target.CorrectionFrom = target.Fish.transform.position;
+            target.CorrectionRotation = target.Fish.Rotation;
+            target.CorrectionStarted = Time.realtimeSinceStartup;
+            var dx = snapshot.X - target.CorrectionFrom.x;
+            var dy = snapshot.Y - target.CorrectionFrom.y;
+            var dz = snapshot.Z - target.CorrectionFrom.z;
+            target.CorrectingLeasePresentation = dx * dx + dy * dy + dz * dz <= 64f;
+            _trace?.Write("LEASE-CORRECTION",
+                $"id={snapshot.Id} tick={snapshot.Tick} blend={target.CorrectingLeasePresentation}");
+        }
+        if (!HasActiveClientHookLease(
+                _clientHookLeases, snapshot.Id, Time.realtimeSinceStartup))
+            ApplyClientState(target);
+        _clientSnapshotsAccepted++;
+        if (previous.Tick != 0 && DistanceSquared(previous, sample) >= 64f)
+        {
+            _clientTeleports++;
+            _trace?.Write("TELEPORT",
+                $"id={snapshot.Id} tick={snapshot.Tick} from=({previous.X:F2},{previous.Y:F2}) " +
+                $"to=({sample.X:F2},{sample.Y:F2})");
+        }
+    }
+
+    private void ApplyClientLifecycle(uint sceneId, uint sceneEpoch, FishLifecycle lifecycle)
+    {
+        if (lifecycle.SceneId != sceneId || lifecycle.SceneEpoch != sceneEpoch)
+            return;
+        if (lifecycle.Kind == FishLifecycleKind.Despawn)
+        {
+            ApplyClientRemoval(sceneId, sceneEpoch, lifecycle.Id, lifecycle.Revision, "lifecycle");
+            return;
+        }
+        if (lifecycle.Kind == FishLifecycleKind.Spawn &&
+            _clientTombstones.TryGetValue(lifecycle.Id, out var removalRevision) &&
+            IsNewer(lifecycle.Revision, removalRevision))
+            _clientTombstones.Remove(lifecycle.Id);
+        if (!_targets.TryGetValue(lifecycle.Id, out var target) || target.Fish == null)
+        {
+            if (!_pendingClientLifecycles.TryGetValue(lifecycle.Id, out var pending) ||
+                IsNewer(lifecycle.Revision, pending.Revision))
+                _pendingClientLifecycles[lifecycle.Id] = lifecycle;
+            return;
+        }
+        if (target.Revision != 0 && !IsNewer(lifecycle.Revision, target.Revision))
+            return;
+        if (lifecycle.Kind is FishLifecycleKind.InterestEnter or FishLifecycleKind.InterestLeave)
+        {
+            target.Revision = lifecycle.Revision;
+            target.Hp = lifecycle.Hp;
+            target.Phase = lifecycle.Phase;
+            target.Interested = lifecycle.Kind == FishLifecycleKind.InterestEnter;
+            target.HasSnapshot = false;
+            if (!target.Interested)
+                target.Samples.Clear();
+            target.Fish.gameObject.SetActive(target.Interested);
+            if (target.Interested)
+            {
+                SetClientSimulation(target.Fish, false, lifecycle.Id);
+                ApplyClientState(target);
+            }
+            _pendingClientLifecycles.Remove(lifecycle.Id);
+            _trace?.Write("INTEREST",
+                $"id={lifecycle.Id} revision={lifecycle.Revision} interested={target.Interested}");
+            return;
+        }
+        target.Revision = lifecycle.Revision;
+        target.Hp = lifecycle.Hp;
+        target.Phase = lifecycle.Phase;
+        target.Flags = (byte)(target.Flags & ~3);
+        if (lifecycle.Phase == FishPhase.Captured)
+            target.Flags |= 2;
+        else if (lifecycle.Phase == FishPhase.Corpse)
+            target.Flags |= 1;
+        if (!HasActiveClientHookLease(
+                _clientHookLeases, lifecycle.Id, Time.realtimeSinceStartup))
+            ApplyClientState(target);
+        _pendingClientLifecycles.Remove(lifecycle.Id);
+        _trace?.Write("LIFECYCLE",
+            $"id={lifecycle.Id} revision={lifecycle.Revision} kind={lifecycle.Kind} " +
+            $"phase={lifecycle.Phase} hp={lifecycle.Hp:F1}");
+    }
+
+    private void ApplyClientRemoval(
+        uint sceneId, uint sceneEpoch, int id, uint revision, string source)
+    {
+        if (!_targets.TryGetValue(id, out var target))
+        {
+            if (_activeClientManifest.TryGetValue(id, out var manifest) &&
+                manifest.FishRevision != 0 && !RemovalWins(revision, manifest.FishRevision) ||
+                _pendingClientLifecycles.TryGetValue(id, out var lifecycle) &&
+                lifecycle.Revision != 0 && !RemovalWins(revision, lifecycle.Revision))
+                return;
+            RecordTombstone(id, revision);
+            return;
+        }
+        if (target.Revision != 0 && !RemovalWins(revision, target.Revision))
+            return;
+        target.Revision = revision;
+        RecordTombstone(id, revision);
+        if (HasPendingClientLoot(id))
+            return;
+        RemoveClientTarget(id, true);
+        _trace?.Write("REMOVE-ACCEPT", $"id={id} revision={revision} source={source}");
+    }
+
+    private bool HasPendingClientLoot(int id)
+    {
+        foreach (var pending in _pendingClientActions.Values)
+            if (pending.Id == id && pending.Action is FishAction.Capture or FishAction.CorpsePickup)
+                return true;
+        foreach (var pair in _clientGrantActions)
+            if (_clientGrantFish.TryGetValue(pair.Key, out var fishId) && fishId == id &&
+                _clientLootRequests.TryGetValue(pair.Key, out var request) && !request.Released)
+                return true;
+        return false;
+    }
+
+    private bool HasClientLootRequestForFish(int id)
+    {
+        foreach (var request in _clientLootRequests.Values)
+            if (request.Request.Id == id)
+                return true;
+        return false;
+    }
+
+    private void AddSnapshot(Target target, TimedSample sample)
+    {
+        InsertSample(target.Samples, sample);
+        if (_hasClientClock)
+            PruneSamples(target.Samples, _clientRenderTick);
+        var unwrapped = _latestClientTick == 0
+            ? sample.Tick
+            : UnwrapTick(sample.Tick, _latestClientTick);
+        if (!_hasClientClock)
+        {
+            _latestClientTick = unwrapped;
+            _clientLatestTick = unwrapped;
+            _clientRenderTick = unwrapped - InterpolationTicks;
+            _hasClientClock = true;
+        }
+        else if (unwrapped > _latestClientTick)
+        {
+            _latestClientTick = unwrapped;
+            _clientLatestTick = unwrapped;
+        }
+    }
+
+    private void AdvanceClientClock(float deltaTime)
+    {
+        if (!_hasClientClock)
+            return;
+        var elapsed = Math.Max(0f, deltaTime);
+        _clientLatestTick += elapsed * SnapshotTicksPerSecond;
+        _clientRenderTick = CorrectRenderClock(
+            _clientRenderTick, _clientLatestTick, elapsed);
+    }
+
+    internal void ApplyClientAuthoritativeAfterPresentation(FishAISystem fish)
+    {
+        if (fish == null ||
+            !_clientIdsByFish.TryGetValue(fish, out var id) ||
+            !_targets.TryGetValue(id, out var target) ||
+            !ShouldApplyAfterPresentation(
+                _hasClientClock, target.Samples.Count > 0,
+                HasActiveClientHookLease(
+                    _clientHookLeases, id, Time.realtimeSinceStartup),
+                target.AwaitingLeaseSnapshot))
+            return;
+        PruneSamples(target.Samples, _clientRenderTick);
+        var rendered = SampleAt(target.Samples, _clientRenderTick);
+        target.Position = new Vector3(rendered.X, rendered.Y, rendered.Z);
+        target.Rotation = rendered.Rotation;
+        if (target.CorrectingLeasePresentation)
+        {
+            var t = Mathf.Clamp01(
+                (Time.realtimeSinceStartup - target.CorrectionStarted) / LeaseCorrectionSeconds);
+            fish.transform.position = Vector3.Lerp(target.CorrectionFrom, target.Position, t);
+            fish.Rotation = Mathf.LerpAngle(target.CorrectionRotation, target.Rotation, t);
+            target.CorrectingLeasePresentation = t < 1f;
+        }
+        else
+        {
+            fish.transform.position = target.Position;
+            fish.Rotation = target.Rotation;
+        }
+        ApplyClientState(target);
+    }
+
+    internal void PublishClientHookPose(
+        UdpSession session, uint sceneId, FishAISystem fish, float now)
+    {
+        if (session == null || fish == null ||
+            !_clientIdsByFish.TryGetValue(fish, out var id) ||
+            !_targets.TryGetValue(id, out var target) ||
+            target.Phase is not (FishPhase.Hooked or FishPhase.Qte) ||
+            !_clientHookLeases.TryGetValue(id, out var lease) || !lease.Accepted ||
+            lease.EndedPending || lease.ReleaseQueued || lease.CaptureQueued ||
+            now >= lease.Expires || now < lease.NextPoseSend)
+            return;
+        var position = fish.transform.position;
+        var velocity = fish.Velocity;
+        var pose = new FishHookPose(
+            sceneId, session.RemoteSceneEpoch, id, lease.RequestId,
+            lease.PoseTick = NextRevision(lease.PoseTick),
+            position.x, position.y, position.z, fish.Rotation, velocity.x, velocity.y);
+        if (!HookPoseFinite(pose) || !session.SendFishHookPose(pose))
+            return;
+        lease.NextPoseSend = now + HookPoseIntervalSeconds;
+    }
+
+    private void ApplyClientState(Target target)
+    {
+        if (target.Fish == null)
+            return;
+        var wasApplying = _applyingClientState;
+        _applyingClientState = true;
+        try
+        {
+            if (Mathf.Abs(target.Fish.HP - target.Hp) >= 0.01f)
+                target.Fish.SetHP(Mathf.Max(0f, target.Hp));
+            var corpse = target.Phase == FishPhase.Corpse || (target.Flags & 1) != 0;
+            var captured = target.Phase == FishPhase.Captured || (target.Flags & 2) != 0;
+            if (target.Fish.IsCorpse != corpse)
+                target.Fish.IsCorpse = corpse;
+            if (target.Fish.IsFishCaptured != captured)
+                target.Fish.IsFishCaptured = captured;
+            var enabled = (target.Flags & 4) != 0;
+            if (target.Fish.IsFishEnable != enabled)
+                target.Fish.IsFishEnable = enabled;
+        }
+        finally
+        {
+            _applyingClientState = wasApplying;
+        }
+    }
+
+    private static FishPhase PhaseFromFlags(byte flags, float hp) =>
+        (flags & 2) != 0 ? FishPhase.Captured :
+        (flags & 1) != 0 || hp <= 0f ? FishPhase.Corpse : FishPhase.Alive;
+
+    private static void ApplyManifestBaseline(Target target, FishManifest manifest)
+    {
+        target.Position = new Vector3(manifest.X, manifest.Y, manifest.Z);
+        target.Rotation = manifest.Rotation;
+        target.Hp = manifest.Hp;
+        target.Flags = manifest.Flags;
+        target.Revision = manifest.FishRevision;
+        target.Interested = ManifestInterested(manifest.Flags);
+    }
+
+    private static byte FlagsForPhase(byte flags, FishPhase phase)
+    {
+        flags = (byte)(flags & ~3);
+        if (phase == FishPhase.Captured)
+            return (byte)(flags | 2);
+        return phase == FishPhase.Corpse ? (byte)(flags | 1) : flags;
+    }
+
+    private static void ApplySnapshotPhase(
+        Target target, byte flags, float hp, bool revisionAdvanced)
+    {
+        var phase = PhaseFromFlags(flags, hp);
+        if (revisionAdvanced || target.Phase is FishPhase.None or FishPhase.Alive ||
+            phase is FishPhase.Captured or FishPhase.Corpse)
+            target.Phase = phase;
+    }
+
+    private static bool InsertSample(List<TimedSample> samples, TimedSample sample)
+    {
+        sample.TimeTick = samples.Count == 0
+            ? sample.Tick
+            : UnwrapTick(sample.Tick, samples[^1].TimeTick);
+        var index = samples.BinarySearch(sample, TimedSampleComparer.Instance);
+        if (index >= 0)
+        {
+            samples[index] = sample;
+            return false;
+        }
+        samples.Insert(~index, sample);
+        if (samples.Count > MaxSamples)
+            samples.RemoveAt(0);
+        return true;
+    }
+
+    private static void PruneSamples(List<TimedSample> samples, double renderTick)
+    {
+        while (samples.Count > 2 && samples[1].TimeTick <= renderTick)
+            samples.RemoveAt(0);
+    }
+
+    private sealed class TimedSampleComparer : IComparer<TimedSample>
+    {
+        internal static readonly TimedSampleComparer Instance = new();
+        public int Compare(TimedSample left, TimedSample right) =>
+            left.TimeTick.CompareTo(right.TimeTick);
+    }
+
+    private static TimedSample SampleAt(List<TimedSample> samples, double renderTick)
+    {
+        if (samples.Count == 1)
+            return SampleAt(samples[0], default, renderTick);
+        var next = 0;
+        while (next < samples.Count && samples[next].TimeTick < renderTick)
+            next++;
+        if (next == 0)
+            return samples[0];
+        if (next == samples.Count)
+            return SampleAt(samples[^1], default, renderTick);
+        return SampleAt(samples[next - 1], samples[next], renderTick);
+    }
+
+    private static TimedSample SampleAt(TimedSample previous, TimedSample next, double renderTick)
+    {
+        if (next.Tick == 0 && next.TimeTick == 0)
+        {
+            var extrapolationSeconds = (float)Math.Clamp(
+                (renderTick - previous.TimeTick) / SnapshotTicksPerSecond,
+                0d, MaxExtrapolationTicks / SnapshotTicksPerSecond);
+            return new TimedSample(previous.Tick,
+                previous.X + previous.VelocityX * extrapolationSeconds,
+                previous.Y + previous.VelocityY * extrapolationSeconds,
+                previous.Z, previous.VelocityX, previous.VelocityY, previous.Rotation);
+        }
+        if (DistanceSquared(previous, next) >= 64f)
+            return renderTick < next.TimeTick ? previous : next;
+        var tickSpan = next.TimeTick - previous.TimeTick;
+        if (tickSpan <= 0)
+            return next;
+        var t = (float)Math.Clamp((renderTick - previous.TimeTick) / tickSpan, 0d, 1d);
+        var seconds = (float)(tickSpan / SnapshotTicksPerSecond);
+        var t2 = t * t;
+        var t3 = t2 * t;
+        var h00 = 2f * t3 - 3f * t2 + 1f;
+        var h10 = t3 - 2f * t2 + t;
+        var h01 = -2f * t3 + 3f * t2;
+        var h11 = t3 - t2;
+        return new TimedSample(previous.Tick,
+            h00 * previous.X + h10 * previous.VelocityX * seconds +
+                h01 * next.X + h11 * next.VelocityX * seconds,
+            h00 * previous.Y + h10 * previous.VelocityY * seconds +
+                h01 * next.Y + h11 * next.VelocityY * seconds,
+            Mathf.Lerp(previous.Z, next.Z, t),
+            Mathf.Lerp(previous.VelocityX, next.VelocityX, t),
+            Mathf.Lerp(previous.VelocityY, next.VelocityY, t),
+            Mathf.LerpAngle(previous.Rotation, next.Rotation, t));
+    }
+
+    private static float DistanceSquared(TimedSample left, TimedSample right)
+    {
+        var dx = right.X - left.X;
+        var dy = right.Y - left.Y;
+        var dz = right.Z - left.Z;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static long UnwrapTick(uint tick, long reference)
+    {
+        var candidate = (reference & ~0xffffffffL) | tick;
+        if (candidate - reference > int.MaxValue)
+            candidate -= 1L << 32;
+        else if (reference - candidate > int.MaxValue)
+            candidate += 1L << 32;
+        return candidate;
+    }
+
+    private static int AddManifestTestEntry(ManifestAssembly assembly, int id)
+    {
+        assembly.Entries[id] = default;
+        return assembly.Entries.Count;
+    }
+
+    private static bool CanActivateManifest(ManifestAssembly assembly, uint currentRevision) =>
+        assembly.IsComplete && (currentRevision == 0 || assembly.Revision == currentRevision ||
+            IsNewer(assembly.Revision, currentRevision));
+
+    private static bool RemovalWins(uint removalRevision, uint fishRevision) =>
+        removalRevision == fishRevision || IsNewer(removalRevision, fishRevision);
+
+    private static bool ManifestEntryEligible(bool captured) => !captured;
+
+    private static int NextMissingScans(int missingScans, bool seen) =>
+        seen ? 0 : missingScans + 1;
+
+    private static bool ShouldRemoveMissingFish(bool unityNull, int missingScans) =>
+        unityNull || missingScans >= MissingAllocatorScanGrace;
+
+    private static bool ShouldSuppressAllocator(string allocatorUid, HashSet<string> represented) =>
+        !string.IsNullOrEmpty(allocatorUid) && represented.Contains(allocatorUid);
+
+    private static (string AllocatorUid, int FishDataTID) ManifestFishKey(
+        string allocatorUid, int fishDataTID) => (allocatorUid, fishDataTID);
+
+    private static bool ManifestRetryDue(float now, float nextRetry) => now >= nextRetry;
+
+    private static bool SceneScopeChanged(
+        uint appliedSceneId, uint appliedSceneEpoch, uint sceneId, uint sceneEpoch) =>
+        appliedSceneId != sceneId || appliedSceneEpoch != sceneEpoch;
+
+    private static ulong NextRequestId(ref ulong requestId)
+    {
+        requestId++;
+        if (requestId == 0)
+            requestId = 1;
+        return requestId;
+    }
+
+    private static bool RequestIsNewer(ulong requestId, ulong previous) =>
+        unchecked((long)(requestId - previous)) > 0;
+
+    private static bool TryMarkProcessedRequest(
+        HashSet<ulong> processed, ref ulong highest, ulong requestId, int windowSize)
+    {
+        if (requestId == 0 || processed.Contains(requestId) || windowSize <= 0)
+            return false;
+        if (processed.Count == 0)
+            highest = requestId;
+        else if (RequestIsNewer(requestId, highest))
+            highest = requestId;
+        else if (unchecked(highest - requestId) >= (ulong)windowSize)
+            return false;
+        processed.Add(requestId);
+        foreach (var processedId in new List<ulong>(processed))
+            if (processedId != highest && !RequestIsNewer(processedId, highest) &&
+                unchecked(highest - processedId) >= (ulong)windowSize)
+                processed.Remove(processedId);
+        return true;
+    }
+
+    private static bool TryEnqueueBounded<T>(Queue<T> queue, T value, int capacity)
+    {
+        if (queue.Count >= capacity)
+            return false;
+        queue.Enqueue(value);
+        return true;
+    }
+
+    private static int BoundDamage(int damage) => Math.Min(damage, 10_000);
+
+    private static bool RevisionMatches(uint known, uint current) => known == current;
+
+    private static void BeginClientHookLease(
+        Dictionary<int, ClientHookLease> leases, int id, ulong requestId) =>
+        leases[id] = new ClientHookLease(requestId);
+
+    private static bool AcceptClientHookLease(
+        Dictionary<int, ClientHookLease> leases,
+        int id,
+        ulong requestId,
+        float now)
+    {
+        if (!leases.TryGetValue(id, out var lease) || lease.RequestId != requestId)
+            return false;
+        lease.Accepted = true;
+        lease.Expires = now + HookLeaseSeconds;
+        return true;
+    }
+
+    private static bool RenewClientHookLease(
+        Dictionary<int, ClientHookLease> leases,
+        int id,
+        ulong requestId,
+        float now)
+    {
+        if (!leases.TryGetValue(id, out var lease) || !lease.Accepted ||
+            lease.RequestId != requestId)
+            return false;
+        lease.Expires = now + HookLeaseSeconds;
+        return true;
+    }
+
+    private static bool RenewHostHookLease(
+        Dictionary<int, HostHookLease> leases,
+        int id,
+        ulong requestId,
+        float now)
+    {
+        if (!leases.TryGetValue(id, out var lease) || lease.RequestId != requestId)
+            return false;
+        lease.Expires = now + HookLeaseSeconds;
+        return true;
+    }
+
+    private static bool HasActiveClientHookLease(
+        Dictionary<int, ClientHookLease> leases, int id, float now) =>
+        leases.TryGetValue(id, out var lease) && lease.Accepted && now < lease.Expires;
+
+    private static bool TryMarkClientHookCleanup(ClientHookLease lease)
+    {
+        if (lease == null || lease.CleanupDone)
+            return false;
+        lease.CleanupDone = true;
+        return true;
+    }
+
+    private static bool TryMarkLeaseActionQueued(
+        ClientHookLease lease, FishAction action, bool enqueued)
+    {
+        if (!enqueued)
+            return false;
+        if (action == FishAction.Release)
+            lease.ReleaseQueued = true;
+        else if (action == FishAction.Capture)
+            lease.CaptureQueued = true;
+        else if (action == FishAction.Hook)
+            lease.HookQueued = true;
+        return true;
+    }
+
+    private static bool MarkHookEndedPending(ClientHookLease lease)
+    {
+        if (lease == null || lease.EndedPending)
+            return false;
+        lease.EndedPending = true;
+        return true;
+    }
+
+    private static bool ResolveHookRecall(ClientHookLease lease, bool isSuccess)
+    {
+        if (lease == null || lease.RecallResolved)
+            return false;
+        lease.EndedPending = true;
+        lease.RecallResolved = true;
+        lease.RecallSuccess = isSuccess;
+        return true;
+    }
+
+    private static bool LeaseIdentityMatches(
+        FishAction action, ulong expectedLeaseId, ulong suppliedLeaseId) =>
+        action is FishAction.Qte or FishAction.Release or FishAction.Capture
+            ? expectedLeaseId != 0 && suppliedLeaseId == expectedLeaseId
+            : suppliedLeaseId == 0;
+
+    private static bool ShouldCancelLeaseOnReject(FishAction action, bool leaseMatches) =>
+        leaseMatches && action is FishAction.Qte or FishAction.Release or FishAction.Capture;
+
+    private static float? ActionRangeSquared(FishAction action) =>
+        action switch
+        {
+            FishAction.Hook or FishAction.Damage => WeaponRangeSquared,
+            FishAction.Capture => CaptureRangeSquared,
+            FishAction.CorpsePickup => CorpsePickupRangeSquared,
+            _ => null
+        };
+
+    private static bool HostActionStateValid(
+        FishAction action, FishPhase phase, bool leaseActive) =>
+        action switch
+        {
+            FishAction.Hook => phase == FishPhase.Alive && !leaseActive,
+            FishAction.Qte or FishAction.Capture =>
+                leaseActive && phase is FishPhase.Hooked or FishPhase.Qte,
+            FishAction.Release =>
+                leaseActive && phase is FishPhase.Hooked or FishPhase.Qte,
+            FishAction.CorpsePickup =>
+                !leaseActive && phase is FishPhase.Corpse or FishPhase.Captured,
+            _ => true
+        };
+
+    private static bool ShouldAllowProxyWrite(
+        bool clientAuthority, bool applyingState, bool clientProxy) =>
+        !clientAuthority || applyingState || !clientProxy;
+
+    private static bool ShouldAllowSimulation(
+        bool clientAuthority, bool applyingState, bool clientProxy, bool presentationLease) =>
+        !clientAuthority || applyingState || !clientProxy || presentationLease;
+
+    private static bool ShouldApplyAfterPresentation(
+        bool hasClock, bool hasSamples, bool activeLease, bool awaitingLeaseSnapshot) =>
+        hasClock && hasSamples && !activeLease && !awaitingLeaseSnapshot;
+
+    private static bool ShouldSuppressPendingClientFishLootPolicy(
+        bool fishLootScope,
+        bool recallScope,
+        bool matchingFish,
+        bool hookEndedPending,
+        bool capturePending) =>
+        fishLootScope || recallScope && matchingFish && (hookEndedPending || capturePending);
+
+    private static bool HookPoseIdentityValid(
+        FishHookPose pose, uint sceneId, uint sceneEpoch, int fishId, ulong leaseId) =>
+        pose.SceneId == sceneId && pose.SceneEpoch == sceneEpoch &&
+        pose.FishId == fishId && pose.LeaseId == leaseId;
+
+    private static bool HookPoseFinite(FishHookPose pose) =>
+        float.IsFinite(pose.X) && float.IsFinite(pose.Y) && float.IsFinite(pose.Z) &&
+        float.IsFinite(pose.Rotation) && float.IsFinite(pose.VelocityX) &&
+        float.IsFinite(pose.VelocityY);
+
+    private static bool HookPoseWithinPlayer(FishHookPose pose, PlayerSnapshot player)
+    {
+        var dx = pose.X - player.X;
+        var dy = pose.Y - player.Y;
+        var dz = pose.Z - player.Z;
+        return dx * dx + dy * dy + dz * dz <= HookPosePlayerRangeSquared;
+    }
+
+    private static bool HookPoseVelocityPlausible(FishHookPose pose) =>
+        pose.VelocityX * pose.VelocityX + pose.VelocityY * pose.VelocityY <=
+            HookPoseMaxSpeed * HookPoseMaxSpeed;
+
+    private static bool HookPoseMotionPlausible(
+        FishHookPose previous, FishHookPose current, float elapsed)
+    {
+        if (!IsNewer(current.Tick, previous.Tick) || elapsed <= 0f)
+            return false;
+        var dx = current.X - previous.X;
+        var dy = current.Y - previous.Y;
+        var dz = current.Z - previous.Z;
+        var maxDistance = HookPoseMaxSpeed * elapsed + 0.001f;
+        return dx * dx + dy * dy + dz * dz <= maxDistance * maxDistance;
+    }
+
+    private static bool HookPoseFromCurrentPlausible(
+        Vector3 current, FishHookPose pose, float elapsed)
+    {
+        if (elapsed <= 0f)
+            return false;
+        var dx = pose.X - current.x;
+        var dy = pose.Y - current.y;
+        var dz = pose.Z - current.z;
+        var maxDistance = HookPoseMaxSpeed * elapsed + 0.001f;
+        return dx * dx + dy * dy + dz * dz <= maxDistance * maxDistance;
+    }
+
+    private static ThreatDecision RemoteThreatPolicy(
+        bool aggressive,
+        float nativeRadius,
+        float distance,
+        bool active,
+        float now,
+        float nextRefresh)
+    {
+        var enter = aggressive ? nativeRadius : Math.Max(nativeRadius, RemoteFearEnterRadius);
+        var exit = aggressive ? nativeRadius : Math.Max(nativeRadius, RemoteFearExitRadius);
+        var inside = distance <= (active ? exit : enter);
+        var entering = inside && !active;
+        return new ThreatDecision(
+            inside, entering, inside && (entering || now >= nextRefresh));
+    }
+
+    private static bool TryConsumeAck(HashSet<ulong> pending, ulong requestId) =>
+        pending.Remove(requestId);
+
+    private static bool TryConsumeAck(
+        Dictionary<ulong, PendingAction> pending, ulong requestId) =>
+        pending.Remove(requestId);
+
+    private static bool TryExpirePendingAction(
+        Dictionary<ulong, PendingAction> pending,
+        Dictionary<int, ulong> pendingByFish,
+        ulong requestId,
+        float now,
+        out PendingAction action)
+    {
+        if (!pending.TryGetValue(requestId, out action) || action.TimedOut || now < action.Expires)
+            return false;
+        action = action with { TimedOut = true };
+        pending[requestId] = action;
+        return true;
+    }
+
+    private static void ClearPendingFish(
+        Dictionary<int, ulong> pendingByFish, PendingAction action, ulong requestId)
+    {
+        if (pendingByFish.TryGetValue(action.Id, out var current) && current == requestId)
+            pendingByFish.Remove(action.Id);
+    }
+
+    private static double CorrectRenderClock(
+        double renderTick, double latestTick, float deltaTime)
+    {
+        var desired = latestTick - InterpolationTicks;
+        var drift = desired - renderTick;
+        if (Math.Abs(drift) > 2.5d)
+            return desired;
+        var scale = drift > 0.25d ? 1.10d : drift < -0.25d ? 0.90d : 1d;
+        return Math.Min(
+            renderTick + Math.Max(0f, deltaTime) * SnapshotTicksPerSecond * scale,
+            latestTick + MaxExtrapolationTicks);
+    }
+
+    private void RecordTombstone(int id, uint revision)
+    {
+        if (!_clientTombstones.TryGetValue(id, out var previous) ||
+            RemovalWins(revision, previous))
+            _clientTombstones[id] = revision;
     }
 
     private void WriteClientSummary(float now)
@@ -1047,28 +3761,47 @@ internal sealed class FishReplicator
         _trace?.Write("FISH-SUMMARY",
             $"bound={_targets.Count} active={valid} pendingBind={_pendingClientManifests.Count} " +
             $"missing={_missingAllocatorIds.Count} suppressed={_suppressedClientFish.Count} " +
-            $"pendingPickup={_pendingClientPickups.Count}");
+            $"samples={_clientSnapshotsAccepted}/{_clientSnapshotsRejected} " +
+            $"teleports={_clientTeleports} tombstones={_clientTombstones.Count} " +
+            $"clock={_clientRenderTick:F1}/{_clientLatestTick:F1} " +
+            $"pendingRemoval={_deferredClientRemovals.Count}");
     }
 
     private int SuppressUnboundClientFish()
     {
         var count = 0;
-        foreach (var fish in UnityEngine.Object.FindObjectsByType<FishAISystem>(
-                     FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+        var represented = new HashSet<string>();
+        foreach (var manifest in _activeClientManifest.Values)
+            if (!string.IsNullOrEmpty(manifest.AllocatorUid))
+                represented.Add(manifest.AllocatorUid);
+        foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (fish == null || _clientIdsByFish.ContainsKey(fish) ||
-                _suppressedClientFish.Contains(fish))
+            if (allocator == null)
                 continue;
-            try
+            var uid = GetNetworkAllocatorUid(_appliedClientSceneId, allocator);
+            if (!ShouldSuppressAllocator(uid, represented))
+                continue;
+            var fishs = allocator.GetInstancedFishs;
+            if (fishs == null)
+                continue;
+            foreach (var fish in fishs)
             {
-                fish.gameObject.SetActive(false);
-                _suppressedClientFish.Add(fish);
-                count++;
-            }
-            catch (Exception exception)
-            {
-                _trace?.Write("SUPPRESS-ERROR",
-                    $"type={fish.FishDataTID} error={exception.GetType().Name}:{exception.Message}");
+                if (fish == null || !fish.gameObject.activeInHierarchy ||
+                    _clientIdsByFish.ContainsKey(fish) || _suppressedClientFish.Contains(fish))
+                    continue;
+                try
+                {
+                    fish.gameObject.SetActive(false);
+                    _suppressedClientFish.Add(fish);
+                    count++;
+                }
+                catch (Exception exception)
+                {
+                    _trace?.Write("SUPPRESS-ERROR",
+                        $"uid={uid} type={fish.FishDataTID} " +
+                        $"error={exception.GetType().Name}:{exception.Message}");
+                }
             }
         }
         return count;
@@ -1090,44 +3823,70 @@ internal sealed class FishReplicator
         _suppressedClientFish.Clear();
     }
 
-    private FishAISystem TakeUnboundFish(FishManifest manifest)
+    private void IndexAvailableClientFish(uint sceneId)
     {
-        FishAISystem best = null;
-        var bestScore = float.NegativeInfinity;
-        var expected = new Vector3(manifest.X, manifest.Y, manifest.Z);
+        _clientAllocatorByUidScratch.Clear();
+        foreach (var fish in _availableClientFishScratch.Values)
+            fish.Clear();
         foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
-                     FindObjectsSortMode.None))
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (allocator == null || !AllocatorUidMatches(
-                    manifest.AllocatorUid, GetNetworkAllocatorUid(manifest.SceneId, allocator)))
+            if (allocator == null)
                 continue;
+            var uid = GetNetworkAllocatorUid(sceneId, allocator);
+            if (string.IsNullOrEmpty(uid))
+                continue;
+            _clientAllocatorByUidScratch.TryAdd(uid, allocator);
             var fishs = allocator.GetInstancedFishs;
             if (fishs == null)
                 continue;
             foreach (var fish in fishs)
             {
-                if (fish == null || !fish.gameObject.activeInHierarchy ||
-                    _clientIdsByFish.ContainsKey(fish) || fish.FishDataTID != manifest.FishDataTID)
+                if (fish == null || _clientIdsByFish.ContainsKey(fish))
                     continue;
-                var score = -Vector3.SqrMagnitude(fish.transform.position - expected);
-                if (score > bestScore)
+                var key = ManifestFishKey(uid, fish.FishDataTID);
+                if (!_availableClientFishScratch.TryGetValue(key, out var available))
                 {
-                    best = fish;
-                    bestScore = score;
+                    available = new List<FishAISystem>();
+                    _availableClientFishScratch[key] = available;
                 }
+                available.Add(fish);
+            }
+        }
+    }
+
+    private FishAISystem TakeUnboundFish(
+        FishManifest manifest,
+        Dictionary<(string AllocatorUid, int FishDataTID), List<FishAISystem>> availableFish)
+    {
+        if (!_clientAllocatorByUidScratch.ContainsKey(manifest.AllocatorUid) ||
+            !availableFish.TryGetValue(
+                ManifestFishKey(manifest.AllocatorUid, manifest.FishDataTID), out var candidates))
+            return null;
+        FishAISystem best = null;
+        var bestScore = float.NegativeInfinity;
+        var expected = new Vector3(manifest.X, manifest.Y, manifest.Z);
+        foreach (var fish in candidates)
+        {
+            if (fish == null || _clientIdsByFish.ContainsKey(fish))
+                continue;
+            var score = -Vector3.SqrMagnitude(fish.transform.position - expected);
+            if (score > bestScore)
+            {
+                best = fish;
+                bestScore = score;
             }
         }
         return best;
     }
 
-    private bool AllCurrentManifestsQueued()
+    private int CountQueuedManifests()
     {
-        if (_manifestRevision == 0)
-            return false;
+        var count = 0;
         foreach (var info in _hostInfoById.Values)
-            if (!info.ManifestQueued)
-                return false;
-        return true;
+            if (info.ManifestQueued)
+                count++;
+        return count;
     }
 
     private static bool ShouldSendSnapshot(HostFish info, FishSnapshot snapshot, float now)
@@ -1140,10 +3899,93 @@ internal sealed class FishReplicator
         var dz = snapshot.Z - previous.Z;
         var dvx = snapshot.VelocityX - previous.VelocityX;
         var dvy = snapshot.VelocityY - previous.VelocityY;
-        return dx * dx + dy * dy + dz * dz >= 0.0025f ||
+        return snapshot.VelocityX * snapshot.VelocityX +
+                snapshot.VelocityY * snapshot.VelocityY >= 0.0001f ||
+            dx * dx + dy * dy + dz * dz >= 0.0025f ||
             Mathf.Abs(Mathf.DeltaAngle(previous.Rotation, snapshot.Rotation)) >= 1f ||
             dvx * dvx + dvy * dvy >= 0.04f ||
             Mathf.Abs(snapshot.Hp - previous.Hp) >= 0.01f || snapshot.Flags != previous.Flags;
+    }
+
+    private static InterestState UpdateInterest(
+        bool interested, int outsideTicks, float distance, bool forced)
+    {
+        if (forced || !interested && distance <= InterestEnterDistance)
+            return new InterestState(true, 0);
+        if (!interested)
+            return new InterestState(false, outsideTicks);
+        if (distance <= InterestLeaveDistance)
+            return new InterestState(true, 0);
+        outsideTicks++;
+        return new InterestState(outsideTicks < InterestLeaveTicks, outsideTicks);
+    }
+
+    private static InterestState UpdateInterestForRemote(
+        bool interested, int outsideTicks, float distance, bool forced, bool hasRemotePlayer) =>
+        hasRemotePlayer
+            ? UpdateInterest(interested, outsideTicks, distance, forced)
+            : new InterestState(interested, outsideTicks);
+
+    private static HostFish CreateHostFish(
+        FishAISystem fish, string allocatorUid, int fishDataTID, bool active) =>
+        new()
+        {
+            Fish = fish,
+            AllocatorUid = allocatorUid,
+            FishDataTID = fishDataTID,
+            Active = active,
+            InterestKnown = active,
+            Interested = active
+        };
+
+    private static FishLifecycleKind? UpdatePoolActive(HostFish info, bool active)
+    {
+        if (info.Active == active)
+            return null;
+        info.Active = active;
+        info.InterestKnown = active;
+        info.Interested = active;
+        info.OutsideInterestTicks = 0;
+        info.HasSnapshot = false;
+        return active ? FishLifecycleKind.InterestEnter : FishLifecycleKind.InterestLeave;
+    }
+
+    private static int FishControlSendBudget(int reliableCapacityRemaining) =>
+        Math.Min(MaxFishControlPacketsPerFrame,
+            Math.Max(0, reliableCapacityRemaining - ReliableCapacityReserve));
+
+    private static bool SnapshotDeadlineReached(float lastSend, float now) =>
+        now >= lastSend + SnapshotKeyframeSeconds;
+
+    private static byte BuildManifestFlags(byte flags, bool interested) =>
+        (byte)(flags | (interested ? 8 : 0));
+
+    private static bool ManifestInterested(byte flags) => (flags & 8) != 0;
+
+    private static bool ShouldHideClientTarget(bool interested, bool active) =>
+        !interested && active;
+
+    private static bool IsForcedRelevant(
+        FishAISystem fish, HostFish info, float now, Transform hostPlayer, Transform remotePlayer)
+    {
+        if (info.Phase is FishPhase.Hooked or FishPhase.Qte or FishPhase.Captured or FishPhase.Corpse ||
+            now < info.RecentDamageUntil)
+            return true;
+        var target = fish.DetectedEnemyData?.DetectedEnemy;
+        return target != null && (target == hostPlayer || target == remotePlayer);
+    }
+
+    private static void InsertSnapshotCandidate(
+        List<SnapshotCandidate> candidates, SnapshotCandidate candidate)
+    {
+        var index = candidates.Count;
+        while (index > 0 && candidates[index - 1].Priority < candidate.Priority)
+            index--;
+        if (index >= SnapshotEntityBudget)
+            return;
+        candidates.Insert(index, candidate);
+        if (candidates.Count > SnapshotEntityBudget)
+            candidates.RemoveAt(SnapshotEntityBudget);
     }
 
     private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
@@ -1153,6 +3995,7 @@ internal sealed class FishReplicator
 
     private void RemoveClientTarget(int id, bool destroy)
     {
+        ClearClientActions(id);
         if (!_targets.TryGetValue(id, out var target))
             return;
         _targets.Remove(id);
@@ -1162,23 +4005,61 @@ internal sealed class FishReplicator
         _clientIdsByFish.Remove(target.Fish);
         if (destroy)
         {
-            try
-            {
-                ReleaseClientHook(target.Fish, id);
-                target.Fish.DestroySelf();
-            }
-            catch (Exception exception)
-            {
-                _log.LogWarning($"Network fish proxy removal failed: id={id}; {exception.Message}");
-                _trace?.Write("REMOVE-ERROR",
-                    $"id={id} error={exception.GetType().Name}:{exception.Message}");
-            }
+            target.Fish.gameObject.SetActive(false);
+            _deferredClientRemovals.Add((
+                target.Fish, id, target.NativeActive, target.NativeBehaviorEnabled));
         }
         else
-        {
-            SetClientSimulation(target.Fish, true, id);
-        }
+            RestoreNativeTarget(target, id);
         _trace?.Write("REMOVE", $"id={id} destroy={destroy}");
+    }
+
+    private void RestoreNativeTarget(Target target, int id)
+    {
+        SetClientSimulation(target.Fish, target.NativeBehaviorEnabled, id);
+        target.Fish.gameObject.SetActive(target.NativeActive);
+        _trace?.Write("BIND-RESTORE",
+            $"id={id} active={target.NativeActive} behavior={target.NativeBehaviorEnabled}");
+    }
+
+    private void ClearClientActions(int id)
+    {
+        _queuedClientActions.Remove(id);
+        _pendingClientActionByFish.Remove(id);
+    }
+
+    private void CancelClientHook(
+        UdpSession session, uint sceneId, int id, FishAISystem fish, float now)
+    {
+        if (!_clientHookLeases.TryGetValue(id, out var lease))
+            return;
+        _queuedClientActions.Remove(id);
+        if (lease.RequestId != 0 && !lease.ReleaseQueued)
+        {
+            var queued = EnqueueClientAction(
+                session, sceneId, id, fish, FishAction.Release, 0, 0, 0, now);
+            TryMarkLeaseActionQueued(lease, FishAction.Release, queued);
+        }
+        ScheduleClientHookCleanup(id);
+    }
+
+    private void ScheduleClientHookCleanup(int id) =>
+        _scheduledClientHookCleanup.Add(id);
+
+    private void CleanupClientHook(int id, FishAISystem fish)
+    {
+        if (!_clientHookLeases.TryGetValue(id, out var lease) ||
+            !TryMarkClientHookCleanup(lease))
+            return;
+        if (_targets.TryGetValue(id, out var target) && !lease.CaptureQueued)
+        {
+            target.AwaitingLeaseSnapshot = true;
+            target.AwaitingLeaseSnapshotTick = target.Tick;
+            target.CorrectingLeasePresentation = false;
+        }
+        if (_lastClientHookId == id)
+            _lastClientHookId = 0;
+        ReleaseClientHook(fish, id);
     }
 
     private void ReleaseClientHook(FishAISystem fish, int id)
@@ -1203,7 +4084,7 @@ internal sealed class FishReplicator
     {
         try
         {
-            fish.EnableBehaviorTree(enabled);
+            FishBehaviorTreeState.Set(fish, enabled);
         }
         catch (Exception exception)
         {
@@ -1214,13 +4095,29 @@ internal sealed class FishReplicator
 
     private void RemoveHostFish(int id)
     {
+        var topologyChanged = _hostFishById.ContainsKey(id) || _hostInfoById.ContainsKey(id);
+        EndHostHookLease(id);
         if (_hostFishById.TryGetValue(id, out var fish))
+        {
             _hostIdsByFish.Remove(fish);
+            FishBehaviorTreeState.Forget(fish);
+        }
         _hostFishById.Remove(id);
         _hostInfoById.Remove(id);
         _lastRemoteDamageById.Remove(id);
-        _nextRemoteStimulusById.Remove(id);
+        _lastRemoteHookActionById.Remove(id);
         _remoteStimulatedIds.Remove(id);
+        _nextRemoteThreatById.Remove(id);
+        if (topologyChanged)
+            MarkHostTopologyChanged();
+    }
+
+    private void MarkHostTopologyChanged()
+    {
+        _manifestRevision = NextRevision(_manifestRevision);
+        foreach (var info in _hostInfoById.Values)
+            info.ManifestQueued = false;
+        _manifestStateQueued = false;
     }
 
     private int TakeHostId()
@@ -1251,12 +4148,12 @@ internal sealed class FishReplicator
     private static bool AllocatorUidMatches(string expected, string actual) =>
         !string.IsNullOrEmpty(expected) && expected == actual;
 
-    private static byte BuildFlags(FishAISystem fish)
+    private static byte BuildFlags(FishAISystem fish, FishPhase phase = FishPhase.None)
     {
         byte flags = 0;
         if (fish.IsCorpse)
             flags |= 1;
-        if (fish.IsFishCaptured)
+        if (fish.IsFishCaptured || phase == FishPhase.Captured)
             flags |= 2;
         if (fish.IsFishEnable)
             flags |= 4;
@@ -1330,24 +4227,12 @@ internal static class FishTakeDamagePatch
 {
     private static bool Prefix(
         FishAISystem __instance,
-        AttackData __0,
-        ref bool __result,
-        out bool __state)
+        AttackData __0)
     {
         var behaviour = ProbeBehaviour.Instance;
-        if (behaviour == null)
-        {
-            __state = false;
-            return true;
-        }
-        var allow = behaviour.BeginFishDamage(__instance, __0, out __state);
-        if (!allow)
-            __result = false;
-        return allow;
+        behaviour?.ObserveFishDamage(__instance, __0);
+        return true;
     }
-
-    private static void Postfix(FishAISystem __instance, bool __state) =>
-        ProbeBehaviour.Instance?.EndFishDamage(__instance, __state);
 }
 
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetTrueHPDamage))]
@@ -1357,28 +4242,25 @@ internal static class FishTrueDamagePatch
         ProbeBehaviour.Instance?.AllowFishTrueDamage(__instance) ?? true;
 }
 
-[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetHPDamageQTE))]
-internal static class FishQteDamagePatch
-{
-    private static bool Prefix(FishAISystem __instance, int damage, EElement element)
-    {
-        var behaviour = ProbeBehaviour.Instance;
-        return behaviour?.AllowFishDamage(
-            __instance, damage, element, AttackType.QTE_Damage) ?? true;
-    }
-}
-
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.WinFromProjectileinFight))]
 internal static class FishHarpoonWinPatch
 {
-    private static void Prefix(FishAISystem __instance)
+    private static bool Prefix(FishAISystem __instance)
     {
         ProbeBehaviour.Instance?.TraceFishPickup("harpoon-win-prefix", __instance, null);
-        ProbeBehaviour.Instance?.OnFishCaptureWon(__instance);
+        return ProbeBehaviour.Instance?.AllowFishCaptureWon(__instance) ?? true;
     }
 
     private static void Postfix(FishAISystem __instance) =>
         ProbeBehaviour.Instance?.TraceFishPickup("harpoon-win-postfix", __instance, null);
+}
+
+[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.HookedByProjectile),
+    new[] { typeof(ProjectileInfo) })]
+internal static class FishHookedByProjectilePatch
+{
+    private static void Postfix(FishAISystem __instance) =>
+        ProbeBehaviour.Instance?.OnFishHooked(__instance);
 }
 
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.SetDeadForce))]
@@ -1394,8 +4276,11 @@ internal static class FishSetDeadForceTracePatch
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.OnEndHookedMode))]
 internal static class FishEndHookedTracePatch
 {
-    private static void Prefix(FishAISystem __instance) =>
+    private static void Prefix(FishAISystem __instance)
+    {
         ProbeBehaviour.Instance?.TraceFishPickup("hook-end-prefix", __instance, null);
+        ProbeBehaviour.Instance?.OnFishHookEnded(__instance);
+    }
 
     private static void Postfix(FishAISystem __instance) =>
         ProbeBehaviour.Instance?.TraceFishPickup("hook-end-postfix", __instance, null);
@@ -1427,9 +4312,6 @@ internal static class FishInteractionAvailabilityPatch
     private static void Postfix(FishInteractionBody __instance, ref bool __result)
     {
         __result = ProbeBehaviour.Instance?.AllowFishInteraction(__instance, __result) ?? __result;
-        if (__result)
-            ProbeBehaviour.Instance?.TraceFishPickup(
-                "body-available", null, __instance, __result);
     }
 }
 
@@ -1466,6 +4348,13 @@ internal static class FishSuccessNetPickupFishTracePatch
             $"success-net-pickup ignore={ignoreOverloaded}", __instance, null);
 }
 
+[HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.DestroySelf))]
+internal static class FishPresentationRemovalPatch
+{
+    private static bool Prefix(FishAISystem __instance) =>
+        ProbeBehaviour.Instance?.AllowFishRemoval(__instance) ?? true;
+}
+
 [HarmonyPatch(typeof(FishAISystem), nameof(FishAISystem.AddDropItemLootBoxWithPlus))]
 internal static class FishAddDropLootTracePatch
 {
@@ -1473,16 +4362,17 @@ internal static class FishAddDropLootTracePatch
         FishAISystem __instance,
         int bonusGrade,
         LootBox.AutoLiftedType type,
-        int tier)
+        int tier,
+        out bool __state)
     {
-        ProbeBehaviour.Instance?.BeginClientFishLootSource();
+        __state = ProbeBehaviour.Instance?.BeginClientFishLootSource(__instance) == true;
         ProbeBehaviour.Instance?.TraceFishPickup(
             $"add-drop bonus={bonusGrade} lift={type} tier={tier}", __instance, null);
     }
 
-    private static Exception Finalizer(Exception __exception)
+    private static Exception Finalizer(Exception __exception, bool __state)
     {
-        ProbeBehaviour.Instance?.EndClientLootSource();
+        ProbeBehaviour.Instance?.EndClientFishLootSource(__state);
         return __exception;
     }
 }
@@ -1529,4 +4419,7 @@ internal static class ClientFishLateUpdatePatch
 {
     private static bool Prefix(FishAISystem __instance) =>
         ProbeBehaviour.Instance?.AllowFishSimulation(__instance) ?? true;
+
+    private static void Postfix(FishAISystem __instance) =>
+        ProbeBehaviour.Instance?.ApplyFishAuthoritativeState(__instance);
 }

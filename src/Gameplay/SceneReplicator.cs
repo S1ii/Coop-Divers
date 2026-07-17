@@ -288,6 +288,7 @@ internal static class SceneMetadataResolver
 internal sealed class SceneReplicator
 {
     private const ushort NativeDefaults = 1 << 15;
+    private const string AnyClientTransition = "*";
     private readonly ManualLogSource _log;
     private SceneTransitionCommand? _pending;
     private bool _applyingHostTransition;
@@ -320,6 +321,9 @@ internal sealed class SceneReplicator
         if (!gate.AllowTransition(SessionRole.Client, "A01", 2f) ||
             gate.AllowTransition(SessionRole.Client, "A01", 2f))
             throw new System.InvalidOperationException("Client transition gate was not one-shot");
+        gate.BeginClientNativeDiveTransition(null, 1f);
+        if (!gate.AllowTransition(SessionRole.Client, "A02", 2f))
+            throw new System.InvalidOperationException("Client wildcard dive transition failed");
     }
 
     internal void OnHostTransition(
@@ -363,8 +367,10 @@ internal sealed class SceneReplicator
 
     internal void BeginClientNativeDiveTransition(string sceneName, float now)
     {
-        _allowedClientTransitionScene = sceneName;
-        _allowedClientTransitionUntil = string.IsNullOrEmpty(sceneName) ? 0f : now + 10f;
+        _allowedClientTransitionScene = string.IsNullOrEmpty(sceneName)
+            ? AnyClientTransition
+            : sceneName;
+        _allowedClientTransitionUntil = now + 10f;
     }
 
     internal void CancelClientNativeDiveTransition()
@@ -451,6 +457,7 @@ internal sealed class SceneReplicator
         {
             if (_allowedClientTransitionScene != null &&
                 (now > _allowedClientTransitionUntil ||
+                 _allowedClientTransitionScene != AnyClientTransition &&
                  !string.Equals(_allowedClientTransitionScene, sceneName,
                      System.StringComparison.Ordinal)))
                 CancelClientNativeDiveTransition();
@@ -483,8 +490,8 @@ internal sealed class SceneReplicator
         float now,
         float expiresAt) =>
         applyingHostTransition ||
-        (now <= expiresAt && string.Equals(
-            expectedScene, requestedScene, System.StringComparison.Ordinal));
+        (now <= expiresAt && (expectedScene == AnyClientTransition || string.Equals(
+            expectedScene, requestedScene, System.StringComparison.Ordinal)));
 
     private static bool ShouldWaitForSceneSeed(bool canDive, bool hasSeed) =>
         canDive && !hasSeed;
