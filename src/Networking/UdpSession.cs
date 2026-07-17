@@ -33,6 +33,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingRoomReady = 256;
+    private const int MaxPendingRoomStates = 256;
     private const int MaxPendingDiveReady = 256;
     private const int MaxPendingDiveExitRequests = 256;
     private const int MaxPendingTravelReady = 256;
@@ -41,6 +42,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
+    private const int MaxFishHookPoses = 128;
 
     private sealed class ReliableReceiveWindow
     {
@@ -125,7 +127,8 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishActionAck> _fishActionAcks = new();
     private readonly ConcurrentQueue<FishLootGrant> _fishLootGrants = new();
     private readonly ConcurrentQueue<FishLootComplete> _fishLootCompletions = new();
-    private readonly ConcurrentQueue<FishHookPose> _fishHookPoses = new();
+    private readonly Queue<int> _fishHookPoseOrder = new();
+    private readonly Dictionary<int, FishHookPose> _fishHookPoses = new();
     private PlayerVisualState _latestPlayerVisualState;
     private bool _hasPlayerVisualState;
     private DiverRuntimeState _latestHostRuntimeState;
@@ -304,6 +307,7 @@ internal sealed class UdpSession : IDisposable
 
         TestProjectileVisualQueueLimit();
         TestFishSnapshotCoalescing();
+        TestFishHookPoseCoalescing();
         TestPlayerVisualCoalescing();
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
@@ -319,6 +323,7 @@ internal sealed class UdpSession : IDisposable
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
         TestRoomReadyQueueOverflow();
+        TestRoomStateQueueOverflow();
         TestIngredientsDeltaQueueOverflow();
         TestDiveReadyQueueOverflow();
         TestDiveExitRequestQueueOverflow();
@@ -363,6 +368,27 @@ internal sealed class UdpSession : IDisposable
             first.X != 3f || !session.TryTakeFishSnapshot(out var second) || second.Id != 2 ||
             session.TryTakeFishSnapshot(out _))
             throw new InvalidOperationException("Fish snapshot coalescing self-test failed");
+    }
+
+    private static void TestFishHookPoseCoalescing()
+    {
+        var session = new UdpSession(null);
+        for (var id = 1; id <= MaxFishHookPoses; id++)
+            session.EnqueueFishHookPose(default(FishHookPose) with { FishId = id, Tick = 1 });
+        session.EnqueueFishHookPose(default(FishHookPose) with { FishId = MaxFishHookPoses, Tick = 2 });
+        session.EnqueueFishHookPose(
+            default(FishHookPose) with { FishId = MaxFishHookPoses + 1, Tick = 1 });
+        if (session._fishHookPoses.Count != MaxFishHookPoses ||
+            !session.TryTakeFishHookPose(out var first) || first.FishId != 2)
+            throw new InvalidOperationException("Fish hook pose queue limit self-test failed");
+        var foundCoalesced = false;
+        while (session.TryTakeFishHookPose(out var pose))
+            if (pose.FishId == MaxFishHookPoses && pose.Tick != 2)
+                throw new InvalidOperationException("Fish hook pose coalescing self-test failed");
+            else if (pose.FishId == MaxFishHookPoses)
+                foundCoalesced = true;
+        if (!foundCoalesced)
+            throw new InvalidOperationException("Fish hook pose coalescing self-test failed");
     }
 
     private static void TestSaveSnapshotAckQueueOverflow()
@@ -742,6 +768,21 @@ internal sealed class UdpSession : IDisposable
         session.QueueRoomReady(default);
         if (session._connected || !session._roomReady.IsEmpty)
             throw new InvalidOperationException("Room ready queue overflow self-test failed");
+    }
+
+    private static void TestRoomStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingRoomStates; index++)
+            session._roomStates.Enqueue(default);
+        session.QueueRoomState(default);
+        if (session._connected || !session._roomStates.IsEmpty ||
+            session._peerLostReason != "room state receive queue overflow")
+            throw new InvalidOperationException("Room state queue overflow self-test failed");
     }
 
     private static void TestDiveExitRequestQueueOverflow()
@@ -1509,8 +1550,30 @@ internal sealed class UdpSession : IDisposable
         return true;
     }
 
-    internal bool TryTakeFishHookPose(out FishHookPose pose) =>
-        _fishHookPoses.TryDequeue(out pose);
+    internal bool TryTakeFishHookPose(out FishHookPose pose)
+    {
+        if (_fishHookPoseOrder.Count > 0)
+        {
+            var fishId = _fishHookPoseOrder.Dequeue();
+            if (_fishHookPoses.Remove(fishId, out pose))
+                return true;
+        }
+        pose = default;
+        return false;
+    }
+
+    private void EnqueueFishHookPose(FishHookPose pose)
+    {
+        if (_fishHookPoses.ContainsKey(pose.FishId))
+        {
+            _fishHookPoses[pose.FishId] = pose;
+            return;
+        }
+        if (_fishHookPoses.Count >= MaxFishHookPoses)
+            _fishHookPoses.Remove(_fishHookPoseOrder.Dequeue());
+        _fishHookPoseOrder.Enqueue(pose.FishId);
+        _fishHookPoses.Add(pose.FishId, pose);
+    }
 
     internal bool SendPickupRemoved(PickupRemoved removed)
     {
@@ -2355,7 +2418,7 @@ internal sealed class UdpSession : IDisposable
                 pose.SceneId == _localSceneId && pose.SceneEpoch == _localSceneEpoch)
             {
                 _lastReceive = now;
-                _fishHookPoses.Enqueue(pose);
+                EnqueueFishHookPose(pose);
             }
             return;
         }
@@ -2551,7 +2614,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _roomStates.Enqueue(state);
+                    QueueRoomState(state);
             }
             return;
         }
@@ -3048,9 +3111,8 @@ internal sealed class UdpSession : IDisposable
         while (_fishLootCompletions.TryDequeue(out _))
         {
         }
-        while (_fishHookPoses.TryDequeue(out _))
-        {
-        }
+        _fishHookPoseOrder.Clear();
+        _fishHookPoses.Clear();
         while (_pickupRemovals.TryDequeue(out _))
         {
         }
@@ -3258,6 +3320,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("room ready receive queue overflow");
+    }
+
+    private void QueueRoomState(RoomState state)
+    {
+        if (HasDecodedQueueCapacity(_roomStates.Count, MaxPendingRoomStates))
+        {
+            _roomStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("room state receive queue overflow");
     }
 
     private void QueueFishActionRequest(FishActionRequest request)
@@ -3502,9 +3574,8 @@ internal sealed class UdpSession : IDisposable
         while (_fishLootCompletions.TryDequeue(out _))
         {
         }
-        while (_fishHookPoses.TryDequeue(out _))
-        {
-        }
+        _fishHookPoseOrder.Clear();
+        _fishHookPoses.Clear();
         while (_pickupRemovals.TryDequeue(out _))
         {
         }
