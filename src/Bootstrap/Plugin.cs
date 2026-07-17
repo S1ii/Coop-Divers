@@ -36,6 +36,7 @@ public sealed class Plugin : BasePlugin
         FishSpawnSeedCoordinator.SelfTest();
         HostAuthorityPolicy.SelfTest();
         MissionProgressReplicator.SelfTest();
+        WorldStateReplicator.SelfTest();
         PickupReplicator.SelfTest();
         RemoteCatchLedger.SelfTest();
         RemoteAvatar.SelfTest();

@@ -13,10 +13,28 @@ internal sealed class WorldStateReplicator
     private readonly Dictionary<string, uint> _clientRevisions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, bool> _pendingClientStates = new(StringComparer.Ordinal);
     private readonly Dictionary<string, bool> _clientOriginals = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _reportedAmbiguousKeys = new(StringComparer.Ordinal);
     private float _nextScan;
     private bool _wasConnected;
 
     internal WorldStateReplicator(ManualLogSource log) => _log = log;
+
+    internal static void SelfTest()
+    {
+        var unique = new Dictionary<string, object>(StringComparer.Ordinal);
+        var ambiguous = new HashSet<string>(StringComparer.Ordinal);
+        var first = new object();
+        var second = new object();
+        AddUniqueKey(unique, ambiguous, "puzzle-a", first);
+        AddUniqueKey(unique, ambiguous, "puzzle-b", second);
+        AddUniqueKey(unique, ambiguous, "puzzle-a", new object());
+        AddUniqueKey(unique, ambiguous, "puzzle-a", new object());
+        AddUniqueKey(unique, ambiguous, " ", new object());
+        if (unique.Count != 1 || !IsUniqueOwner(unique, "puzzle-b", second) ||
+            IsUniqueOwner(unique, "puzzle-b", first) ||
+            !ambiguous.SetEquals(new[] { "puzzle-a" }))
+            throw new InvalidOperationException("World-state unique-key policy failed");
+    }
 
     internal void Update(SessionRole role, UdpSession session, float now)
     {
@@ -68,7 +86,7 @@ internal sealed class WorldStateReplicator
         if (role != SessionRole.Client || session == null || !session.Connected)
             return true;
         var key = saveObject?._key;
-        if (!string.IsNullOrWhiteSpace(key))
+        if (IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
             session.SendWorldFlagRequest(new WorldFlagRequest(key, value));
         return false;
     }
@@ -82,7 +100,7 @@ internal sealed class WorldStateReplicator
         if (role != SessionRole.Host || session == null || !session.Connected)
             return;
         var key = saveObject?._key;
-        if (!string.IsNullOrWhiteSpace(key))
+        if (IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
             Publish(session, key, value);
     }
 
@@ -92,40 +110,37 @@ internal sealed class WorldStateReplicator
         _hostStates.Clear();
         _clientRevisions.Clear();
         _pendingClientStates.Clear();
+        _reportedAmbiguousKeys.Clear();
         _nextScan = 0f;
         _wasConnected = false;
     }
 
     private void ApplyHostRequest(WorldFlagRequest request)
     {
-        foreach (var saveObject in UnityEngine.Object.FindObjectsByType<PuzzleStateSaveObject>(
-                     FindObjectsInactive.Include, FindObjectsSortMode.None))
+        var saveObjects = FindUniqueSaveObjects();
+        if (saveObjects.TryGetValue(request.Key, out var saveObject))
         {
-            if (saveObject != null && string.Equals(saveObject._key, request.Key, StringComparison.Ordinal))
-            {
-                saveObject.Save(request.Value);
-                return;
-            }
+            saveObject.Save(request.Value);
+            return;
         }
         _log.LogWarning($"World flag request has no active object: {request.Key}");
     }
 
     private void ScanHost(UdpSession session)
     {
-        foreach (var saveObject in UnityEngine.Object.FindObjectsByType<PuzzleStateSaveObject>(
-                     FindObjectsInactive.Include, FindObjectsSortMode.None))
+        foreach (var pair in FindUniqueSaveObjects())
         {
-            if (saveObject == null || string.IsNullOrWhiteSpace(saveObject._key))
-                continue;
+            var key = pair.Key;
+            var saveObject = pair.Value;
             try
             {
                 var data = saveObject.GetSaveData();
-                if (data != null && data._keyToSolves.TryGetValue(saveObject._key, out var value))
-                    Publish(session, saveObject._key, value);
+                if (data != null && data._keyToSolves.TryGetValue(key, out var value))
+                    Publish(session, key, value);
             }
             catch (Exception exception)
             {
-                _log.LogWarning($"World flag read failed for {saveObject._key}: {exception.Message}");
+                _log.LogWarning($"World flag read failed for {key}: {exception.Message}");
             }
         }
     }
@@ -145,23 +160,24 @@ internal sealed class WorldStateReplicator
         if (_pendingClientStates.Count == 0)
             return;
         var applied = new List<string>();
-        foreach (var saveObject in UnityEngine.Object.FindObjectsByType<PuzzleStateSaveObject>(
-                     FindObjectsInactive.Include, FindObjectsSortMode.None))
+        foreach (var pair in FindUniqueSaveObjects())
         {
-            if (saveObject == null || !_pendingClientStates.TryGetValue(saveObject._key, out var value))
+            var key = pair.Key;
+            var saveObject = pair.Value;
+            if (!_pendingClientStates.TryGetValue(key, out var value))
                 continue;
-            if (!_clientOriginals.ContainsKey(saveObject._key))
+            if (!_clientOriginals.ContainsKey(key))
             {
                 var data = saveObject.GetSaveData();
-                _clientOriginals[saveObject._key] = data != null &&
-                    data._keyToSolves.TryGetValue(saveObject._key, out var original) && original;
+                _clientOriginals[key] = data != null &&
+                    data._keyToSolves.TryGetValue(key, out var original) && original;
             }
             saveObject._onLoad?.Invoke(value);
             if (value)
                 saveObject._onLoadSolved?.Invoke();
             else
                 saveObject._onLoadNotSolved?.Invoke();
-            applied.Add(saveObject._key);
+            applied.Add(key);
         }
         foreach (var key in applied)
             _pendingClientStates.Remove(key);
@@ -184,6 +200,49 @@ internal sealed class WorldStateReplicator
         }
         _clientOriginals.Clear();
     }
+
+    private Dictionary<string, PuzzleStateSaveObject> FindUniqueSaveObjects()
+    {
+        var unique = new Dictionary<string, PuzzleStateSaveObject>(StringComparer.Ordinal);
+        var ambiguous = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var saveObject in UnityEngine.Object.FindObjectsByType<PuzzleStateSaveObject>(
+                     FindObjectsInactive.Include, FindObjectsSortMode.None))
+        {
+            if (saveObject == null)
+                continue;
+            var key = saveObject._key;
+            var wasUnique = !string.IsNullOrWhiteSpace(key) && unique.ContainsKey(key);
+            AddUniqueKey(unique, ambiguous, key, saveObject);
+            if (wasUnique && ambiguous.Contains(key) && _reportedAmbiguousKeys.Add(key))
+                _log.LogWarning($"World flag replication disabled for duplicate key: {key}");
+        }
+        return unique;
+    }
+
+    private static void AddUniqueKey<T>(
+        IDictionary<string, T> unique,
+        ISet<string> ambiguous,
+        string key,
+        T value)
+    {
+        if (string.IsNullOrWhiteSpace(key) || ambiguous.Contains(key))
+            return;
+        if (unique.ContainsKey(key))
+        {
+            unique.Remove(key);
+            ambiguous.Add(key);
+            return;
+        }
+        unique.Add(key, value);
+    }
+
+    private static bool IsUniqueOwner<T>(
+        IReadOnlyDictionary<string, T> unique,
+        string key,
+        T value)
+        where T : class =>
+        !string.IsNullOrWhiteSpace(key) && value != null &&
+        unique.TryGetValue(key, out var owner) && ReferenceEquals(owner, value);
 
     private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
 

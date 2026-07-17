@@ -4746,6 +4746,18 @@ internal static class Protocol
         BinaryPrimitives.WriteUInt32LittleEndian(pickupRequest.AsSpan(HeaderSize + 24), 0);
         if (TryDecodePickupRequest(pickupRequest, out _, out _))
             throw new InvalidOperationException("Protocol accepted pickup request without revision");
+        pickupRequest = EncodePickupRequest(51, expectedPickupRequest);
+        BinaryPrimitives.WriteUInt32LittleEndian(pickupRequest.AsSpan(HeaderSize + 16), 0);
+        if (TryDecodePickupRequest(pickupRequest, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup request without world ID");
+        pickupRequest = EncodePickupRequest(51, expectedPickupRequest);
+        BinaryPrimitives.WriteInt32LittleEndian(pickupRequest.AsSpan(HeaderSize + 20), 0);
+        if (TryDecodePickupRequest(pickupRequest, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup request without item ID");
+        pickupRequest = EncodePickupRequest(51, expectedPickupRequest);
+        WriteSingle(pickupRequest.AsSpan(HeaderSize + 28), float.NaN);
+        if (TryDecodePickupRequest(pickupRequest, out _, out _))
+            throw new InvalidOperationException("Protocol accepted non-finite pickup position");
 
         var acceptedPickup = new PickupResult(
             expectedPickupRequest.RequestId, expectedPickupRequest.SceneId,

@@ -57,11 +57,20 @@ internal sealed class PickupReplicator
         var request = new PickupRequest(9, 7, 3, 11, 42, PickupRevision, 1f, 2f);
         var accepted = new PickupResult(
             9, 7, 3, 11, 42, PickupRevision, true, PickupRejectReason.None);
+        var collision = request with { WorldId = 12 };
         if (!MatchesRemotePickup(42, 42, 2f, 2f) ||
+            !MatchesRemotePickup(42, 42, 4f, 0f) ||
             MatchesRemotePickup(42, 43, 0f, 0f) ||
             MatchesRemotePickup(42, 42, 5f, 0f) ||
+            MatchesRemotePickup(0, 42, 0f, 0f) ||
+            !MatchesHostWorld(request, 7, 3) ||
+            MatchesHostWorld(request, 7, 2) ||
             !SameTransaction(accepted, request) ||
-            SameTransaction(accepted, request with { WorldId = 12 }) ||
+            SameTransaction(accepted, collision) ||
+            ResolveCachedResult(accepted, request) != accepted ||
+            ResolveCachedResult(accepted, collision).RejectReason != PickupRejectReason.InternalError ||
+            NextRequestId(ulong.MaxValue) != 1 ||
+            !IsClientRequestExpired(15f, 15f) || IsClientRequestExpired(14.99f, 15f) ||
             Reject(request, PickupRejectReason.OutOfRange).Accepted ||
             prefix == null || prefix.GetParameters().Length != 2 ||
             finalizer == null || finalizer.ReturnType != typeof(Exception) ||
@@ -155,7 +164,7 @@ internal sealed class PickupReplicator
         var worldId = WorldId(item);
         if (itemId <= 0 || worldId == 0 || _clientPendingByWorld.ContainsKey(worldId))
             return false;
-        _nextRequestId = _nextRequestId == ulong.MaxValue ? 1 : _nextRequestId + 1;
+        _nextRequestId = NextRequestId(_nextRequestId);
         var position = item.transform.position;
         var request = new PickupRequest(
             _nextRequestId, sceneId, session.RemoteSceneEpoch, worldId, itemId,
@@ -292,9 +301,7 @@ internal sealed class PickupReplicator
     {
         if (_hostResultCache.TryGetValue(request.RequestId, out var cached))
         {
-            QueueHostResult(session, SameTransaction(cached, request)
-                ? cached
-                : Reject(request, PickupRejectReason.InternalError));
+            QueueHostResult(session, ResolveCachedResult(cached, request));
             return;
         }
 
@@ -313,7 +320,7 @@ internal sealed class PickupReplicator
         PlayerCharacter hostPlayer,
         PickupRequest request)
     {
-        if (request.SceneId != sceneId || request.SceneEpoch != session.LocalSceneEpoch)
+        if (!MatchesHostWorld(request, sceneId, session.LocalSceneEpoch))
             return Reject(request, PickupRejectReason.SceneMismatch);
         if (request.KnownRevision != PickupRevision)
             return Reject(request, PickupRejectReason.StaleRevision);
@@ -389,7 +396,7 @@ internal sealed class PickupReplicator
             return;
         var expired = new List<ulong>();
         foreach (var pair in _clientPending)
-            if (now >= pair.Value.ExpiresAt)
+            if (IsClientRequestExpired(now, pair.Value.ExpiresAt))
                 expired.Add(pair.Key);
         foreach (var requestId in expired)
         {
@@ -437,6 +444,19 @@ internal sealed class PickupReplicator
     private static PickupResult Reject(PickupRequest request, PickupRejectReason reason) =>
         new(request.RequestId, request.SceneId, request.SceneEpoch, request.WorldId,
             request.ItemId, PickupRevision, false, reason);
+
+    private static PickupResult ResolveCachedResult(PickupResult cached, PickupRequest request) =>
+        SameTransaction(cached, request)
+            ? cached
+            : Reject(request, PickupRejectReason.InternalError);
+
+    private static ulong NextRequestId(ulong requestId) =>
+        requestId == ulong.MaxValue ? 1 : requestId + 1;
+
+    private static bool IsClientRequestExpired(float now, float expiresAt) => now >= expiresAt;
+
+    private static bool MatchesHostWorld(PickupRequest request, uint sceneId, uint sceneEpoch) =>
+        request.SceneId == sceneId && request.SceneEpoch == sceneEpoch;
 
     private static bool SameTransaction(PickupResult result, PickupRequest request) =>
         result.RequestId == request.RequestId && result.SceneId == request.SceneId &&
