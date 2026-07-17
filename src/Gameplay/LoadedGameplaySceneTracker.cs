@@ -12,6 +12,9 @@ internal sealed class LoadedGameplaySceneTracker
     internal int GameplaySceneCount => _gameplay.Count;
     internal bool AllowsUnsafeWorldReplication => _gameplay.Count <= 1;
 
+    internal bool AllowsWorldScopedReplication(SessionRole role, bool connected) =>
+        role == SessionRole.Offline || !connected || AllowsUnsafeWorldReplication;
+
     internal void Reset()
     {
         _loaded.Clear();
@@ -57,6 +60,10 @@ internal sealed class LoadedGameplaySceneTracker
         tracker.SetForTest(11, "DR_A02", true);
         if (tracker.AllowsUnsafeWorldReplication || tracker.GameplaySceneCount != 2)
             throw new InvalidOperationException("Additive gameplay scene was not rejected");
+        if (tracker.AllowsWorldScopedReplication(SessionRole.Host, true) ||
+            !tracker.AllowsWorldScopedReplication(SessionRole.Offline, true) ||
+            !tracker.AllowsWorldScopedReplication(SessionRole.Client, false))
+            throw new InvalidOperationException("World replication gate self-test failed");
         tracker.RemoveForTest(11);
         if (!tracker.AllowsUnsafeWorldReplication || tracker.GameplaySceneCount != 1)
             throw new InvalidOperationException("Gameplay scene unload did not restore the gate");

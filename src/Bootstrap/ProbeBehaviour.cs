@@ -257,9 +257,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
             Role, _session, _sceneId, _player, _remoteAvatar,
             Role == SessionRole.Host && (_diveCoordinator?.ClientDead ?? false));
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
-        _fishReplicator?.Update(
-            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
-            _player, _remoteAvatar.TargetTransform);
+        if (!UnsafeWorldReplicationBlocked)
+        {
+            _fishReplicator?.Update(
+                Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
+                _player, _remoteAvatar.TargetTransform);
+        }
         if (!UnsafeWorldReplicationBlocked)
         {
             _bossReplicator?.Update(
@@ -472,8 +475,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     private bool UnsafeWorldReplicationBlocked =>
-        Role != SessionRole.Offline && _session?.Connected == true &&
-        !_loadedGameplayScenes.AllowsUnsafeWorldReplication;
+        !_loadedGameplayScenes.AllowsWorldScopedReplication(
+            Role, _session?.Connected == true);
 
     private void OnUnitySceneLoaded(Scene scene, LoadSceneMode mode)
     {
@@ -501,6 +504,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _unsafeWorldReplicationBlocked = blocked;
         if (!blocked)
         {
+            _fishReplicator?.Clear();
             _pickupReplicator?.Clear();
             _bossReplicator?.Clear();
             _worldStateReplicator?.Clear();
@@ -508,6 +512,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             return;
         }
 
+        _fishReplicator?.Clear();
         _pickupReplicator?.Clear();
         _bossReplicator?.Clear();
         Logger?.LogWarning(
@@ -539,6 +544,45 @@ public sealed class ProbeBehaviour : MonoBehaviour
         {
         }
         while (_session.TryTakeWorldFlagState(out _))
+        {
+        }
+        while (_session.TryTakeFishSnapshot(out _))
+        {
+        }
+        while (_session.TryTakeFishRemoved(out _))
+        {
+        }
+        while (_session.TryTakeFishPickupResult(out _))
+        {
+        }
+        while (_session.TryTakeFishManifest(out _))
+        {
+        }
+        while (_session.TryTakeFishManifestState(out _))
+        {
+        }
+        while (_session.TryTakeFishLifecycle(out _))
+        {
+        }
+        while (_session.TryTakeFishActionRequest(out _))
+        {
+        }
+        while (_session.TryTakeFishActionAck(out _))
+        {
+        }
+        while (_session.TryTakeFishLootGrant(out _))
+        {
+        }
+        while (_session.TryTakeFishLootComplete(out _))
+        {
+        }
+        while (_session.TryTakeFishDamageRequest(out _))
+        {
+        }
+        while (_session.TryTakeFishPickupRequest(out _))
+        {
+        }
+        while (_session.TryTakeFishHookPose(out _))
         {
         }
     }
