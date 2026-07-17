@@ -28,6 +28,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingDiveExitRequests = 256;
+    private const int MaxPendingTravelReady = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -303,6 +304,7 @@ internal sealed class UdpSession : IDisposable
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
         TestDiveExitRequestQueueOverflow();
+        TestTravelReadyQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -628,6 +630,20 @@ internal sealed class UdpSession : IDisposable
         session.QueueDiveExitRequest(default);
         if (session._connected || !session._diveExitRequests.IsEmpty)
             throw new InvalidOperationException("Dive exit request queue overflow self-test failed");
+    }
+
+    private static void TestTravelReadyQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingTravelReady; index++)
+            session._travelReady.Enqueue(default);
+        session.QueueTravelReady(default);
+        if (session._connected || !session._travelReady.IsEmpty)
+            throw new InvalidOperationException("Travel ready queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2470,7 +2486,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _travelReady.Enqueue(ready);
+                    QueueTravelReady(ready);
             }
             return;
         }
@@ -3094,6 +3110,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("dive exit request receive queue overflow");
+    }
+
+    private void QueueTravelReady(TravelReady ready)
+    {
+        if (HasDecodedQueueCapacity(_travelReady.Count, MaxPendingTravelReady))
+        {
+            _travelReady.Enqueue(ready);
+            return;
+        }
+        FailReliableDelivery("travel ready receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>

@@ -37,6 +37,15 @@ updates, unsupported story moments, and the occasional desync.
 Traffic is plain UDP with no encryption or peer authentication. Only play
 with people you trust, and do not expose a public lobby.
 
+## Compatibility and removal
+
+Runtime patching can conflict with antivirus, overlays, other mods, or a
+game update. If the game becomes unstable, close it and delete
+`BepInEx/plugins/DaveTheDiverMP/DaveTheDiverMP.dll`.
+
+Networking is opt-in from the title menu, and session traces are written
+under `BepInEx/DTMP-logs`. The mod has no telemetry or auto-updater.
+
 ## Install
 
 1. Install BepInEx IL2CPP for Dave the Diver.
