@@ -512,7 +512,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _bossReplicator?.Clear();
         Logger?.LogWarning(
             $"Network world replication disabled: {_loadedGameplayScenes.GameplaySceneCount} " +
-            "gameplay scenes are loaded; additive routes are unsupported");
+            "gameplay scenes are loaded; leave the additive route to resume replication");
         DrainBlockedWorldPackets();
     }
 

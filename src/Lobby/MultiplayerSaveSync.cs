@@ -6,6 +6,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using BepInEx;
 using BepInEx.Logging;
 using DR.Save;
@@ -19,7 +20,8 @@ internal static class MultiplayerSaveSync
     private const SaveSlotType MpSlotType = SaveSlotType.Manual;
     private const uint BundleMagic = 0x42534D44; // DMSB
     private const int BundleHeaderSize = 16;
-    private const int MarkerSchema = 2;
+    private const int MarkerSchema = 3;
+    private const int LegacyMarkerSchema = 2;
     private const int MaxBundleBytes = 16 * 1024 * 1024;
     private const int MaxMetadataBytes = 64 * 1024;
     private static readonly string MpSlotMarkerPath =
@@ -31,7 +33,15 @@ internal static class MultiplayerSaveSync
     {
         public int Schema { get; set; }
         public int Slot { get; set; }
-        public string Fingerprint { get; set; } = string.Empty;
+        public string MultiplayerFingerprint { get; set; } = string.Empty;
+        public string PreviousFingerprint { get; set; } = string.Empty;
+        public string ProfileIdentity { get; set; } = string.Empty;
+        public string GameBuild { get; set; } = string.Empty;
+        public string CreatedAt { get; set; } = string.Empty;
+
+        [JsonPropertyName("Fingerprint")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string LegacyFingerprint { get; set; }
     }
 
     private sealed class PendingWrite
@@ -92,11 +102,19 @@ internal static class MultiplayerSaveSync
         {
             Schema = MarkerSchema,
             Slot = MpSlotIndex,
-            Fingerprint = fingerprint
+            MultiplayerFingerprint = fingerprint,
+            PreviousFingerprint = new string('A', 64),
+            ProfileIdentity = string.Empty,
+            GameBuild = "self-test",
+            CreatedAt = "2026-07-18T00:00:00.0000000+00:00"
         });
         if (!TryParseMarker(markerJson, out var marker) ||
             !MarkerOwns(marker, fingerprint) || MarkerOwns(marker, new string('0', 64)) ||
-            TryParseMarker("{\"Schema\":1,\"Slot\":6,\"Fingerprint\":\"bad\"}", out _))
+            marker.PreviousFingerprint != new string('A', 64) ||
+            marker.GameBuild.Length == 0 || marker.CreatedAt.Length == 0 ||
+            TryParseMarker("{\"Schema\":3,\"Slot\":6,\"MultiplayerFingerprint\":\"bad\"}", out _) ||
+            !TryParseMarker($"{{\"Schema\":2,\"Slot\":6,\"Fingerprint\":\"{fingerprint}\"}}", out var legacy) ||
+            !MarkerOwns(legacy, fingerprint))
             throw new InvalidOperationException("MP save marker self-test failed");
         var pendingJson = JsonSerializer.Serialize(new PendingWrite
         {
@@ -107,7 +125,9 @@ internal static class MultiplayerSaveSync
             TargetFingerprint = new string('A', 64)
         });
         if (!TryParsePending(pendingJson, out var pending) || !pending.HadSlot ||
-            pending.PreviousFingerprint != fingerprint)
+            pending.PreviousFingerprint != fingerprint ||
+            !TryParsePending($"{{\"Schema\":2,\"Slot\":6,\"HadSlot\":true," +
+                $"\"PreviousFingerprint\":\"{fingerprint}\",\"TargetFingerprint\":\"\"}}", out _))
             throw new InvalidOperationException("MP save pending journal self-test failed");
         if (IsApplyingRemoteSnapshot)
             throw new InvalidOperationException("MP save apply scope leaked before self-test");
@@ -285,7 +305,7 @@ internal static class MultiplayerSaveSync
             var fullFingerprint = FullFingerprint(_hostSnapshot);
             pending.TargetFingerprint = fullFingerprint;
             WriteAtomicText(MpSlotPendingPath, JsonSerializer.Serialize(pending));
-            if (!CommitSlotWrite(fullFingerprint, log))
+            if (!CommitSlotWrite(pending, fullFingerprint, log))
             {
                 RollBackSlotWrite(save, pending, log);
                 _hostSnapshot = Array.Empty<byte>();
@@ -387,7 +407,7 @@ internal static class MultiplayerSaveSync
             if (verified)
                 _normalSaveRestartRequired = true;
             var loaded = verified && save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
-            if (!loaded || !CommitSlotWrite(fullFingerprint, log))
+            if (!loaded || !CommitSlotWrite(pending, fullFingerprint, log))
             {
                 RollBackSlotWrite(save, pending, log);
                 RejectClientSave(session, "Could not safely load host save");
@@ -541,16 +561,18 @@ internal static class MultiplayerSaveSync
         }
     }
 
-    private static bool CommitSlotWrite(string fingerprint, ManualLogSource log)
+    private static bool CommitSlotWrite(
+        PendingWrite pending,
+        string fingerprint,
+        ManualLogSource log)
     {
         try
         {
-            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
-            {
-                Schema = MarkerSchema,
-                Slot = MpSlotIndex,
-                Fingerprint = fingerprint
-            }));
+            if (pending == null || pending.Schema != MarkerSchema || pending.Slot != MpSlotIndex ||
+                !string.Equals(pending.TargetFingerprint, fingerprint, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("pending journal does not match marker commit");
+            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
+                CreateMarker(fingerprint, pending.PreviousFingerprint)));
             if (!TryDeleteFile(MpSlotPendingPath))
                 throw new IOException("could not remove pending journal");
             if (!TryDeleteFile(MpSlotBackupPath))
@@ -595,7 +617,9 @@ internal static class MultiplayerSaveSync
     {
         try
         {
-            if (pending == null || pending.Schema != MarkerSchema || pending.Slot != MpSlotIndex)
+            if (pending == null ||
+                (pending.Schema != MarkerSchema && pending.Schema != LegacyMarkerSchema) ||
+                pending.Slot != MpSlotIndex)
                 throw new InvalidDataException("invalid pending journal");
             if (pending.HadSlot)
             {
@@ -607,12 +631,8 @@ internal static class MultiplayerSaveSync
                     !TryReadSlotBundle(save, out var restored, out _) ||
                     FullFingerprint(restored) != pending.PreviousFingerprint)
                     throw new IOException("restored slot verification failed");
-                WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
-                {
-                    Schema = MarkerSchema,
-                    Slot = MpSlotIndex,
-                    Fingerprint = pending.PreviousFingerprint
-                }));
+                WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
+                    CreateMarker(pending.PreviousFingerprint, string.Empty)));
             }
             else
             {
@@ -648,7 +668,23 @@ internal static class MultiplayerSaveSync
         if (TryParseMarker(json, out var marker))
         {
             if (MarkerOwns(marker, currentFingerprint))
+            {
+                if (marker.Schema == MarkerSchema)
+                    return true;
+                try
+                {
+                    WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
+                        CreateMarker(currentFingerprint, string.Empty)));
+                }
+                catch (Exception exception)
+                {
+                    RefuseOccupiedSlot(log, "legacy marker could not be migrated");
+                    log?.LogWarning($"MP save sync: legacy marker migration failed: {exception.Message}");
+                    return false;
+                }
+                log?.LogInfo("MP save sync: migrated schema-2 slot marker");
                 return true;
+            }
             RefuseOccupiedSlot(log, "slot contents differ from the last verified DTMP write");
             return false;
         }
@@ -656,12 +692,8 @@ internal static class MultiplayerSaveSync
         if (uint.TryParse(json.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture,
                 out var legacy) && legacy == Fingerprint(current))
         {
-            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
-            {
-                Schema = MarkerSchema,
-                Slot = MpSlotIndex,
-                Fingerprint = currentFingerprint
-            }));
+            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
+                CreateMarker(currentFingerprint, string.Empty)));
             log?.LogInfo("MP save sync: migrated legacy slot marker");
             return true;
         }
@@ -856,8 +888,17 @@ internal static class MultiplayerSaveSync
         try
         {
             marker = JsonSerializer.Deserialize<SlotMarker>(json);
-            return marker != null && marker.Schema == MarkerSchema && marker.Slot == MpSlotIndex &&
-                IsFullFingerprint(marker.Fingerprint);
+            if (marker == null || marker.Slot != MpSlotIndex)
+                return false;
+            if (marker.Schema == MarkerSchema)
+                return IsFullFingerprint(marker.MultiplayerFingerprint) &&
+                    (string.IsNullOrEmpty(marker.PreviousFingerprint) ||
+                        IsFullFingerprint(marker.PreviousFingerprint)) &&
+                    !string.IsNullOrWhiteSpace(marker.GameBuild) &&
+                    DateTimeOffset.TryParseExact(
+                        marker.CreatedAt, "O", CultureInfo.InvariantCulture,
+                        DateTimeStyles.None, out _);
+            return marker.Schema == LegacyMarkerSchema && IsFullFingerprint(marker.LegacyFingerprint);
         }
         catch (JsonException)
         {
@@ -871,7 +912,9 @@ internal static class MultiplayerSaveSync
         try
         {
             pending = JsonSerializer.Deserialize<PendingWrite>(json);
-            return pending != null && pending.Schema == MarkerSchema && pending.Slot == MpSlotIndex &&
+            return pending != null &&
+                (pending.Schema == MarkerSchema || pending.Schema == LegacyMarkerSchema) &&
+                pending.Slot == MpSlotIndex &&
                 (!pending.HadSlot || IsFullFingerprint(pending.PreviousFingerprint)) &&
                 (string.IsNullOrEmpty(pending.TargetFingerprint) ||
                     IsFullFingerprint(pending.TargetFingerprint));
@@ -884,7 +927,23 @@ internal static class MultiplayerSaveSync
 
     private static bool MarkerOwns(SlotMarker marker, string fingerprint) =>
         marker != null && string.Equals(
-            marker.Fingerprint, fingerprint, StringComparison.OrdinalIgnoreCase);
+            marker.Schema == MarkerSchema
+                ? marker.MultiplayerFingerprint
+                : marker.LegacyFingerprint,
+            fingerprint, StringComparison.OrdinalIgnoreCase);
+
+    private static SlotMarker CreateMarker(string multiplayerFingerprint, string previousFingerprint) =>
+        new()
+        {
+            Schema = MarkerSchema,
+            Slot = MpSlotIndex,
+            MultiplayerFingerprint = multiplayerFingerprint,
+            PreviousFingerprint = previousFingerprint ?? string.Empty,
+            // No stable local profile/Steam identity is proven safe for LAN/offline use.
+            ProfileIdentity = string.Empty,
+            GameBuild = string.IsNullOrWhiteSpace(Application.version) ? "unknown" : Application.version,
+            CreatedAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture)
+        };
 
     private static bool IsFullFingerprint(string value)
     {

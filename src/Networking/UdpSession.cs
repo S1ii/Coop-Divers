@@ -26,6 +26,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
+    private const int MaxPendingSaveSnapshotAcks = 256;
 
     private sealed class ReliableReceiveWindow
     {
@@ -264,6 +265,9 @@ internal sealed class UdpSession : IDisposable
         if (!HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks - 1, MaxPendingSaveSnapshotChunks) ||
             HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks, MaxPendingSaveSnapshotChunks))
             throw new InvalidOperationException("Save snapshot queue cap self-test failed");
+        if (!HasDecodedQueueCapacity(MaxPendingSaveSnapshotAcks - 1, MaxPendingSaveSnapshotAcks) ||
+            HasDecodedQueueCapacity(MaxPendingSaveSnapshotAcks, MaxPendingSaveSnapshotAcks))
+            throw new InvalidOperationException("Save snapshot acknowledgement queue cap self-test failed");
         if (!HasDecodedQueueCapacity(
                 MaxPendingIngredientsSnapshotChunks - 1, MaxPendingIngredientsSnapshotChunks) ||
             HasDecodedQueueCapacity(
@@ -279,6 +283,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
+        TestSaveSnapshotAckQueueOverflow();
         TestCargoEpochGate();
         TestManagerEventEpochGate();
         TestSceneSeedEpochGate();
@@ -304,6 +309,21 @@ internal sealed class UdpSession : IDisposable
                 foundCoalesced = true;
         if (!foundCoalesced)
             throw new InvalidOperationException("Projectile visual coalescing self-test failed");
+    }
+
+    private static void TestSaveSnapshotAckQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingSaveSnapshotAcks; index++)
+            session._saveSnapshotAcks.Enqueue(default);
+        session.QueueSaveSnapshotAck(default);
+        if (session._connected || !session._saveSnapshotAcks.IsEmpty ||
+            session._peerLostReason != "save snapshot acknowledgement receive queue overflow")
+            throw new InvalidOperationException("Save snapshot acknowledgement overflow self-test failed");
     }
 
     private static void TestPlayerVisualCoalescing()
@@ -2136,7 +2156,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _saveSnapshotAcks.Enqueue(ack);
+                    QueueSaveSnapshotAck(ack);
             }
             return;
         }
@@ -2731,6 +2751,16 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("save snapshot receive queue overflow");
     }
 
+    private void QueueSaveSnapshotAck(SaveSnapshotAck ack)
+    {
+        if (HasDecodedQueueCapacity(_saveSnapshotAcks.Count, MaxPendingSaveSnapshotAcks))
+        {
+            _saveSnapshotAcks.Enqueue(ack);
+            return;
+        }
+        FailReliableDelivery("save snapshot acknowledgement receive queue overflow");
+    }
+
     private void QueueIngredientsSnapshotChunk(IngredientsSnapshotChunk chunk)
     {
         if (HasDecodedQueueCapacity(
@@ -2758,7 +2788,7 @@ internal sealed class UdpSession : IDisposable
         ResetPeerState();
         if (_role == SessionRole.Host)
             _remote = null;
-        _log.LogWarning($"Network: {reason}; peer session reset");
+        _log?.LogWarning($"Network: {reason}; peer session reset");
     }
 
     private static bool IsFishDirectionAllowed(SessionRole receiver, PacketType type) =>

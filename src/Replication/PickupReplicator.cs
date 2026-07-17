@@ -326,6 +326,8 @@ internal sealed class PickupReplicator
             return Reject(request, PickupRejectReason.MissingEntity);
         if (ItemId(item) != request.ItemId)
             return Reject(request, PickupRejectReason.ItemMismatch);
+        if (!IsAvailable(item))
+            return Reject(request, PickupRejectReason.AlreadyClaimed);
 
         var itemPosition = item.transform.position;
         var expectedDx = itemPosition.x - request.ExpectedX;
@@ -465,6 +467,18 @@ internal sealed class PickupReplicator
         catch
         {
             return 0;
+        }
+    }
+
+    private static bool IsAvailable(PickupInstanceItem item)
+    {
+        try
+        {
+            return item != null && item.isActiveAndEnabled && item.GetIsEnableInteraction;
+        }
+        catch
+        {
+            return false;
         }
     }
 
