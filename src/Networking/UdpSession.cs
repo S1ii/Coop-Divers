@@ -26,9 +26,11 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
+    private const int MaxPendingFishLootGrants = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
+    private const int MaxPendingRoomReady = 256;
     private const int MaxPendingDiveExitRequests = 256;
     private const int MaxPendingTravelReady = 256;
     private const int MaxPendingDiverLifeStates = 256;
@@ -307,9 +309,11 @@ internal sealed class UdpSession : IDisposable
         TestSaveSnapshotAckQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
+        TestFishLootGrantQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
+        TestRoomReadyQueueOverflow();
         TestIngredientsDeltaQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
@@ -398,6 +402,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._fishActionAcks.IsEmpty ||
             session._peerLostReason != "fish action acknowledgement receive queue overflow")
             throw new InvalidOperationException("Fish action acknowledgement queue overflow self-test failed");
+    }
+
+    private static void TestFishLootGrantQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishLootGrants; index++)
+            session._fishLootGrants.Enqueue(default);
+        session.QueueFishLootGrant(default);
+        if (session._connected || !session._fishLootGrants.IsEmpty ||
+            session._peerLostReason != "fish loot grant receive queue overflow")
+            throw new InvalidOperationException("Fish loot grant queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -670,6 +689,20 @@ internal sealed class UdpSession : IDisposable
         if (!session._ingredientsDeltas.IsEmpty || !session.TryConsumeIngredientsDeltaResync() ||
             session.TryConsumeIngredientsDeltaResync() || !session._connected)
             throw new InvalidOperationException("Ingredients delta queue overflow self-test failed");
+    }
+
+    private static void TestRoomReadyQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingRoomReady; index++)
+            session._roomReady.Enqueue(default);
+        session.QueueRoomReady(default);
+        if (session._connected || !session._roomReady.IsEmpty)
+            throw new InvalidOperationException("Room ready queue overflow self-test failed");
     }
 
     private static void TestDiveExitRequestQueueOverflow()
@@ -2242,7 +2275,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && grant.SceneId == _remoteSceneId &&
                     grant.SceneEpoch == _remoteSceneEpoch)
-                    _fishLootGrants.Enqueue(grant);
+                    QueueFishLootGrant(grant);
             }
             return;
         }
@@ -2451,7 +2484,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _roomReady.Enqueue(ready);
+                    QueueRoomReady(ready);
             }
             return;
         }
@@ -3162,6 +3195,16 @@ internal sealed class UdpSession : IDisposable
         _log?.LogWarning("Ingredients delta receive backlog reset; client will resnapshot");
     }
 
+    private void QueueRoomReady(RoomReady ready)
+    {
+        if (HasDecodedQueueCapacity(_roomReady.Count, MaxPendingRoomReady))
+        {
+            _roomReady.Enqueue(ready);
+            return;
+        }
+        FailReliableDelivery("room ready receive queue overflow");
+    }
+
     private void QueueFishActionRequest(FishActionRequest request)
     {
         if (HasDecodedQueueCapacity(_fishActionRequests.Count, MaxPendingFishActionRequests))
@@ -3190,6 +3233,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish action acknowledgement receive queue overflow");
+    }
+
+    private void QueueFishLootGrant(FishLootGrant grant)
+    {
+        if (HasDecodedQueueCapacity(_fishLootGrants.Count, MaxPendingFishLootGrants))
+        {
+            _fishLootGrants.Enqueue(grant);
+            return;
+        }
+        FailReliableDelivery("fish loot grant receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
