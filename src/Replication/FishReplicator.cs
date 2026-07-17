@@ -42,6 +42,7 @@ internal sealed class FishReplicator
     private const float SnapshotKeyframeSeconds = 1f;
     private const float RemoteStimulusInterval = 0.1f;
     private const int MaxFishControlPacketsPerFrame = 8;
+    private const int MaxPendingHostLifecycles = 256;
     private const int ReliableCapacityReserve = 32;
     private const float ActionTimeoutSeconds = 2f;
     private const float HookLeaseSeconds = 12f;
@@ -372,6 +373,15 @@ internal sealed class FishReplicator
         var actionQueue = new Queue<int>();
         for (var value = 1; value <= MaxQueuedActionsPerFish + 1; value++)
             TryEnqueueBounded(actionQueue, value, MaxQueuedActionsPerFish);
+        var lifecycleQueue = new Queue<FishLifecycle>();
+        for (var value = 0; value < MaxPendingHostLifecycles; value++)
+            lifecycleQueue.Enqueue(default);
+        var lifecycleOverflowSignalled = false;
+        var lifecycleQueued = TryEnqueueHostLifecycle(lifecycleQueue, default, () =>
+        {
+            lifecycleOverflowSignalled = true;
+            lifecycleQueue.Clear();
+        });
         var delayedQueue = new Queue<QueuedAction>();
         delayedQueue.Enqueue(new QueuedAction(FishAction.Damage, 1, 0, 2, 0));
         delayedQueue.Enqueue(new QueuedAction(FishAction.Damage, 2, 0, 2, 0));
@@ -495,6 +505,7 @@ internal sealed class FishReplicator
             !TryMarkProcessedRequest(wrappedRequests, ref wrappedHighest, ulong.MaxValue, 4) ||
             !TryMarkProcessedRequest(wrappedRequests, ref wrappedHighest, 1, 4) ||
             actionQueue.Count != MaxQueuedActionsPerFish || actionQueue.Peek() != 1 ||
+            lifecycleQueued || !lifecycleOverflowSignalled || lifecycleQueue.Count != 0 ||
             delayedQueue.Count != 2 || delayedQueue.Peek().Damage != 1 ||
             !expiredInFlight || !retainedTimedOutIdentity || !acceptedLateAck ||
             timedActions.Count != 0 || timedActionByFish.Count != 0 ||
@@ -2113,7 +2124,7 @@ internal sealed class FishReplicator
             ? FishPhase.Captured : FishPhase.Corpse;
         _hostRemovedFish.Add(fish);
         SendCommittedFishLoot(session, transaction);
-        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+        QueueHostLifecycle(session, new FishLifecycle(
             sceneId, session.LocalSceneEpoch, request.Id, revision,
             FishLifecycleKind.Despawn, 0, FishPhase.None, 0f));
         RemoveHostFish(request.Id);
@@ -2344,7 +2355,7 @@ internal sealed class FishReplicator
         HostFish info,
         FishLifecycleKind kind)
     {
-        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+        QueueHostLifecycle(session, new FishLifecycle(
             sceneId, session.LocalSceneEpoch, id, info.Revision, kind,
             0,
             info.Phase, Mathf.Max(0f, info.Fish.HP)));
@@ -2353,7 +2364,7 @@ internal sealed class FishReplicator
     private uint SendHostDespawn(UdpSession session, uint sceneId, int id)
     {
         var revision = NextHostRevision(id);
-        _pendingHostLifecycles.Enqueue(new FishLifecycle(
+        QueueHostLifecycle(session, new FishLifecycle(
             sceneId, session.LocalSceneEpoch, id, revision, FishLifecycleKind.Despawn,
             0, FishPhase.None, 0f));
         return revision;
@@ -3495,6 +3506,24 @@ internal sealed class FishReplicator
             return false;
         queue.Enqueue(value);
         return true;
+    }
+
+    private static bool TryEnqueueHostLifecycle(
+        Queue<FishLifecycle> queue, FishLifecycle lifecycle, System.Action onOverflow)
+    {
+        if (TryEnqueueBounded(queue, lifecycle, MaxPendingHostLifecycles))
+            return true;
+        onOverflow();
+        return false;
+    }
+
+    private void QueueHostLifecycle(UdpSession session, FishLifecycle lifecycle)
+    {
+        TryEnqueueHostLifecycle(_pendingHostLifecycles, lifecycle, () =>
+        {
+            _pendingHostLifecycles.Clear();
+            session.FailReliableDeliveryFromDomain("fish lifecycle publish queue overflow");
+        });
     }
 
     private static int BoundDamage(int damage) => Math.Min(damage, 10_000);
