@@ -31,6 +31,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingFishLootGrants = 256;
     private const int MaxPendingFishLootCompletions = 256;
     private const int MaxPendingPickupRequests = 256;
+    private const int MaxPendingPickupResults = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
@@ -324,6 +325,7 @@ internal sealed class UdpSession : IDisposable
         TestFishLootGrantQueueOverflow();
         TestFishLootCompleteQueueOverflow();
         TestPickupRequestQueueOverflow();
+        TestPickupResultQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
@@ -516,6 +518,21 @@ internal sealed class UdpSession : IDisposable
         session.QueuePickupRequest(default);
         if (session._connected || !session._pickupRequests.IsEmpty)
             throw new InvalidOperationException("Pickup request queue overflow self-test failed");
+    }
+
+    private static void TestPickupResultQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingPickupResults; index++)
+            session._pickupResults.Enqueue(default);
+        session.QueuePickupResult(default);
+        if (session._connected || !session._pickupResults.IsEmpty ||
+            session._peerLostReason != "pickup result receive queue overflow")
+            throw new InvalidOperationException("Pickup result queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -2572,7 +2589,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) &&
                     MatchesRemoteWorld(result.SceneId, result.SceneEpoch))
-                    _pickupResults.Enqueue(result);
+                    QueuePickupResult(result);
             }
             return;
         }
@@ -3433,6 +3450,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("pickup request receive queue overflow");
+    }
+
+    private void QueuePickupResult(PickupResult result)
+    {
+        if (HasDecodedQueueCapacity(_pickupResults.Count, MaxPendingPickupResults))
+        {
+            _pickupResults.Enqueue(result);
+            return;
+        }
+        FailReliableDelivery("pickup result receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
