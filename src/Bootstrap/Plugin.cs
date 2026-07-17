@@ -22,6 +22,7 @@ public sealed class Plugin : BasePlugin
     {
         Protocol.SelfTest();
         HarmonyCompatibilityReporter.SelfTest();
+        ControllerScopePolicy.SelfTest();
         UdpSession.SelfTest();
         ProbeBehaviour.SelfTest();
         LobbyInput.SelfTest();
@@ -30,6 +31,7 @@ public sealed class Plugin : BasePlugin
         WorldObjectId.SelfTest();
         FishReplicator.SelfTest();
         DiveCoordinator.SelfTest();
+        TravelCoordinator.SelfTest();
         DiverRuntimeAuthority.SelfTest();
         DiverWeaponAuthority.SelfTest();
         DiverWeaponReplicator.SelfTest();

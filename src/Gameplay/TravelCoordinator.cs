@@ -52,6 +52,7 @@ internal static class TravelTargets
 
 internal sealed class TravelCoordinator
 {
+    private const float TravelTimeoutSeconds = 20f;
     private sealed class ElementText
     {
         internal readonly MoveSceneElement Element;
@@ -84,11 +85,18 @@ internal sealed class TravelCoordinator
     private bool _starting;
     private bool _warnedMissingAction;
     private float _nextElementScan;
+    private float _expiresAt;
     private Action _hostAction;
     private Action _clientAction;
     private TravelRoute _route;
 
     internal TravelCoordinator(ManualLogSource log) => _log = log;
+
+    internal static void SelfTest()
+    {
+        if (!HasExpired(3f, 3f) || HasExpired(3.01f, 3f) || HasExpired(0f, 100f))
+            throw new InvalidOperationException("Travel timeout self-test failed");
+    }
 
     internal bool Request(
         SessionRole role,
@@ -108,6 +116,7 @@ internal sealed class TravelCoordinator
             return true;
 
         Select(targetId);
+        _expiresAt = Time.realtimeSinceStartup + TravelTimeoutSeconds;
         _soloAllowed = soloAllowed;
         _hostDead = hostDead;
         _route = route;
@@ -144,6 +153,12 @@ internal sealed class TravelCoordinator
     {
         if (session == null || !session.Connected)
         {
+            Reset();
+            return;
+        }
+        if (_targetId != 0 && HasExpired(_expiresAt, Time.realtimeSinceStartup))
+        {
+            _log.LogWarning($"Travel {TravelTargets.Name(_targetId)} timed out; request cleared");
             Reset();
             return;
         }
@@ -218,6 +233,7 @@ internal sealed class TravelCoordinator
         _starting = false;
         _warnedMissingAction = false;
         _nextElementScan = 0f;
+        _expiresAt = 0f;
         _hostAction = null;
         _clientAction = null;
         _route = default;
@@ -251,6 +267,7 @@ internal sealed class TravelCoordinator
         _clientAction = null;
         _route = default;
         _warnedMissingAction = false;
+        _expiresAt = Time.realtimeSinceStartup + TravelTimeoutSeconds;
     }
 
     private void Publish(UdpSession session)
@@ -498,6 +515,9 @@ internal sealed class TravelCoordinator
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;
+
+    private static bool HasExpired(float expiresAt, float now) =>
+        expiresAt > 0f && now >= expiresAt;
 }
 
 [HarmonyPatch(typeof(MoveSceneElement), nameof(MoveSceneElement.OnClick))]

@@ -44,6 +44,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private SpriteRenderer _lobbyRenderer;
     private SushiBarPlayerHanlder _sushiPlayer;
     private SpriteRenderer _sushiRenderer;
+    private string _unsupportedControllerName = string.Empty;
     internal UdpSession _session;
     private FishReplicator _fishReplicator;
     private PickupReplicator _pickupReplicator;
@@ -79,6 +80,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private string _lobbyError = string.Empty;
     private float _hostAuthorityRefreshAt;
     private bool _wasSessionConnected;
+    private bool _recoveryPending;
+    private float _recoveryReadyAt;
+    private string _lastRecoveryBlockedDomain = string.Empty;
     private int _remoteMissionApplyDepth;
     private int _clientPresentationLifecycleDepth;
     private bool _restoringClientOriginals;
@@ -89,6 +93,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal static void SelfTest()
     {
+        if (!ShouldHoldRecoveryMutation(SessionRole.Client, true, false, 2f, 3f) ||
+            !ShouldHoldRecoveryMutation(SessionRole.Client, true, true, 4f, 3f) ||
+            ShouldHoldRecoveryMutation(SessionRole.Client, true, true, 3f, 3f) ||
+            ShouldHoldRecoveryMutation(SessionRole.Offline, true, false, 4f, 3f))
+            throw new InvalidOperationException("Reconnect recovery gate self-test failed");
         if (!ShouldEmitSessionDesyncDump(
                 SessionRole.Host, true, true, 7, 11, 13) ||
             ShouldEmitSessionDesyncDump(
@@ -198,6 +207,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _lobbyRenderer = null;
             _sushiPlayer = null;
             _sushiRenderer = null;
+            _unsupportedControllerName = string.Empty;
             _remoteAvatar.Clear();
             _nextRuntimeState = 0f;
             _runtimeRevision = 0;
@@ -210,6 +220,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _projectileVisualReplicator?.Clear();
             _diverWeaponReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
+            BeginRecovery("scene changed");
             if (Role == SessionRole.Host)
                 FishSpawnSeedCoordinator.ActivateLocalScene(
                     _sceneId, _session?.LocalSceneEpoch ?? 0);
@@ -249,6 +260,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
         _session?.Update(Time.realtimeSinceStartup);
         var sessionConnected = _session?.Connected == true;
+        if (!_wasSessionConnected && sessionConnected)
+            BeginRecovery("peer connected");
         if (ManagerEventReplicator.ShouldScheduleReconnectKeyframe(
                 Role, _wasSessionConnected, sessionConnected))
         {
@@ -256,6 +269,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _sessionTrace?.Write("AUTH-KEYFRAME", "reason=rejoin-await-scene-settle missions=1 story=1 day=1");
         }
         _wasSessionConnected = sessionConnected;
+        UpdateRecoveryGate(sessionConnected);
         FishSpawnSeedCoordinator.Update(Role, _session);
         if (Role == SessionRole.Client && _session != null && _session.TryTakePeerLoss(out var peerLoss))
         {
@@ -428,6 +442,23 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 _playerPresent = true;
                 return;
             }
+            var unsupported = ControllerScopePolicy.FindActiveUnsupported();
+            if (unsupported != null)
+            {
+                var typeName = unsupported.GetType().Name;
+                var changed = _unsupportedControllerName != typeName;
+                _unsupportedControllerName = typeName;
+                _playerPresent = true;
+                _remoteAvatar.Clear();
+                if (changed)
+                {
+                    Logger.LogWarning(
+                        $"Network controller unsupported: {_unsupportedControllerName}; remote replication is disabled");
+                    _sessionTrace?.Write("CONTROLLER-UNSUPPORTED",
+                        $"type={_unsupportedControllerName} scene={_sceneId:X8}");
+                }
+                return;
+            }
             if (_playerPresent)
                 Logger.LogInfo("Player character left the scene");
             _playerPresent = false;
@@ -443,6 +474,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _lobbyRenderer = null;
         _sushiPlayer = null;
         _sushiRenderer = null;
+        _unsupportedControllerName = string.Empty;
         if (_player != player)
             _playerRenderer = RemoteAvatar.FindPrimaryRenderer(player);
         _player = player;
@@ -543,6 +575,56 @@ public sealed class ProbeBehaviour : MonoBehaviour
         uint remoteEpoch) =>
         role == SessionRole.Host && connected && scenesMatch && sceneId != 0 &&
         localEpoch != 0 && remoteEpoch != 0;
+
+    private static bool ShouldHoldRecoveryMutation(
+        SessionRole role,
+        bool connected,
+        bool scenesMatch,
+        float readyAt,
+        float now) =>
+        role != SessionRole.Offline && (!connected || !scenesMatch || now < readyAt);
+
+    private void BeginRecovery(string reason)
+    {
+        if (Role == SessionRole.Offline)
+            return;
+        _recoveryPending = true;
+        _recoveryReadyAt = 0f;
+        _lastRecoveryBlockedDomain = string.Empty;
+        _sessionTrace?.Write("RECOVERY-GATE", $"state=hold reason={reason}");
+    }
+
+    private void UpdateRecoveryGate(bool connected)
+    {
+        if (Role == SessionRole.Offline || !_recoveryPending)
+            return;
+        var scenesMatch = _session?.SceneMatches(_sceneId) == true;
+        if (!connected || !scenesMatch)
+            return;
+        if (_recoveryReadyAt <= 0f)
+            _recoveryReadyAt = Time.realtimeSinceStartup + 2f;
+        if (Time.realtimeSinceStartup < _recoveryReadyAt)
+            return;
+        _recoveryPending = false;
+        _lastRecoveryBlockedDomain = string.Empty;
+        _sessionTrace?.Write("RECOVERY-GATE", "state=open");
+    }
+
+    private bool AllowRecoveryMutation(string domain)
+    {
+        if (!_recoveryPending || !ShouldHoldRecoveryMutation(
+                Role, _session?.Connected == true,
+                _session?.SceneMatches(_sceneId) == true,
+                _recoveryReadyAt, Time.realtimeSinceStartup))
+            return true;
+        if (_lastRecoveryBlockedDomain != domain)
+        {
+            _lastRecoveryBlockedDomain = domain;
+            Logger.LogInfo($"Network recovery pending; {domain} mutation blocked");
+            _sessionTrace?.Write("RECOVERY-GATE", $"state=block domain={domain}");
+        }
+        return false;
+    }
 
     private static string FormatPacketReceiveDiagnostics(PacketReceiveDiagnostics[] diagnostics)
     {
@@ -875,6 +957,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (Role != nextRole)
             _remoteCatchLedger?.Clear("network authority changed");
         _wasSessionConnected = false;
+        _recoveryPending = nextRole != SessionRole.Offline;
+        _recoveryReadyAt = 0f;
+        _lastRecoveryBlockedDomain = string.Empty;
         _hostAuthorityRefreshAt = 0f;
         _remoteAvatar.Clear();
         _fishReplicator?.Clear();
@@ -971,6 +1056,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool RequestMoveSceneTravel(Common.Contents.MoveSceneElement element)
     {
+        if (!AllowRecoveryMutation("travel"))
+            return false;
         var targetId = element == null ? 0 : TravelTargets.FromMoveScene(element.Scene);
         Action action = element == null ? null : element.OnClick;
         return _travelCoordinator?.Request(
@@ -981,13 +1068,15 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     internal bool RequestSushiBarReturn(SushiBarExitPanel panel) =>
-        _travelCoordinator?.Request(
+        AllowRecoveryMutation("travel") && (_travelCoordinator?.Request(
             Role, _session, TravelTargets.Lobby, panel.OnExecute,
             _diveCoordinator?.AnyPlayerDead ?? false,
-            _diveCoordinator?.HostDead ?? false) ?? true;
+            _diveCoordinator?.HostDead ?? false) ?? true);
 
     internal bool RequestFishFarmTravel(FishFarm.FishFarmManager manager, string methodName)
     {
+        if (!AllowRecoveryMutation("travel"))
+            return false;
         uint targetId;
         Action action;
         switch (methodName)
@@ -1018,19 +1107,19 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     internal bool RequestDredgeReturn(Dredge.DredgeManager manager) =>
-        _travelCoordinator?.Request(
+        AllowRecoveryMutation("travel") && (_travelCoordinator?.Request(
             Role, _session, TravelTargets.Lobby, manager.ReturnToLobby,
             _diveCoordinator?.AnyPlayerDead ?? false,
-            _diveCoordinator?.HostDead ?? false) ?? true;
+            _diveCoordinator?.HostDead ?? false) ?? true);
 
     internal bool RequestEscapeMirror(
         Interaction.Escape.EscapeMirror mirror,
         BaseCharacter player) =>
-        _travelCoordinator?.Request(
+        AllowRecoveryMutation("travel") && (_travelCoordinator?.Request(
             Role, _session, TravelTargets.Lobby,
             () => mirror.SuccessInteract(player),
             _diveCoordinator?.AnyPlayerDead ?? false,
-            _diveCoordinator?.HostDead ?? false) ?? true;
+            _diveCoordinator?.HostDead ?? false) ?? true);
 
     internal bool RequestJungleFastTravel(
         JDLC.FastTravelPanelController panel,
@@ -1038,7 +1127,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         SceneType sceneType,
         SceneConnectLocationID location,
         SceneTransitionType transitionType) =>
-        _travelCoordinator?.Request(
+        AllowRecoveryMutation("travel") && (_travelCoordinator?.Request(
             Role, _session,
             TravelTargets.JungleFastTravel(sceneName, sceneType, (int)location),
             () => TravelCoordinator.ChangeJungleScene(panel, sceneName, sceneType, location, transitionType),
@@ -1046,7 +1135,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diveCoordinator?.HostDead ?? false,
             null,
             new TravelRoute(
-                sceneName, (int)sceneType, (int)location, (int)transitionType)) ?? true;
+                sceneName, (int)sceneType, (int)location, (int)transitionType)) ?? true);
 
     internal bool AllowSceneTransition(string sceneName)
     {
@@ -1063,7 +1152,20 @@ public sealed class ProbeBehaviour : MonoBehaviour
         ManagerAction action,
         int value,
         int context) =>
-        _managerEventReplicator?.Intercept(Role, _session, domain, action, value, context) ?? true;
+        AllowRecoveryMutation("manager") &&
+        (_managerEventReplicator?.Intercept(Role, _session, domain, action, value, context) ?? true);
+
+    internal bool InterceptTimeScale(TimeScaleController.Type type, float scale) =>
+        AllowRecoveryMutation("time") &&
+        (_managerEventReplicator?.InterceptTimeScale(Role, _session, type, scale) ?? true);
+
+    internal bool InterceptTimeStop(bool isGamePause) =>
+        isGamePause || AllowRecoveryMutation("time") &&
+        (_managerEventReplicator?.InterceptTimeStop(Role, _session, isGamePause) ?? true);
+
+    internal bool InterceptTimeReset() =>
+        AllowRecoveryMutation("time") &&
+        (_managerEventReplicator?.InterceptTimeReset(Role, _session) ?? true);
 
     internal bool BeginManagerEvent(
         ManagerDomain domain,
@@ -1072,6 +1174,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
         int context,
         out bool suppressNested)
     {
+        if (!AllowRecoveryMutation("manager"))
+        {
+            suppressNested = false;
+            return false;
+        }
         if (_managerEventReplicator != null)
             return _managerEventReplicator.BeginIntercept(
                 Role, _session, domain, action, value, context, out suppressNested);
@@ -1083,13 +1190,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _managerEventReplicator?.EndIntercept(suppressNested);
 
     internal bool AllowScenarioControl() =>
-        _managerEventReplicator?.AllowScenarioControl(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.AllowScenarioControl(Role, _session) ?? true);
 
     internal bool AllowDialogueAdvance() =>
-        _managerEventReplicator?.AllowDialogueAdvance(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.AllowDialogueAdvance(Role, _session) ?? true);
 
     internal bool AllowDialogueChoice() =>
-        _managerEventReplicator?.AllowDialogueChoice(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.AllowDialogueChoice(Role, _session) ?? true);
 
     internal bool TryRestoreClientOriginals()
     {
@@ -1108,16 +1218,20 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     internal bool InterceptPhoneCall(int tid, Il2CppSystem.Action<bool> callback) =>
-        _managerEventReplicator?.InterceptPhoneCall(Role, _session, tid, callback) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.InterceptPhoneCall(Role, _session, tid, callback) ?? true);
 
     internal bool InterceptPhoneAnswer() =>
-        _managerEventReplicator?.InterceptPhoneAnswer(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.InterceptPhoneAnswer(Role, _session) ?? true);
 
     internal bool AllowScenarioTerminal() =>
-        _managerEventReplicator?.AllowScenarioTerminal(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.AllowScenarioTerminal(Role, _session) ?? true);
 
     internal bool AllowDialogueTerminal() =>
-        _managerEventReplicator?.AllowDialogueTerminal(Role, _session) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.AllowDialogueTerminal(Role, _session) ?? true);
 
     internal bool InterceptScenarioStart(
         string bundleId,
@@ -1128,9 +1242,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         bool useButton,
         bool showCurtain,
         bool ignorePlaying) =>
-        _managerEventReplicator?.InterceptScenarioStart(
+        AllowRecoveryMutation("story") && (_managerEventReplicator?.InterceptScenarioStart(
             Role, _session, bundleId, isBranch, branchData, arguments, callback,
-            useButton, showCurtain, ignorePlaying) ?? true;
+            useButton, showCurtain, ignorePlaying) ?? true);
 
     internal bool InterceptDialogueStart(
         string bundleId,
@@ -1142,13 +1256,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Il2CppSystem.Action<int> choiceCallback,
         bool useButton,
         bool showCurtain) =>
-        _managerEventReplicator?.InterceptDialogueStart(
+        AllowRecoveryMutation("story") && (_managerEventReplicator?.InterceptDialogueStart(
             Role, _session, bundleId, kind, arguments, entries, buttonInfo,
-            callback, choiceCallback, useButton, showCurtain) ?? true;
+            callback, choiceCallback, useButton, showCurtain) ?? true);
 
     internal bool InterceptScenarioNode(ScenarioManager manager, DRSequence sequence) =>
-        _managerEventReplicator?.InterceptScenarioNode(
-            Role, _session, manager, sequence) ?? true;
+        AllowRecoveryMutation("story") &&
+        (_managerEventReplicator?.InterceptScenarioNode(
+            Role, _session, manager, sequence) ?? true);
 
     internal void ObserveScenarioStarted(ScenarioManager manager, string bundleId) =>
         _managerEventReplicator?.ObserveScenarioStarted(
@@ -1207,33 +1322,39 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Il2CppSystem.Action<bool> onFinished,
         bool applyOffset,
         Il2CppSystem.Nullable<Vector3> customPos) =>
-        _managerEventReplicator?.InterceptTimelinePlay(
-            Role, _session, tid, onStart, onFinished, applyOffset, customPos) ?? true;
+        AllowRecoveryMutation("timeline") &&
+        (_managerEventReplicator?.InterceptTimelinePlay(
+            Role, _session, tid, onStart, onFinished, applyOffset, customPos) ?? true);
 
     internal bool InterceptTimelineController(
         TimelineController controller,
         Il2CppSystem.Action onStart,
         Il2CppSystem.Action<bool> onFinished,
         int id) =>
-        _managerEventReplicator?.InterceptTimelineController(
-            Role, _session, controller, onStart, onFinished, id) ?? true;
+        AllowRecoveryMutation("timeline") &&
+        (_managerEventReplicator?.InterceptTimelineController(
+            Role, _session, controller, onStart, onFinished, id) ?? true);
 
     internal void ObserveTimeline(TimelineManager.TPlayState state, int tid, bool success) =>
         _managerEventReplicator?.ObserveTimeline(Role, _session, state, tid, success);
 
     internal bool AllowTimelineTerminalControl() =>
-        _managerEventReplicator?.AllowTimelineTerminalControl(Role, _session) ?? true;
+        AllowRecoveryMutation("timeline") &&
+        (_managerEventReplicator?.AllowTimelineTerminalControl(Role, _session) ?? true);
 
     internal bool RequestNpcTalk(Common.Contents.TalkTarget target) =>
-        _npcInteractionCoordinator?.RequestTalk(Role, _session, _sceneId, target) ?? true;
+        AllowRecoveryMutation("npc") &&
+        (_npcInteractionCoordinator?.RequestTalk(Role, _session, _sceneId, target) ?? true);
 
     internal bool RequestNpcTalkMenu(Common.Contents.TalkNPCMenu menu) =>
-        _npcInteractionCoordinator?.RequestTalkMenu(
-            Role, _session, _sceneId, menu) ?? true;
+        AllowRecoveryMutation("npc") &&
+        (_npcInteractionCoordinator?.RequestTalkMenu(
+            Role, _session, _sceneId, menu) ?? true);
 
     internal bool RequestMissionNpcTalk(MissionTargetNPCController npc) =>
-        _npcInteractionCoordinator?.RequestMissionTalk(
-            Role, _session, _sceneId, npc) ?? true;
+        AllowRecoveryMutation("npc") &&
+        (_npcInteractionCoordinator?.RequestMissionTalk(
+            Role, _session, _sceneId, npc) ?? true);
 
     private void ReturnToOnlineRoom(string reason)
     {

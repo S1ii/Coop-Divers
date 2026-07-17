@@ -27,7 +27,8 @@ internal enum ManagerDomain : byte
     InsectBattle = 14,
     SeahorseRace = 15,
     Scenario = 16,
-    Progression = 17
+    Progression = 17,
+    Time = 18
 }
 
 internal enum ManagerAction : byte
@@ -81,7 +82,10 @@ internal enum ManagerAction : byte
     SushiServeResult = 74,
     SushiCleanRequest = 75,
     SushiCleanResult = 76,
-    SushiWasabiRequest = 77
+    SushiWasabiRequest = 77,
+    TimeScale = 78,
+    TimeStop = 79,
+    TimeReset = 80
 }
 
 internal sealed class ManagerEventReplicator
@@ -197,6 +201,8 @@ internal sealed class ManagerEventReplicator
     private bool _applying;
     private bool _applyingScenarioAuthority;
     private bool _applyingDialogueAuthority;
+    private bool _applyingTimeAuthority;
+    private bool _remoteTimeScopeActive;
     private int _suppressPublish;
     private float _nextSushiScan;
     private float _nextProgressionScan;
@@ -277,6 +283,11 @@ internal sealed class ManagerEventReplicator
 
     internal static void SelfTest()
     {
+        if (!IsLocalTimeScope(TimeScaleController.Type.PauseMenumAuto) ||
+            IsLocalTimeScope(TimeScaleController.Type.InGameQTE) ||
+            !IsActivityTerminal(ManagerDomain.Karaoke, ManagerAction.Result) ||
+            IsActivityTerminal(ManagerDomain.Dialogue, ManagerAction.Result))
+            throw new InvalidOperationException("Manager time/activity policy self-test failed");
         if (!HasManagerEventCapacity(MaxPendingManagerEvents - 1) ||
             HasManagerEventCapacity(MaxPendingManagerEvents))
             throw new InvalidOperationException("Manager event queue capacity self-test failed");
@@ -652,6 +663,45 @@ internal sealed class ManagerEventReplicator
         SessionRole role, bool connected, bool wasConnected) =>
         role == SessionRole.Host && connected && !wasConnected;
 
+    internal bool InterceptTimeScale(
+        SessionRole role,
+        UdpSession session,
+        TimeScaleController.Type type,
+        float scale)
+    {
+        if (_applyingTimeAuthority || IsLocalTimeScope(type) ||
+            session == null || !session.Connected)
+            return true;
+        if (role != SessionRole.Host)
+            return role != SessionRole.Client;
+        Publish(session, ManagerDomain.Time, ManagerAction.TimeScale,
+            (int)type, BitConverter.SingleToInt32Bits(scale));
+        return true;
+    }
+
+    internal bool InterceptTimeStop(
+        SessionRole role,
+        UdpSession session,
+        bool isGamePause)
+    {
+        if (_applyingTimeAuthority || isGamePause || session == null || !session.Connected)
+            return true;
+        if (role != SessionRole.Host)
+            return role != SessionRole.Client;
+        Publish(session, ManagerDomain.Time, ManagerAction.TimeStop, 0, 0);
+        return true;
+    }
+
+    internal bool InterceptTimeReset(SessionRole role, UdpSession session)
+    {
+        if (_applyingTimeAuthority || session == null || !session.Connected)
+            return true;
+        if (role != SessionRole.Host)
+            return role != SessionRole.Client;
+        Publish(session, ManagerDomain.Time, ManagerAction.TimeReset, 0, 0);
+        return true;
+    }
+
     internal bool Intercept(
         SessionRole role,
         UdpSession session,
@@ -669,6 +719,8 @@ internal sealed class ManagerEventReplicator
         if (role == SessionRole.Host)
         {
             Publish(session, domain, action, value, context);
+            if (IsActivityTerminal(domain, action))
+                ForceHostKeyframe();
             return true;
         }
         if (role == SessionRole.Client && domain == ManagerDomain.Dialogue)
@@ -1469,6 +1521,24 @@ internal sealed class ManagerEventReplicator
         _applying = false;
         _applyingScenarioAuthority = false;
         _applyingDialogueAuthority = false;
+        _applyingTimeAuthority = false;
+        if (_remoteTimeScopeActive)
+        {
+            try
+            {
+                _applyingTimeAuthority = true;
+                TimeManager.Instance?.ResetTimeScale();
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning($"Remote time scope cleanup failed: {exception.Message}");
+            }
+            finally
+            {
+                _applyingTimeAuthority = false;
+            }
+        }
+        _remoteTimeScopeActive = false;
         _suppressPublish = 0;
         _nextSushiScan = 0f;
         _nextProgressionScan = 0f;
@@ -1825,6 +1895,8 @@ internal sealed class ManagerEventReplicator
                         return false;
                     race.session.OnGoal(state.Value, BitConverter.Int32BitsToSingle(state.Context));
                     return true;
+                case ManagerDomain.Time:
+                    return ApplyTimeScope((ManagerAction)state.Action, state.Value, state.Context);
                 default:
                     return false;
             }
@@ -1839,6 +1911,40 @@ internal sealed class ManagerEventReplicator
             _applyingScenarioAuthority = previousScenarioAuthority;
             _applyingDialogueAuthority = previousDialogueAuthority;
             _applying = previousApplying;
+        }
+    }
+
+    private bool ApplyTimeScope(ManagerAction action, int value, int context)
+    {
+        try
+        {
+            _applyingTimeAuthority = true;
+            switch (action)
+            {
+                case ManagerAction.TimeScale:
+                    var scale = BitConverter.Int32BitsToSingle(context);
+                    if (float.IsNaN(scale) || float.IsInfinity(scale) || scale < 0f || scale > 4f ||
+                        !Enum.IsDefined(typeof(TimeScaleController.Type), value))
+                        return false;
+                    TimeManager.SetTimeScale((TimeScaleController.Type)value, scale);
+                    _remoteTimeScopeActive = true;
+                    return true;
+                case ManagerAction.TimeStop:
+                    TimeManager.Instance?.TimeStop("DaveTheDiverMP", false);
+                    _remoteTimeScopeActive = true;
+                    return true;
+                case ManagerAction.TimeReset:
+                    if (_remoteTimeScopeActive)
+                        TimeManager.Instance?.ResetTimeScale();
+                    _remoteTimeScopeActive = false;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        finally
+        {
+            _applyingTimeAuthority = false;
         }
     }
 
@@ -3611,7 +3717,17 @@ internal sealed class ManagerEventReplicator
 
     private static bool IsGlobal(ManagerDomain domain) =>
         domain is ManagerDomain.Story or ManagerDomain.Day or
-            ManagerDomain.Dialogue or ManagerDomain.Scenario or ManagerDomain.Progression;
+            ManagerDomain.Dialogue or ManagerDomain.Scenario or ManagerDomain.Progression or
+            ManagerDomain.Time;
+
+    private static bool IsLocalTimeScope(TimeScaleController.Type type) =>
+        type == TimeScaleController.Type.PauseMenumAuto;
+
+    private static bool IsActivityTerminal(ManagerDomain domain, ManagerAction action) =>
+        (action is ManagerAction.Result or ManagerAction.Goal or ManagerAction.Finish) &&
+        domain is ManagerDomain.MainSushi or ManagerDomain.JungleSushi or
+            ManagerDomain.Betting or ManagerDomain.VipCooking or ManagerDomain.JungleMiniGame or
+            ManagerDomain.Karaoke or ManagerDomain.InsectBattle or ManagerDomain.SeahorseRace;
 
     private static bool IsNewer(uint revision, uint previous) =>
         unchecked((int)(revision - previous)) > 0;
