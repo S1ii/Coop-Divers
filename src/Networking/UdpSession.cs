@@ -24,6 +24,7 @@ internal sealed class UdpSession : IDisposable
     private const float ReliableExpirySeconds = 15f;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
+    private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -293,7 +294,9 @@ internal sealed class UdpSession : IDisposable
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
+        TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
+        TestFishActionRequestQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -348,6 +351,23 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._saveSnapshotAcks.IsEmpty ||
             session._peerLostReason != "save snapshot acknowledgement receive queue overflow")
             throw new InvalidOperationException("Save snapshot acknowledgement overflow self-test failed");
+    }
+
+    private static void TestWorldReceiveCacheReset()
+    {
+        var session = new UdpSession(null)
+        {
+            _lastSnapshotSequence = 3,
+            _lastVisualSequence = 4,
+            _lastProjectileVisualSequence = 5,
+            _lastHostRuntimeRevision = 6,
+            _lastClientRuntimeRevision = 7
+        };
+        session.ClearRemoteWorldState();
+        if (session._lastSnapshotSequence != 0 || session._lastVisualSequence != 0 ||
+            session._lastProjectileVisualSequence != 0 ||
+            session._lastHostRuntimeRevision != 0 || session._lastClientRuntimeRevision != 0)
+            throw new InvalidOperationException("World receive cache reset self-test failed");
     }
 
     private static void TestPlayerVisualCoalescing()
@@ -545,6 +565,20 @@ internal sealed class UdpSession : IDisposable
         if (!session.ShouldQueueFishActionRequest(current) ||
             session.ShouldQueueFishActionRequest(stale))
             throw new InvalidOperationException("Fish action request scene epoch gate self-test failed");
+    }
+
+    private static void TestFishActionRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishActionRequests; index++)
+            session._fishActionRequests.Enqueue(default);
+        session.QueueFishActionRequest(default);
+        if (session._connected || !session._fishActionRequests.IsEmpty)
+            throw new InvalidOperationException("Fish action request queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2040,7 +2074,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && ShouldQueueFishActionRequest(request))
-                    _fishActionRequests.Enqueue(request);
+                    QueueFishActionRequest(request);
             }
             return;
         }
@@ -2734,6 +2768,7 @@ internal sealed class UdpSession : IDisposable
         _hasSnapshot = false;
         _hasRemotePlayerState = false;
         _lastSnapshotReceive = 0f;
+        _lastSnapshotSequence = 0;
         _latestPlayerVisualState = default;
         _hasPlayerVisualState = false;
         _latestHostRuntimeState = default;
@@ -2969,6 +3004,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("ingredients snapshot receive queue overflow");
+    }
+
+    private void QueueFishActionRequest(FishActionRequest request)
+    {
+        if (HasDecodedQueueCapacity(_fishActionRequests.Count, MaxPendingFishActionRequests))
+        {
+            _fishActionRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("fish action request receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
