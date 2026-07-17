@@ -13,6 +13,9 @@ internal readonly record struct VisibleTransform(
 
 internal sealed class RemoteAvatar : IDisposable
 {
+    private const float SnapshotFreshSeconds = 0.75f;
+    private const float VisualFreshSeconds = 0.5f;
+
     internal static void SelfTest()
     {
         var angle = 40f * Mathf.Deg2Rad;
@@ -25,6 +28,8 @@ internal sealed class RemoteAvatar : IDisposable
         if (ApplyDepthBias(-0.05f) >= -0.05f || RemoteTint.a != 1f ||
             NameOffset(true, 0.75f, 2.5f) != 0.95f ||
             NameOffset(false, 0.75f, 2.5f) != 2.5f || normal.FlipX ||
+            !IsFresh(0.75f, SnapshotFreshSeconds) ||
+            IsFresh(0.751f, SnapshotFreshSeconds) ||
             Mathf.Abs(Mathf.DeltaAngle(normal.Rotation, 40f)) > 0.01f ||
             !reflected.FlipX ||
             Mathf.Abs(Mathf.DeltaAngle(reflected.Rotation, -40f)) > 0.01f)
@@ -50,13 +55,19 @@ internal sealed class RemoteAvatar : IDisposable
     private Vector3 _velocity;
     private float _targetRotation;
     private float _timeSinceSnapshot;
+    private float _timeSinceVisual;
     private float _nameOffset = 2.5f;
     private float _defaultNameOffset = 2.5f;
     private bool _isDive;
     private bool _initialized;
     private bool _hasVisualState;
+    private bool _isRemoteDead;
 
     internal Transform Transform => _gameObject?.transform;
+    internal Transform TargetTransform =>
+        _gameObject != null && IsFresh(_timeSinceSnapshot, SnapshotFreshSeconds)
+            ? _gameObject.transform
+            : null;
 
     internal void Apply(
         PlayerSnapshot snapshot,
@@ -72,6 +83,8 @@ internal sealed class RemoteAvatar : IDisposable
         _targetRotation = snapshot.Rotation;
         _timeSinceSnapshot = 0f;
         _isDive = isDive;
+        _gameObject.SetActive(true);
+        _nameObject.SetActive(true);
         _nameText.text = Protocol.NormalizePlayerName(playerName);
         if (snapshot.SpriteId != 0 && _sprites.TryGetValue(snapshot.SpriteId, out var sprite))
             _renderer.sprite = sprite;
@@ -94,8 +107,9 @@ internal sealed class RemoteAvatar : IDisposable
         if (_gameObject == null)
             return;
 
-        _hasVisualState = true;
-        _renderer.enabled = false;
+        _timeSinceVisual = 0f;
+        _hasVisualState = state.Sprites.Length > 0;
+        _renderer.enabled = !_hasVisualState;
         _gameObject.transform.localScale = Vector3.one;
         _nameText.text = Protocol.NormalizePlayerName(playerName);
         while (_visualRenderers.Count < state.Sprites.Length)
@@ -134,13 +148,96 @@ internal sealed class RemoteAvatar : IDisposable
         nameRenderer.sortingOrder = highestOrder + 100;
     }
 
+    internal void ApplyRuntime(DiverRuntimeState state)
+    {
+        _isRemoteDead = state.IsDead;
+        ApplyTint();
+    }
+
+    internal static bool TryCaptureRuntimeState(
+        uint sceneId,
+        uint sceneEpoch,
+        uint revision,
+        PlayerCharacter player,
+        out DiverRuntimeState state)
+    {
+        state = default;
+        if (sceneId == 0 || sceneEpoch == 0 || revision == 0 || player == null)
+            return false;
+        try
+        {
+            var fields = DiverRuntimeFields.None;
+            var flags = DiverRuntimeFlags.None;
+            var oxygen = 0f;
+            var maxOxygen = 0f;
+            var breath = player.BreathHandler;
+            if (breath != null)
+            {
+                if (!float.IsFinite(breath.HP) || !float.IsFinite(breath.MaxHP) ||
+                    breath.MaxHP is <= 0f or > 1_000_000f ||
+                    breath.HP < 0f || breath.HP > breath.MaxHP)
+                    return false;
+                fields |= DiverRuntimeFields.Oxygen;
+                maxOxygen = breath.MaxHP;
+                oxygen = breath.HP;
+                if (breath.IsOxygenDepleting)
+                    flags |= DiverRuntimeFlags.OxygenDepleting;
+            }
+
+            var cargoWeight = 0f;
+            var cargo = LootBox.Instance;
+            if (cargo != null)
+            {
+                if (!float.IsFinite(cargo.weight) || cargo.weight is < 0f or > 1_000_000f)
+                    return false;
+                fields |= DiverRuntimeFields.Cargo;
+                cargoWeight = cargo.weight;
+                if (cargo.isOverweightState)
+                    flags |= DiverRuntimeFlags.Overweight;
+            }
+            if (player.IsImmuneDamage)
+                flags |= DiverRuntimeFlags.Invulnerable;
+
+            state = new DiverRuntimeState(
+                sceneId, sceneEpoch, revision, DiverOwner.Host, player.IsDead(), fields, flags,
+                0f, 0f, oxygen, maxOxygen, cargoWeight, 0, 0);
+            return true;
+        }
+        catch
+        {
+            state = default;
+            return false;
+        }
+    }
+
     internal void Update(float deltaTime)
     {
         if (_gameObject == null)
             return;
 
-        _timeSinceSnapshot = Mathf.Min(_timeSinceSnapshot + deltaTime, 0.15f);
-        var predictedPosition = _target + _velocity * _timeSinceSnapshot;
+        _timeSinceSnapshot += deltaTime;
+        _timeSinceVisual += deltaTime;
+        if (!IsFresh(_timeSinceSnapshot, SnapshotFreshSeconds))
+        {
+            _gameObject.SetActive(false);
+            _nameObject.SetActive(false);
+            return;
+        }
+        if (!_gameObject.activeSelf)
+        {
+            _gameObject.SetActive(true);
+            _nameObject.SetActive(true);
+        }
+        if (_hasVisualState && !IsFresh(_timeSinceVisual, VisualFreshSeconds))
+        {
+            _hasVisualState = false;
+            _renderer.enabled = true;
+            foreach (var visual in _visualRenderers)
+                if (visual.Renderer != null)
+                    visual.Renderer.gameObject.SetActive(false);
+        }
+
+        var predictedPosition = _target + _velocity * Mathf.Min(_timeSinceSnapshot, 0.15f);
         var positionBlend = 1f - Mathf.Exp(-18f * deltaTime);
         _gameObject.transform.position = Vector3.Lerp(
             _gameObject.transform.position,
@@ -178,6 +275,9 @@ internal sealed class RemoteAvatar : IDisposable
         _visualRenderers.Clear();
         _initialized = false;
         _hasVisualState = false;
+        _isRemoteDead = false;
+        _timeSinceSnapshot = 0f;
+        _timeSinceVisual = 0f;
     }
 
     internal static SpriteRenderer FindPrimaryRenderer(Component player)
@@ -250,6 +350,9 @@ internal sealed class RemoteAvatar : IDisposable
     private static float NameOffset(bool isDive, float highestTop, float fallback) =>
         isDive ? Mathf.Max(0.65f, highestTop + 0.2f) : fallback;
 
+    private static bool IsFresh(float age, float maxAge) =>
+        age >= 0f && age <= maxAge;
+
     private void Create(SpriteRenderer sourceRenderer, Vector3 position, string playerName)
     {
         _gameObject = new GameObject("DTMP Remote Diver");
@@ -257,7 +360,7 @@ internal sealed class RemoteAvatar : IDisposable
         var baseVisual = new GameObject("DTMP Remote Base Visual");
         baseVisual.transform.SetParent(_gameObject.transform, false);
         _renderer = baseVisual.AddComponent<SpriteRenderer>();
-        _renderer.color = RemoteTint;
+        _renderer.color = CurrentTint;
 
         if (sourceRenderer != null)
         {
@@ -304,8 +407,21 @@ internal sealed class RemoteAvatar : IDisposable
         var visual = new GameObject("DTMP Remote Visual");
         visual.transform.SetParent(_gameObject.transform, false);
         var renderer = visual.AddComponent<SpriteRenderer>();
-        renderer.color = RemoteTint;
+        renderer.color = CurrentTint;
         _visualRenderers.Add(new RemoteVisual { Renderer = renderer });
+    }
+
+    private Color CurrentTint => _isRemoteDead
+        ? new Color(0.55f, 0.62f, 0.68f, 0.75f)
+        : RemoteTint;
+
+    private void ApplyTint()
+    {
+        if (_renderer != null)
+            _renderer.color = CurrentTint;
+        foreach (var visual in _visualRenderers)
+            if (visual.Renderer != null)
+                visual.Renderer.color = CurrentTint;
     }
 
     private static Transform FindPlayerRoot(SpriteRenderer renderer)

@@ -27,6 +27,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private float _nextPositionLog;
     private float _nextSnapshot;
     private float _nextVisual;
+    private float _nextRuntimeState;
+    private uint _runtimeRevision;
     private uint _sceneId;
     private ResolvedSceneMetadata _sceneMetadata;
     private float _nextSceneMetadataRefresh;
@@ -161,6 +163,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _sushiPlayer = null;
             _sushiRenderer = null;
             _remoteAvatar.Clear();
+            _nextRuntimeState = 0f;
+            _runtimeRevision = 0;
             _fishReplicator?.Clear();
             _pickupReplicator?.Clear();
             _bossReplicator?.Clear();
@@ -221,7 +225,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
         _diveCoordinator?.Update(
-            Role, _session, Time.realtimeSinceStartup, _player, _remoteAvatar.Transform);
+            Role, _session, Time.realtimeSinceStartup, _player, _remoteAvatar.TargetTransform);
         _travelCoordinator?.Update(
             Role, _session,
             _diveCoordinator?.HostDead ?? false,
@@ -229,7 +233,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         _fishReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
-            _player, _remoteAvatar.Transform);
+            _player, _remoteAvatar.TargetTransform);
         _bossReplicator?.Update(
             Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
         _pickupReplicator?.Update(
@@ -256,6 +260,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 visualState.SceneEpoch == _session.RemoteSceneEpoch)
                 _remoteAvatar.ApplyVisual(visualState, _session.RemoteName);
         }
+        while (_session != null && _session.TryTakeDiverRuntimeState(out var runtimeState))
+            if (runtimeState.Owner == DiverOwner.Host)
+                _remoteAvatar.ApplyRuntime(runtimeState);
         _remoteAvatar.Update(Time.unscaledDeltaTime);
 
         if (_session != null && _session.SceneMatches(_sceneId) &&
@@ -311,6 +318,17 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _nextVisual = Time.realtimeSinceStartup + 0.1f;
         }
 
+        if (Role == SessionRole.Host && _session != null && _player != null &&
+            _session.SceneMatches(_sceneId) && Time.realtimeSinceStartup >= _nextRuntimeState)
+        {
+            _runtimeRevision = _runtimeRevision == uint.MaxValue ? 1 : _runtimeRevision + 1;
+            if (RemoteAvatar.TryCaptureRuntimeState(
+                    _sceneId, _session.LocalSceneEpoch, _runtimeRevision, _player,
+                    out var runtimeState))
+                _session.SendDiverRuntimeState(runtimeState);
+            _nextRuntimeState = Time.realtimeSinceStartup + 0.2f;
+        }
+
         if (Time.realtimeSinceStartup < _nextScan)
             return;
 
@@ -350,6 +368,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _lobbyRenderer = null;
             _sushiPlayer = null;
             _sushiRenderer = null;
+            _remoteAvatar.Clear();
             return;
         }
 

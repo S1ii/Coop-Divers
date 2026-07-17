@@ -59,7 +59,8 @@ internal enum PacketType : byte
     FishHookPose = 53,
     SaveSnapshotChunk = 54,
     SaveSnapshotAck = 55,
-    PickupResult = 56
+    PickupResult = 56,
+    DiverRuntimeState = 57
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -75,6 +76,49 @@ internal readonly record struct PlayerSnapshot(
     float ScaleX,
     float ScaleY,
     bool Flipped);
+
+internal enum DiverOwner : byte
+{
+    Host = 1,
+    Client = 2
+}
+
+[Flags]
+internal enum DiverRuntimeFields : ushort
+{
+    None = 0,
+    Health = 1 << 0,
+    Oxygen = 1 << 1,
+    Cargo = 1 << 2,
+    Weapon = 1 << 3,
+    Ammo = 1 << 4
+}
+
+[Flags]
+internal enum DiverRuntimeFlags : ushort
+{
+    None = 0,
+    Invulnerable = 1 << 0,
+    OxygenDepleting = 1 << 1,
+    Overweight = 1 << 2,
+    Reviving = 1 << 3
+}
+
+internal readonly record struct DiverRuntimeState(
+    uint SceneId,
+    uint SceneEpoch,
+    uint Revision,
+    DiverOwner Owner,
+    bool IsDead,
+    DiverRuntimeFields Fields,
+    DiverRuntimeFlags Flags,
+    float Hp,
+    float MaxHp,
+    float Oxygen,
+    float MaxOxygen,
+    float CargoWeight,
+    int WeaponId,
+    int Ammo);
 
 internal readonly record struct VisualSprite(
     uint SpriteId,
@@ -520,9 +564,10 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 42;
+    private const byte Version = 43;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
+    private const int DiverRuntimeStateSize = HeaderSize + 46;
     private const int VisualStateFixedSize = HeaderSize + 9;
     private const int VisualSpriteSize = 38;
     private const int ProjectileVisualStateSize = HeaderSize + 74;
@@ -694,6 +739,61 @@ internal static class Protocol
             x, y, z, rotation, velocityX, velocityY,
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 32)),
             scaleX, scaleY, packet[HeaderSize + 44] == 1);
+        return true;
+    }
+
+    internal static byte[] EncodeDiverRuntimeState(uint sequence, DiverRuntimeState state)
+    {
+        if (!IsValidDiverRuntimeState(state))
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[DiverRuntimeStateSize];
+        WriteHeader(packet, PacketType.DiverRuntimeState, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Revision);
+        packet[HeaderSize + 12] = (byte)state.Owner;
+        packet[HeaderSize + 13] = state.IsDead ? (byte)1 : (byte)0;
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 14), (ushort)state.Fields);
+        BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 16), (ushort)state.Flags);
+        WriteSingle(packet.AsSpan(HeaderSize + 18), state.Hp);
+        WriteSingle(packet.AsSpan(HeaderSize + 22), state.MaxHp);
+        WriteSingle(packet.AsSpan(HeaderSize + 26), state.Oxygen);
+        WriteSingle(packet.AsSpan(HeaderSize + 30), state.MaxOxygen);
+        WriteSingle(packet.AsSpan(HeaderSize + 34), state.CargoWeight);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 38), state.WeaponId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 42), state.Ammo);
+        return packet;
+    }
+
+    internal static bool TryDecodeDiverRuntimeState(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out DiverRuntimeState state)
+    {
+        sequence = 0;
+        state = default;
+        if (packet.Length != DiverRuntimeStateSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.DiverRuntimeState ||
+            packet[HeaderSize + 13] > 1)
+            return false;
+        var candidate = new DiverRuntimeState(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            (DiverOwner)packet[HeaderSize + 12],
+            packet[HeaderSize + 13] != 0,
+            (DiverRuntimeFields)BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 14)),
+            (DiverRuntimeFlags)BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 16)),
+            ReadSingle(packet.Slice(HeaderSize + 18)),
+            ReadSingle(packet.Slice(HeaderSize + 22)),
+            ReadSingle(packet.Slice(HeaderSize + 26)),
+            ReadSingle(packet.Slice(HeaderSize + 30)),
+            ReadSingle(packet.Slice(HeaderSize + 34)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 38)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 42)));
+        if (!IsValidDiverRuntimeState(candidate))
+            return false;
+        state = candidate;
         return true;
     }
 
@@ -3376,6 +3476,56 @@ internal static class Protocol
             MathF.Abs(state.RopeEndY) <= 1_000_000f &&
             MathF.Abs(state.RopeEndZ) <= 1_000_000f);
 
+    private static bool IsValidDiverRuntimeState(DiverRuntimeState state)
+    {
+        const DiverRuntimeFields knownFields = DiverRuntimeFields.Health |
+            DiverRuntimeFields.Oxygen | DiverRuntimeFields.Cargo |
+            DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo;
+        const DiverRuntimeFlags knownFlags = DiverRuntimeFlags.Invulnerable |
+            DiverRuntimeFlags.OxygenDepleting | DiverRuntimeFlags.Overweight |
+            DiverRuntimeFlags.Reviving;
+        if (state.SceneId == 0 || state.SceneEpoch == 0 || state.Revision == 0 ||
+            state.Owner is not (DiverOwner.Host or DiverOwner.Client) ||
+            (state.Fields & ~knownFields) != 0 || (state.Flags & ~knownFlags) != 0)
+            return false;
+
+        var hasHealth = (state.Fields & DiverRuntimeFields.Health) != 0;
+        if (hasHealth
+                ? !IsValidRuntimeValuePair(state.Hp, state.MaxHp)
+                : state.Hp != 0f || state.MaxHp != 0f)
+            return false;
+
+        var hasOxygen = (state.Fields & DiverRuntimeFields.Oxygen) != 0;
+        if (hasOxygen
+                ? !IsValidRuntimeValuePair(state.Oxygen, state.MaxOxygen)
+                : state.Oxygen != 0f || state.MaxOxygen != 0f)
+            return false;
+        if ((state.Flags & DiverRuntimeFlags.OxygenDepleting) != 0 && !hasOxygen)
+            return false;
+
+        var hasCargo = (state.Fields & DiverRuntimeFields.Cargo) != 0;
+        if (hasCargo
+                ? !float.IsFinite(state.CargoWeight) ||
+                  state.CargoWeight is < 0f or > 1_000_000f
+                : state.CargoWeight != 0f)
+            return false;
+        if ((state.Flags & DiverRuntimeFlags.Overweight) != 0 && !hasCargo)
+            return false;
+
+        var hasWeapon = (state.Fields & DiverRuntimeFields.Weapon) != 0;
+        if (hasWeapon ? state.WeaponId <= 0 : state.WeaponId != 0)
+            return false;
+
+        var hasAmmo = (state.Fields & DiverRuntimeFields.Ammo) != 0;
+        return hasAmmo
+            ? hasWeapon && state.Ammo is >= 0 and <= 1_000_000
+            : state.Ammo == 0;
+    }
+
+    private static bool IsValidRuntimeValuePair(float current, float maximum) =>
+        float.IsFinite(current) && float.IsFinite(maximum) &&
+        maximum is > 0f and <= 1_000_000f && current >= 0f && current <= maximum;
+
     private static bool IsValidPickupRequest(PickupRequest request) =>
         request.RequestId != 0 && request.SceneId != 0 && request.SceneEpoch != 0 &&
         request.WorldId != 0 && request.ItemId > 0 && request.KnownRevision != 0 &&
@@ -3539,6 +3689,55 @@ internal static class Protocol
         WriteSingle(cargoPacket.AsSpan(HeaderSize + 8), 0f);
         if (TryDecodeCargoState(cargoPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid cargo state");
+
+        var expectedDiverRuntime = new DiverRuntimeState(
+            SceneId("A02_01_01"), 7, 3, DiverOwner.Client, false,
+            DiverRuntimeFields.Health | DiverRuntimeFields.Oxygen |
+            DiverRuntimeFields.Cargo | DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo,
+            DiverRuntimeFlags.OxygenDepleting,
+            80f, 100f, 45f, 120f, 17.5f, 2101, 8);
+        var diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        if (!TryDecodeDiverRuntimeState(
+                diverRuntimePacket, out sequence, out var actualDiverRuntime) ||
+            sequence != 47 || actualDiverRuntime != expectedDiverRuntime)
+            throw new InvalidOperationException("Diver runtime state round-trip failed");
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 14), 0x8000);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid diver runtime field mask");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 16), 0x8000);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid diver runtime status mask");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        WriteSingle(diverRuntimePacket.AsSpan(HeaderSize + 18), float.NaN);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted NaN diver runtime health");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 14),
+            (ushort)(expectedDiverRuntime.Fields & ~DiverRuntimeFields.Cargo));
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted non-canonical absent diver field");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 14),
+            (ushort)(expectedDiverRuntime.Fields & ~DiverRuntimeFields.Oxygen));
+        WriteSingle(diverRuntimePacket.AsSpan(HeaderSize + 26), 0f);
+        WriteSingle(diverRuntimePacket.AsSpan(HeaderSize + 30), 0f);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted oxygen flag without oxygen state");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 14),
+            (ushort)(expectedDiverRuntime.Fields & ~DiverRuntimeFields.Cargo));
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 16),
+            (ushort)(expectedDiverRuntime.Flags | DiverRuntimeFlags.Overweight));
+        WriteSingle(diverRuntimePacket.AsSpan(HeaderSize + 34), 0f);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted cargo flag without cargo state");
 
         var expectedInteraction = new NpcInteraction(
             0x123456789abcdef0, SceneId("DR_Lobby"), 4, 0x10203040, 7,

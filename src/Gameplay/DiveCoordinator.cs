@@ -222,6 +222,7 @@ internal sealed class DiveCoordinator
 
     internal void Reset()
     {
+        RestoreLocalCamera();
         RestorePrompt();
         (_localRevision, _remoteRevision, _stateRevision, _lastStateRevision) = (1, 0, 0, 0);
         (_hostReady, _clientReady, _starting, _clientNativeStartRequested,
@@ -381,7 +382,7 @@ internal sealed class DiveCoordinator
             return;
         localDead = dead;
         if (!dead)
-            _localSpectating = false;
+            RestoreLocalCamera();
         _lifeRevision = NextRevision(_lifeRevision);
         session.SendDiverLifeState(new DiverLifeState(_lifeRevision, dead));
         _log.LogInfo($"Dive: {(role == SessionRole.Host ? "host" : "client")} " +
@@ -524,6 +525,16 @@ internal sealed class DiveCoordinator
         camera.ChangeTarget(remoteAvatar);
         _localSpectating = true;
         _log.LogInfo($"Dive: {message}");
+    }
+
+    private void RestoreLocalCamera()
+    {
+        if (!_localSpectating)
+            return;
+        var player = UnityEngine.Object.FindFirstObjectByType<PlayerCharacter>();
+        if (player != null && CameraManager.Instance != null)
+            CameraManager.Instance.ChangeTarget(player.transform);
+        _localSpectating = false;
     }
 
     private static SceneExitTrigger FindLoadedExitTrigger()

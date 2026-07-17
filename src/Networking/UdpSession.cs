@@ -108,6 +108,12 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishHookPose> _fishHookPoses = new();
     private PlayerVisualState _latestPlayerVisualState;
     private bool _hasPlayerVisualState;
+    private DiverRuntimeState _latestHostRuntimeState;
+    private DiverRuntimeState _latestClientRuntimeState;
+    private bool _hasHostRuntimeState;
+    private bool _hasClientRuntimeState;
+    private uint _lastHostRuntimeRevision;
+    private uint _lastClientRuntimeRevision;
     private readonly Queue<int> _projectileVisualOrder = new();
     private readonly Dictionary<int, ProjectileVisualState> _projectileVisualStates = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
@@ -242,6 +248,7 @@ internal sealed class UdpSession : IDisposable
 
         TestProjectileVisualQueueLimit();
         TestPlayerVisualCoalescing();
+        TestDiverRuntimeCoalescing();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -273,6 +280,33 @@ internal sealed class UdpSession : IDisposable
         if (!session.TryTakePlayerVisualState(out var state) || state.SceneId != 2 ||
             session.TryTakePlayerVisualState(out _))
             throw new InvalidOperationException("Player visual coalescing self-test failed");
+    }
+
+    private static void TestDiverRuntimeCoalescing()
+    {
+        if (!IsNewer(1, uint.MaxValue) || IsNewer(uint.MaxValue, 1) || IsNewer(1, 1))
+            throw new InvalidOperationException("Diver runtime revision self-test failed");
+        var session = new UdpSession(null);
+        session.EnqueueDiverRuntimeState(default(DiverRuntimeState) with
+        {
+            Owner = DiverOwner.Host,
+            Revision = 1
+        });
+        session.EnqueueDiverRuntimeState(default(DiverRuntimeState) with
+        {
+            Owner = DiverOwner.Host,
+            Revision = 2
+        });
+        session.EnqueueDiverRuntimeState(default(DiverRuntimeState) with
+        {
+            Owner = DiverOwner.Client,
+            Revision = 1
+        });
+        if (!session.TryTakeDiverRuntimeState(out var host) ||
+            host.Owner != DiverOwner.Host || host.Revision != 2 ||
+            !session.TryTakeDiverRuntimeState(out var client) ||
+            client.Owner != DiverOwner.Client || session.TryTakeDiverRuntimeState(out _))
+            throw new InvalidOperationException("Diver runtime coalescing self-test failed");
     }
 
     internal bool Connected => _connected;
@@ -324,6 +358,41 @@ internal sealed class UdpSession : IDisposable
         _lastSentVisualState = state;
         _lastVisualSend = _now;
         _hasSentVisualState = true;
+    }
+
+    internal void SendDiverRuntimeState(DiverRuntimeState state)
+    {
+        if (_role == SessionRole.Host && MatchesLocalWorld(state.SceneId, state.SceneEpoch))
+            Send(Protocol.EncodeDiverRuntimeState(++_sequence, state));
+    }
+
+    internal bool TryTakeDiverRuntimeState(out DiverRuntimeState state)
+    {
+        if (_hasHostRuntimeState)
+        {
+            state = _latestHostRuntimeState;
+            _hasHostRuntimeState = false;
+            return true;
+        }
+        state = _latestClientRuntimeState;
+        if (!_hasClientRuntimeState)
+            return false;
+        _hasClientRuntimeState = false;
+        return true;
+    }
+
+    private void EnqueueDiverRuntimeState(DiverRuntimeState state)
+    {
+        if (state.Owner == DiverOwner.Host)
+        {
+            _latestHostRuntimeState = state;
+            _hasHostRuntimeState = true;
+        }
+        else
+        {
+            _latestClientRuntimeState = state;
+            _hasClientRuntimeState = true;
+        }
     }
 
     internal bool TryTakePlayerVisualState(out PlayerVisualState state)
@@ -1058,6 +1127,25 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.DiverRuntimeState)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiverRuntimeState(received.Buffer, out _, out var state) &&
+                MatchesRemoteWorld(state.SceneId, state.SceneEpoch))
+            {
+                ref var revision = ref (state.Owner == DiverOwner.Host
+                    ? ref _lastHostRuntimeRevision
+                    : ref _lastClientRuntimeRevision);
+                if (IsNewer(state.Revision, revision))
+                {
+                    revision = state.Revision;
+                    _lastReceive = now;
+                    EnqueueDiverRuntimeState(state);
+                }
+            }
+            return;
+        }
+
         if (type == PacketType.ProjectileVisualState)
         {
             if (_connected && Protocol.TryDecodeProjectileVisualState(received.Buffer, out _, out var state) &&
@@ -1773,6 +1861,12 @@ internal sealed class UdpSession : IDisposable
         _lastSnapshotReceive = 0f;
         _latestPlayerVisualState = default;
         _hasPlayerVisualState = false;
+        _latestHostRuntimeState = default;
+        _latestClientRuntimeState = default;
+        _hasHostRuntimeState = false;
+        _hasClientRuntimeState = false;
+        _lastHostRuntimeRevision = 0;
+        _lastClientRuntimeRevision = 0;
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         _lastVisualSequence = 0;
@@ -2035,6 +2129,12 @@ internal sealed class UdpSession : IDisposable
         }
         _latestPlayerVisualState = default;
         _hasPlayerVisualState = false;
+        _latestHostRuntimeState = default;
+        _latestClientRuntimeState = default;
+        _hasHostRuntimeState = false;
+        _hasClientRuntimeState = false;
+        _lastHostRuntimeRevision = 0;
+        _lastClientRuntimeRevision = 0;
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         while (_fishDamageRequests.TryDequeue(out _))
@@ -2077,6 +2177,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_pickupRequests.TryDequeue(out _))
+        {
+        }
+        while (_pickupResults.TryDequeue(out _))
         {
         }
         while (_sceneTransitions.TryDequeue(out _))
