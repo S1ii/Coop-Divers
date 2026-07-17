@@ -2,8 +2,10 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using BepInEx;
 using BepInEx.Logging;
 using DR.Save;
@@ -17,8 +19,29 @@ internal static class MultiplayerSaveSync
     private const SaveSlotType MpSlotType = SaveSlotType.Manual;
     private const uint BundleMagic = 0x42534D44; // DMSB
     private const int BundleHeaderSize = 16;
+    private const int MarkerSchema = 2;
+    private const int MaxBundleBytes = 16 * 1024 * 1024;
+    private const int MaxMetadataBytes = 64 * 1024;
     private static readonly string MpSlotMarkerPath =
         Path.Combine(Paths.ConfigPath, "DaveTheDiverMP.mp-slot");
+    private static readonly string MpSlotPendingPath = MpSlotMarkerPath + ".pending";
+    private static readonly string MpSlotBackupPath = MpSlotMarkerPath + ".backup";
+
+    private sealed class SlotMarker
+    {
+        public int Schema { get; set; }
+        public int Slot { get; set; }
+        public string Fingerprint { get; set; } = string.Empty;
+    }
+
+    private sealed class PendingWrite
+    {
+        public int Schema { get; set; }
+        public int Slot { get; set; }
+        public bool HadSlot { get; set; }
+        public string PreviousFingerprint { get; set; } = string.Empty;
+        public string TargetFingerprint { get; set; } = string.Empty;
+    }
 
     private static readonly Dictionary<ushort, byte[]> ClientChunks = new();
     private static byte[] _hostSnapshot = Array.Empty<byte>();
@@ -32,10 +55,21 @@ internal static class MultiplayerSaveSync
     private static int _clientTotalBytes;
     private static ushort _clientChunkCount;
     private static bool _clientLoaded;
+    private static bool _clientRejectedTransfer;
+    private static string _originalGameJson = string.Empty;
+    private static string _originalPhotoJson = string.Empty;
+    private static string _originalPlayerJson = string.Empty;
+    private static bool _originalProfileRestoreRequired;
+    private static bool _normalSaveRestartRequired;
+    [ThreadStatic]
+    private static int _remoteSnapshotApplyDepth;
     private static string _status = string.Empty;
 
     internal static bool HostRemoteLoaded => _hostRemoteLoaded;
     internal static bool ClientLoaded => _clientLoaded;
+    internal static bool IsApplyingRemoteSnapshot => _remoteSnapshotApplyDepth > 0;
+    internal static bool OriginalProfileRestoreRequired => _originalProfileRestoreRequired;
+    internal static bool NormalSaveRestartRequired => _normalSaveRestartRequired;
     internal static string Status => _status;
 
     internal static void SelfTest()
@@ -50,13 +84,82 @@ internal static class MultiplayerSaveSync
         bundle[4] = byte.MaxValue;
         if (TryUnpackBundle(bundle, out _, out _, out _))
             throw new InvalidOperationException("MP save bundle accepted invalid lengths");
+        if (AreBundleLengthsValid(MaxBundleBytes, 1, 1) ||
+            AreBundleLengthsValid(int.MaxValue, int.MaxValue, int.MaxValue))
+            throw new InvalidOperationException("MP save bundle accepted oversized lengths");
+        var fingerprint = FullFingerprint(PackBundle("{\"g\":1}", "{\"p\":2}", "{\"d\":3}"));
+        var markerJson = JsonSerializer.Serialize(new SlotMarker
+        {
+            Schema = MarkerSchema,
+            Slot = MpSlotIndex,
+            Fingerprint = fingerprint
+        });
+        if (!TryParseMarker(markerJson, out var marker) ||
+            !MarkerOwns(marker, fingerprint) || MarkerOwns(marker, new string('0', 64)) ||
+            TryParseMarker("{\"Schema\":1,\"Slot\":6,\"Fingerprint\":\"bad\"}", out _))
+            throw new InvalidOperationException("MP save marker self-test failed");
+        var pendingJson = JsonSerializer.Serialize(new PendingWrite
+        {
+            Schema = MarkerSchema,
+            Slot = MpSlotIndex,
+            HadSlot = true,
+            PreviousFingerprint = fingerprint,
+            TargetFingerprint = new string('A', 64)
+        });
+        if (!TryParsePending(pendingJson, out var pending) || !pending.HadSlot ||
+            pending.PreviousFingerprint != fingerprint)
+            throw new InvalidOperationException("MP save pending journal self-test failed");
+        if (IsApplyingRemoteSnapshot)
+            throw new InvalidOperationException("MP save apply scope leaked before self-test");
+        BeginRemoteSnapshotApply();
+        BeginRemoteSnapshotApply();
+        if (!IsApplyingRemoteSnapshot)
+            throw new InvalidOperationException("MP save apply scope did not activate");
+        EndRemoteSnapshotApply();
+        if (!IsApplyingRemoteSnapshot)
+            throw new InvalidOperationException("MP save nested apply scope ended early");
+        EndRemoteSnapshotApply();
+        if (IsApplyingRemoteSnapshot)
+            throw new InvalidOperationException("MP save apply scope leaked after self-test");
+        if (!ShouldRestoreBeforeRoleChange(
+                SessionRole.Client, SessionRole.Offline, true) ||
+            !ShouldRestoreBeforeRoleChange(
+                SessionRole.Client, SessionRole.Host, true) ||
+            ShouldRestoreBeforeRoleChange(
+                SessionRole.Client, SessionRole.Client, true) ||
+            ShouldRestoreBeforeRoleChange(
+                SessionRole.Host, SessionRole.Offline, true) ||
+            ShouldRestoreBeforeRoleChange(
+                SessionRole.Client, SessionRole.Offline, false))
+            throw new InvalidOperationException("MP original-profile restore policy failed");
     }
 
     internal static void Reset()
     {
         ResetHost();
         ResetClient();
-        _status = string.Empty;
+        if (!_originalProfileRestoreRequired && !_normalSaveRestartRequired)
+            _status = string.Empty;
+    }
+
+    internal static bool RequiresOriginalProfileRestore(
+        SessionRole currentRole,
+        SessionRole nextRole) =>
+        ShouldRestoreBeforeRoleChange(
+            currentRole, nextRole, _originalProfileRestoreRequired);
+
+    private static bool ShouldRestoreBeforeRoleChange(
+        SessionRole currentRole,
+        SessionRole nextRole,
+        bool restoreRequired) =>
+        restoreRequired && currentRole == SessionRole.Client && nextRole != SessionRole.Client;
+
+    private static void BeginRemoteSnapshotApply() => _remoteSnapshotApplyDepth++;
+
+    private static void EndRemoteSnapshotApply()
+    {
+        if (_remoteSnapshotApplyDepth > 0)
+            _remoteSnapshotApplyDepth--;
     }
 
     internal static void UpdateHost(UdpSession session, ManualLogSource log)
@@ -112,10 +215,22 @@ internal static class MultiplayerSaveSync
         {
             if (chunk.TransferId != _clientTransferId || chunk.Fingerprint != _clientFingerprint)
                 StartClientTransfer(chunk);
+            if (_clientRejectedTransfer)
+            {
+                session.SendSaveSnapshotAck(new SaveSnapshotAck(
+                    _clientTransferId, _clientFingerprint, false));
+                continue;
+            }
             if (_clientLoaded)
             {
                 session.SendSaveSnapshotAck(new SaveSnapshotAck(
                     _clientTransferId, _clientFingerprint, true));
+                continue;
+            }
+            if (chunk.TotalBytes != _clientTotalBytes || chunk.ChunkCount != _clientChunkCount)
+            {
+                RejectClientSave(session, "Host save chunk metadata changed during transfer");
+                _clientRejectedTransfer = true;
                 continue;
             }
             ClientChunks.TryAdd(chunk.ChunkIndex, chunk.Data);
@@ -147,36 +262,36 @@ internal static class MultiplayerSaveSync
     private static bool PrepareHostSnapshot(UdpSession session, ManualLogSource log)
     {
         var save = FindSaveSystem(log);
-        if (save?.GameDataManager == null)
+        if (save?.GameDataManager == null || save.PhotoDataManager == null ||
+            save.PlayerDataManager == null)
             return false;
         try
         {
-            if (save.CheckGameSaveExist(SaveDataType.GameData, MpSlotIndex, MpSlotType) &&
-                !File.Exists(MpSlotMarkerPath))
-            {
-                _status = "Manual save slot 7 is occupied";
-                log?.LogWarning("MP save sync: manual slot 7 is occupied and not owned by DTMP");
+            if (!TryBeginSlotWrite(save, string.Empty, log, out var pending))
                 return false;
-            }
             if (!save.SaveGameDataInSlot(MpSlotIndex, true, MpSlotType))
             {
                 _status = "Could not write MP save slot";
+                RollBackSlotWrite(save, pending, log);
                 return false;
             }
-            var gameJson = save.GameDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
-            var photoJson = save.PhotoDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
-            var playerJson = save.PlayerDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
-            if (!IsJsonObject(gameJson) || !IsJsonObject(photoJson) || !IsJsonObject(playerJson))
+            if (!TryReadSlotBundle(save, out _hostSnapshot, out var details))
             {
                 _status = "MP save slot did not contain complete data";
-                log?.LogWarning(
-                    $"MP save sync: invalid slot JSON; gd={FirstContentCharacter(gameJson)}; " +
-                    $"pz={FirstContentCharacter(photoJson)}; pd={FirstContentCharacter(playerJson)}");
+                log?.LogWarning($"MP save sync: invalid host slot after write; {details}");
+                RollBackSlotWrite(save, pending, log);
                 return false;
             }
-            _hostSnapshot = PackBundle(gameJson, photoJson, playerJson);
+            var fullFingerprint = FullFingerprint(_hostSnapshot);
+            pending.TargetFingerprint = fullFingerprint;
+            WriteAtomicText(MpSlotPendingPath, JsonSerializer.Serialize(pending));
+            if (!CommitSlotWrite(fullFingerprint, log))
+            {
+                RollBackSlotWrite(save, pending, log);
+                _hostSnapshot = Array.Empty<byte>();
+                return false;
+            }
             _hostFingerprint = Fingerprint(_hostSnapshot);
-            File.WriteAllText(MpSlotMarkerPath, _hostFingerprint.ToString("X8"));
             _hostTransferId = session.ConnectionId ^ ((ulong)_hostFingerprint << 32) ^ (uint)_hostSnapshot.Length;
             if (_hostTransferId == 0)
                 _hostTransferId = _hostFingerprint;
@@ -190,6 +305,7 @@ internal static class MultiplayerSaveSync
         {
             _status = "Could not prepare MP save";
             log?.LogWarning($"MP save sync: host prepare failed: {exception.Message}");
+            TryRecoverPendingWrite(save, log);
             return false;
         }
     }
@@ -201,55 +317,85 @@ internal static class MultiplayerSaveSync
         _clientFingerprint = chunk.Fingerprint;
         _clientTotalBytes = chunk.TotalBytes;
         _clientChunkCount = chunk.ChunkCount;
+        _clientRejectedTransfer = chunk.TotalBytes is < BundleHeaderSize or > MaxBundleBytes;
+        if (_clientRejectedTransfer)
+        {
+            _status = "Host save bundle is too large";
+            return;
+        }
         _status = $"Receiving host save ({chunk.TotalBytes / 1024} KB)";
     }
 
     private static void FinishClientTransfer(UdpSession session, ManualLogSource log)
     {
+        if (_clientTotalBytes is < BundleHeaderSize or > MaxBundleBytes)
+        {
+            RejectClientSave(session, "Host save bundle is too large");
+            return;
+        }
         var bytes = new byte[_clientTotalBytes];
         for (ushort index = 0; index < _clientChunkCount; index++)
         {
             if (!ClientChunks.TryGetValue(index, out var chunk))
                 return;
-            Array.Copy(chunk, 0, bytes, index * Protocol.MaxSaveSnapshotChunkBytes, chunk.Length);
+            var offset = (long)index * Protocol.MaxSaveSnapshotChunkBytes;
+            if (chunk == null || chunk.Length == 0 || offset + chunk.Length > bytes.Length)
+            {
+                RejectClientSave(session, "Host save chunks are invalid");
+                return;
+            }
+            Array.Copy(chunk, 0, bytes, (int)offset, chunk.Length);
         }
         if (Fingerprint(bytes) != _clientFingerprint)
         {
-            _status = "Host save checksum mismatch";
-            session.SendSaveSnapshotAck(new SaveSnapshotAck(_clientTransferId, _clientFingerprint, false));
+            RejectClientSave(session, "Host save checksum mismatch");
             return;
         }
         var save = FindSaveSystem(log);
         if (save?.GameDataManager == null || save.PhotoDataManager == null ||
             save.PlayerDataManager == null)
             return;
+        BeginRemoteSnapshotApply();
         try
         {
             if (!TryUnpackBundle(bytes, out var gameJson, out var photoJson, out var playerJson))
             {
-                _status = "Host save bundle is invalid";
-                session.SendSaveSnapshotAck(new SaveSnapshotAck(
-                    _clientTransferId, _clientFingerprint, false));
+                RejectClientSave(session, "Host save bundle is invalid");
                 return;
             }
-            if (save.CheckGameSaveExist(SaveDataType.GameData, MpSlotIndex, MpSlotType) &&
-                !File.Exists(MpSlotMarkerPath))
+            if (!TryCaptureOriginalProfile(save, log))
             {
-                _status = "Manual save slot 7 is occupied";
-                log?.LogWarning("MP save sync: client manual slot 7 is occupied and not owned by DTMP");
+                RejectClientSave(session, _status);
+                return;
+            }
+            var fullFingerprint = FullFingerprint(bytes);
+            if (!TryBeginSlotWrite(save, fullFingerprint, log, out var pending))
+            {
                 session.SendSaveSnapshotAck(new SaveSnapshotAck(
                     _clientTransferId, _clientFingerprint, false));
                 return;
             }
-            File.WriteAllText(MpSlotMarkerPath, _clientFingerprint.ToString("X8"));
             var gameSaved = save.GameDataManager.SaveSlotWithJson(
                 gameJson, MpSlotIndex, MpSlotType);
             var photoSaved = save.PhotoDataManager.SaveSlotWithJson(
                 photoJson, MpSlotIndex, MpSlotType);
             var playerSaved = save.PlayerDataManager.SaveSlotWithJson(
                 playerJson, MpSlotIndex, MpSlotType);
-            var loaded = gameSaved && photoSaved && playerSaved &&
-                save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
+            var verified = gameSaved && photoSaved && playerSaved &&
+                TryReadSlotBundle(save, out var written, out _) &&
+                FullFingerprint(written) == fullFingerprint;
+            if (verified)
+                _normalSaveRestartRequired = true;
+            var loaded = verified && save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
+            if (!loaded || !CommitSlotWrite(fullFingerprint, log))
+            {
+                RollBackSlotWrite(save, pending, log);
+                RejectClientSave(session, "Could not safely load host save");
+                log?.LogWarning(
+                    $"MP save sync: client transaction failed; gd={gameSaved}; " +
+                    $"pz={photoSaved}; pd={playerSaved}; verified={verified}; loaded={loaded}");
+                return;
+            }
             _clientLoaded = loaded;
             _status = _clientLoaded ? "Host save synced" : "Could not load host save";
             session.SendSaveSnapshotAck(new SaveSnapshotAck(
@@ -261,9 +407,339 @@ internal static class MultiplayerSaveSync
         catch (Exception exception)
         {
             _status = "Could not load host save";
+            TryRecoverPendingWrite(save, log);
             session.SendSaveSnapshotAck(new SaveSnapshotAck(_clientTransferId, _clientFingerprint, false));
             log?.LogWarning($"MP save sync: client load failed: {exception.Message}");
         }
+        finally
+        {
+            EndRemoteSnapshotApply();
+        }
+    }
+
+    private static bool TryCaptureOriginalProfile(SaveSystem save, ManualLogSource log)
+    {
+        if (_originalProfileRestoreRequired)
+            return true;
+        try
+        {
+            var game = SaveDataBase.Serialize(save.GameDataManager.Data);
+            var photo = SaveDataBase.Serialize(save.PhotoDataManager.Data);
+            var player = SaveDataBase.Serialize(save.PlayerDataManager.Data);
+            if (!IsJsonObject(game) || !IsJsonObject(photo) || !IsJsonObject(player))
+                throw new InvalidDataException("current profile serialization returned invalid JSON");
+
+            _originalGameJson = game;
+            _originalPhotoJson = photo;
+            _originalPlayerJson = player;
+            _originalProfileRestoreRequired = true;
+            log?.LogInfo("MP save sync: captured original client profile in memory");
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not preserve original client profile";
+            log?.LogWarning($"MP save sync: original profile capture failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    internal static bool TryRestoreOriginalProfile(ManualLogSource log)
+    {
+        if (!_originalProfileRestoreRequired)
+            return true;
+        var save = FindSaveSystem(log);
+        if (save?.GameDataManager == null || save.PhotoDataManager == null ||
+            save.PlayerDataManager == null)
+        {
+            _status = "Save system not ready to restore original client profile";
+            log?.LogWarning("MP save sync: original profile restore managers are unavailable");
+            return false;
+        }
+
+        try
+        {
+            if (!save.GameDataManager.TryLoadFromJson(_originalGameJson, out var game) ||
+                !save.PhotoDataManager.TryLoadFromJson(_originalPhotoJson, out var photo) ||
+                !save.PlayerDataManager.TryLoadFromJson(_originalPlayerJson, out var player) ||
+                game == null || photo == null || player == null)
+                throw new InvalidDataException("original profile JSON could not be parsed");
+
+            save.GameDataManager.SetLoadedData(game);
+            save.PhotoDataManager.SetLoadedData(photo);
+            save.PlayerDataManager.SetLoadedData(player);
+
+            _originalGameJson = string.Empty;
+            _originalPhotoJson = string.Empty;
+            _originalPlayerJson = string.Empty;
+            _originalProfileRestoreRequired = false;
+            _status = _normalSaveRestartRequired
+                ? "Original profile restored; restart before using normal saves"
+                : "Original client profile restored";
+            log?.LogInfo(
+                "MP save sync: restored original client profile from memory; " +
+                $"restartRequired={_normalSaveRestartRequired}");
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not restore original client profile; remaining online";
+            log?.LogWarning($"MP save sync: original profile restore failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryBeginSlotWrite(
+        SaveSystem save,
+        string targetFingerprint,
+        ManualLogSource log,
+        out PendingWrite pending)
+    {
+        pending = null;
+        if (!TryRecoverPendingWrite(save, log))
+            return false;
+
+        var hadSlot = AnySlotFileExists(save);
+        var previous = Array.Empty<byte>();
+        var previousFingerprint = string.Empty;
+        if (hadSlot)
+        {
+            if (!TryReadSlotBundle(save, out previous, out var details))
+            {
+                RefuseOccupiedSlot(log, $"slot data is incomplete; {details}");
+                return false;
+            }
+            previousFingerprint = FullFingerprint(previous);
+            if (!TryValidateOwnedMarker(previous, previousFingerprint, log))
+                return false;
+        }
+        else if (File.Exists(MpSlotMarkerPath))
+        {
+            RefuseOccupiedSlot(log, "marker exists but slot data is missing");
+            return false;
+        }
+
+        pending = new PendingWrite
+        {
+            Schema = MarkerSchema,
+            Slot = MpSlotIndex,
+            HadSlot = hadSlot,
+            PreviousFingerprint = previousFingerprint,
+            TargetFingerprint = targetFingerprint ?? string.Empty
+        };
+        try
+        {
+            WriteAtomicBytes(MpSlotBackupPath, previous);
+            WriteAtomicText(MpSlotPendingPath, JsonSerializer.Serialize(pending));
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not back up MP save slot";
+            log?.LogWarning($"MP save sync: transaction backup failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool CommitSlotWrite(string fingerprint, ManualLogSource log)
+    {
+        try
+        {
+            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
+            {
+                Schema = MarkerSchema,
+                Slot = MpSlotIndex,
+                Fingerprint = fingerprint
+            }));
+            if (!TryDeleteFile(MpSlotPendingPath))
+                throw new IOException("could not remove pending journal");
+            if (!TryDeleteFile(MpSlotBackupPath))
+                log?.LogWarning("MP save sync: committed, but stale backup could not be removed");
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not commit MP save slot";
+            log?.LogWarning($"MP save sync: marker commit failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryRecoverPendingWrite(SaveSystem save, ManualLogSource log)
+    {
+        if (!File.Exists(MpSlotPendingPath))
+            return true;
+        try
+        {
+            if (!TryReadMetadata(MpSlotPendingPath, out var json) ||
+                !TryParsePending(json, out var pending))
+            {
+                _status = "MP save recovery metadata is invalid";
+                log?.LogWarning("MP save sync: refusing slot write because pending journal is invalid");
+                return false;
+            }
+            return RollBackSlotWrite(save, pending, log);
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not recover MP save slot";
+            log?.LogWarning($"MP save sync: pending recovery failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool RollBackSlotWrite(
+        SaveSystem save,
+        PendingWrite pending,
+        ManualLogSource log)
+    {
+        try
+        {
+            if (pending == null || pending.Schema != MarkerSchema || pending.Slot != MpSlotIndex)
+                throw new InvalidDataException("invalid pending journal");
+            if (pending.HadSlot)
+            {
+                var backup = ReadBoundedBytes(MpSlotBackupPath, MaxBundleBytes);
+                if (!TryUnpackBundle(backup, out var game, out var photo, out var player) ||
+                    FullFingerprint(backup) != pending.PreviousFingerprint)
+                    throw new InvalidDataException("backup fingerprint mismatch");
+                if (!WriteSlot(save, game, photo, player) ||
+                    !TryReadSlotBundle(save, out var restored, out _) ||
+                    FullFingerprint(restored) != pending.PreviousFingerprint)
+                    throw new IOException("restored slot verification failed");
+                WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
+                {
+                    Schema = MarkerSchema,
+                    Slot = MpSlotIndex,
+                    Fingerprint = pending.PreviousFingerprint
+                }));
+            }
+            else
+            {
+                DeleteSlotFiles(save);
+                if (AnySlotFileExists(save))
+                    throw new IOException("new partial slot files could not be removed");
+                TryDeleteFile(MpSlotMarkerPath);
+            }
+            if (!TryDeleteFile(MpSlotPendingPath))
+                throw new IOException("pending journal could not be removed after rollback");
+            TryDeleteFile(MpSlotBackupPath);
+            log?.LogInfo("MP save sync: restored slot after interrupted write");
+            return true;
+        }
+        catch (Exception exception)
+        {
+            _status = "Could not recover MP save slot";
+            log?.LogWarning($"MP save sync: rollback failed: {exception.Message}");
+            return false;
+        }
+    }
+
+    private static bool TryValidateOwnedMarker(
+        byte[] current,
+        string currentFingerprint,
+        ManualLogSource log)
+    {
+        if (!TryReadMetadata(MpSlotMarkerPath, out var json))
+        {
+            RefuseOccupiedSlot(log, "valid ownership marker is missing");
+            return false;
+        }
+        if (TryParseMarker(json, out var marker))
+        {
+            if (MarkerOwns(marker, currentFingerprint))
+                return true;
+            RefuseOccupiedSlot(log, "slot contents differ from the last verified DTMP write");
+            return false;
+        }
+
+        if (uint.TryParse(json.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture,
+                out var legacy) && legacy == Fingerprint(current))
+        {
+            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(new SlotMarker
+            {
+                Schema = MarkerSchema,
+                Slot = MpSlotIndex,
+                Fingerprint = currentFingerprint
+            }));
+            log?.LogInfo("MP save sync: migrated legacy slot marker");
+            return true;
+        }
+        RefuseOccupiedSlot(log, "ownership marker is invalid or stale");
+        return false;
+    }
+
+    private static bool TryReadSlotBundle(
+        SaveSystem save,
+        out byte[] bundle,
+        out string details)
+    {
+        bundle = Array.Empty<byte>();
+        details = string.Empty;
+        try
+        {
+            var game = save.GameDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
+            var photo = save.PhotoDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
+            var player = save.PlayerDataManager.GetDataStringFromFile(MpSlotIndex, MpSlotType);
+            if (!IsJsonObject(game) || !IsJsonObject(photo) || !IsJsonObject(player))
+            {
+                details = $"gd={FirstContentCharacter(game)}; pz={FirstContentCharacter(photo)}; " +
+                    $"pd={FirstContentCharacter(player)}";
+                return false;
+            }
+            bundle = PackBundle(game, photo, player);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            details = exception.Message;
+            return false;
+        }
+    }
+
+    private static bool WriteSlot(
+        SaveSystem save,
+        string game,
+        string photo,
+        string player)
+    {
+        var gameSaved = save.GameDataManager.SaveSlotWithJson(game, MpSlotIndex, MpSlotType);
+        var photoSaved = save.PhotoDataManager.SaveSlotWithJson(photo, MpSlotIndex, MpSlotType);
+        var playerSaved = save.PlayerDataManager.SaveSlotWithJson(player, MpSlotIndex, MpSlotType);
+        return gameSaved && photoSaved && playerSaved;
+    }
+
+    private static bool AnySlotFileExists(SaveSystem save)
+    {
+        if (save.CheckGameSaveExist(SaveDataType.GameData, MpSlotIndex, MpSlotType))
+            return true;
+        foreach (var type in new[] { SaveDataType.GameData, SaveDataType.PhotoData, SaveDataType.PlayerData })
+            if (File.Exists(save.GetSaveFilePath(type, MpSlotIndex, MpSlotType)))
+                return true;
+        return false;
+    }
+
+    private static void DeleteSlotFiles(SaveSystem save)
+    {
+        foreach (var type in new[] { SaveDataType.GameData, SaveDataType.PhotoData, SaveDataType.PlayerData })
+        {
+            var path = save.GetSaveFilePath(type, MpSlotIndex, MpSlotType);
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
+    private static void RefuseOccupiedSlot(ManualLogSource log, string reason)
+    {
+        _status = "Manual save slot 7 changed outside DTMP; recovery required";
+        log?.LogWarning($"MP save sync: refusing manual slot 7: {reason}");
+    }
+
+    private static void RejectClientSave(UdpSession session, string status)
+    {
+        _status = status;
+        session.SendSaveSnapshotAck(new SaveSnapshotAck(
+            _clientTransferId, _clientFingerprint, false));
     }
 
     private static SaveSystem FindSaveSystem(ManualLogSource log)
@@ -295,6 +771,7 @@ internal static class MultiplayerSaveSync
         _clientTotalBytes = 0;
         _clientChunkCount = 0;
         _clientLoaded = false;
+        _clientRejectedTransfer = false;
     }
 
     private static int ChunkCount(int totalBytes) =>
@@ -304,6 +781,11 @@ internal static class MultiplayerSaveSync
     {
         if (!IsJsonObject(gameJson) || !IsJsonObject(photoJson) || !IsJsonObject(playerJson))
             throw new ArgumentException("Save bundle contains invalid JSON");
+        var gameLength = Encoding.UTF8.GetByteCount(gameJson);
+        var photoLength = Encoding.UTF8.GetByteCount(photoJson);
+        var playerLength = Encoding.UTF8.GetByteCount(playerJson);
+        if (!AreBundleLengthsValid(gameLength, photoLength, playerLength))
+            throw new ArgumentException("Save bundle is too large");
         var game = Encoding.UTF8.GetBytes(gameJson);
         var photo = Encoding.UTF8.GetBytes(photoJson);
         var player = Encoding.UTF8.GetBytes(playerJson);
@@ -331,7 +813,7 @@ internal static class MultiplayerSaveSync
         var gameLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(4));
         var photoLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(8));
         var playerLength = BinaryPrimitives.ReadInt32LittleEndian(bundle.AsSpan(12));
-        if (gameLength <= 0 || photoLength <= 0 || playerLength <= 0 ||
+        if (!AreBundleLengthsValid(gameLength, photoLength, playerLength) ||
             (long)BundleHeaderSize + gameLength + photoLength + playerLength != bundle.Length)
             return false;
         gameJson = Encoding.UTF8.GetString(bundle, BundleHeaderSize, gameLength);
@@ -340,6 +822,10 @@ internal static class MultiplayerSaveSync
             bundle, BundleHeaderSize + gameLength + photoLength, playerLength);
         return IsJsonObject(gameJson) && IsJsonObject(photoJson) && IsJsonObject(playerJson);
     }
+
+    private static bool AreBundleLengthsValid(int gameLength, int photoLength, int playerLength) =>
+        gameLength > 0 && photoLength > 0 && playerLength > 0 &&
+        (long)BundleHeaderSize + gameLength + photoLength + playerLength <= MaxBundleBytes;
 
     private static bool IsJsonObject(string value)
     {
@@ -363,6 +849,115 @@ internal static class MultiplayerSaveSync
                 return $"U+{(int)value[index]:X4}";
         return "whitespace";
     }
+
+    private static bool TryParseMarker(string json, out SlotMarker marker)
+    {
+        marker = null;
+        try
+        {
+            marker = JsonSerializer.Deserialize<SlotMarker>(json);
+            return marker != null && marker.Schema == MarkerSchema && marker.Slot == MpSlotIndex &&
+                IsFullFingerprint(marker.Fingerprint);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParsePending(string json, out PendingWrite pending)
+    {
+        pending = null;
+        try
+        {
+            pending = JsonSerializer.Deserialize<PendingWrite>(json);
+            return pending != null && pending.Schema == MarkerSchema && pending.Slot == MpSlotIndex &&
+                (!pending.HadSlot || IsFullFingerprint(pending.PreviousFingerprint)) &&
+                (string.IsNullOrEmpty(pending.TargetFingerprint) ||
+                    IsFullFingerprint(pending.TargetFingerprint));
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool MarkerOwns(SlotMarker marker, string fingerprint) =>
+        marker != null && string.Equals(
+            marker.Fingerprint, fingerprint, StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsFullFingerprint(string value)
+    {
+        if (value == null || value.Length != 64)
+            return false;
+        for (var index = 0; index < value.Length; index++)
+            if (!Uri.IsHexDigit(value[index]))
+                return false;
+        return true;
+    }
+
+    private static bool TryReadMetadata(string path, out string value)
+    {
+        value = string.Empty;
+        try
+        {
+            if (!File.Exists(path))
+                return false;
+            var bytes = ReadBoundedBytes(path, MaxMetadataBytes);
+            value = Encoding.UTF8.GetString(bytes);
+            return !string.IsNullOrWhiteSpace(value);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static byte[] ReadBoundedBytes(string path, int maximum)
+    {
+        var length = new FileInfo(path).Length;
+        if (length < 0 || length > maximum)
+            throw new InvalidDataException($"file exceeds {maximum} bytes");
+        return File.ReadAllBytes(path);
+    }
+
+    private static void WriteAtomicText(string path, string value)
+    {
+        var bytes = Encoding.UTF8.GetBytes(value ?? string.Empty);
+        if (bytes.Length == 0 || bytes.Length > MaxMetadataBytes)
+            throw new InvalidDataException("metadata size is invalid");
+        WriteAtomicBytes(path, bytes);
+    }
+
+    private static void WriteAtomicBytes(string path, byte[] bytes)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var temporary = path + ".tmp";
+        using (var stream = new FileStream(
+                   temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(bytes, 0, bytes.Length);
+            stream.Flush(true);
+        }
+        File.Move(temporary, path, true);
+    }
+
+    private static bool TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+            return !File.Exists(path);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FullFingerprint(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes));
 
     private static uint Fingerprint(byte[] bytes)
     {

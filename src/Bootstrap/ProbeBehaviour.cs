@@ -472,9 +472,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
         out string error)
     {
         error = string.Empty;
+        if (role != SessionRole.Offline && MultiplayerSaveSync.NormalSaveRestartRequired)
+        {
+            error = "Restart the game before starting another online session";
+            return false;
+        }
         if (role != SessionRole.Offline &&
             !LobbyInput.TryValidate(role, address, port.ToString(), out address, out port, out error))
             return false;
+        var restoreOriginalProfile =
+            MultiplayerSaveSync.RequiresOriginalProfileRestore(Role, role);
 
         var localName = Plugin.ResolvePlayerName(configuredName);
         if (_session != null && role == Role && role != SessionRole.Offline &&
@@ -487,8 +494,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
         var previous = _session;
         var previousRunning = previous != null && previous.IsRunning;
-        var disposedPrevious = previous != null && (!previousRunning ||
-            Role == SessionRole.Host && role == SessionRole.Host && Port == port);
+        var disposedPrevious = previous != null && !restoreOriginalProfile &&
+            (!previousRunning ||
+                Role == SessionRole.Host && role == SessionRole.Host && Port == port);
         if (disposedPrevious)
         {
             _npcInteractionCoordinator?.Clear(Role, previous);
@@ -500,6 +508,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (role != SessionRole.Offline && !replacement.IsRunning)
         {
             replacement.Dispose();
+            if (restoreOriginalProfile &&
+                !MultiplayerSaveSync.TryRestoreOriginalProfile(Logger))
+            {
+                error = MultiplayerSaveSync.Status;
+                return false;
+            }
             if (previousRunning && !disposedPrevious)
             {
                 error = "Network start failed; current session kept";
@@ -519,6 +533,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
             SaveSelectedSettings(Role, Address, Port, ConfiguredName, persist, ref error);
             _sessionTrace?.SwitchRole(Role, _localName, _buildId);
             error = "Network start failed; see BepInEx log";
+            return false;
+        }
+
+        if (restoreOriginalProfile &&
+            !MultiplayerSaveSync.TryRestoreOriginalProfile(Logger))
+        {
+            replacement.Dispose();
+            error = MultiplayerSaveSync.Status;
             return false;
         }
 

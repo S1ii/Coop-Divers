@@ -49,6 +49,16 @@ internal static class HostAuthorityPolicy
             AllowsHostOwnedAction(SessionRole.Client, true) ||
             !AllowsHostOwnedAction(SessionRole.Client, false))
             throw new InvalidOperationException("Host-owned action policy failed");
+        if (!AllowsSaveWrite(SessionRole.Offline, false, false) ||
+            !AllowsSaveWrite(SessionRole.Host, true, false) ||
+            !AllowsSaveWrite(SessionRole.Client, false, false) ||
+            AllowsSaveWrite(SessionRole.Client, true, false) ||
+            !AllowsSaveWrite(SessionRole.Client, true, true) ||
+            AllowsSaveWrite(SessionRole.Offline, false, false, true) ||
+            !AllowsSaveWrite(SessionRole.Offline, false, true, true) ||
+            AllowsSaveWrite(SessionRole.Offline, false, false, false, true) ||
+            !AllowsSaveWrite(SessionRole.Offline, false, true, false, true))
+            throw new InvalidOperationException("Host-owned save policy failed");
     }
 
     internal static bool CanMutatePersistentProgress
@@ -71,6 +81,14 @@ internal static class HostAuthorityPolicy
             ProbeBehaviour.Role,
             ProbeBehaviour.Instance?._session?.Connected == true);
 
+    internal static bool CanWriteHostOwnedSave =>
+        AllowsSaveWrite(
+            ProbeBehaviour.Role,
+            ProbeBehaviour.Instance?._session?.Connected == true,
+            MultiplayerSaveSync.IsApplyingRemoteSnapshot,
+            MultiplayerSaveSync.OriginalProfileRestoreRequired,
+            MultiplayerSaveSync.NormalSaveRestartRequired);
+
     private static bool AllowsPersistentMutation(
         SessionRole role,
         bool connected,
@@ -80,6 +98,15 @@ internal static class HostAuthorityPolicy
 
     private static bool AllowsHostOwnedAction(SessionRole role, bool connected) =>
         role != SessionRole.Client || !connected;
+
+    private static bool AllowsSaveWrite(
+        SessionRole role,
+        bool connected,
+        bool remoteSnapshot,
+        bool restoreRequired = false,
+        bool restartRequired = false) =>
+        remoteSnapshot || !restoreRequired && !restartRequired &&
+            (role != SessionRole.Client || !connected);
 
     internal static bool IsPersistentMissionMutationRoot(string name, Type returnType) =>
         returnType == typeof(void) && PersistentMissionMutationRoots.Contains(name);
@@ -241,11 +268,78 @@ internal static class GameSaveAuthorityPatch
 
     private static bool Prefix(ref bool __result)
     {
-        if (HostAuthorityPolicy.CanMutatePersistentProgress)
+        if (HostAuthorityPolicy.CanWriteHostOwnedSave)
             return true;
         __result = true;
         return false;
     }
+}
+
+[HarmonyPatch]
+internal static class CentralSaveAuthorityPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        var seen = new HashSet<MethodBase>();
+        var saveAll = AccessTools.DeclaredMethod(
+            typeof(SaveSystem), nameof(SaveSystem.SaveAllData), Type.EmptyTypes);
+        if (saveAll != null && seen.Add(saveAll))
+            yield return saveAll;
+
+        var gameSave = AccessTools.DeclaredMethod(
+            typeof(SaveSystemGameDataManager), nameof(SaveSystemGameDataManager.SaveData),
+            new[] { typeof(bool) });
+        if (gameSave != null && seen.Add(gameSave))
+            yield return gameSave;
+
+        var playerSave = AccessTools.Method(
+            typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.SaveData),
+            new[] { typeof(bool) });
+        if (playerSave != null && seen.Add(playerSave))
+            yield return playerSave;
+
+        var playerUpdate = AccessTools.DeclaredMethod(
+            typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.UpdateData),
+            Type.EmptyTypes);
+        if (playerUpdate != null && seen.Add(playerUpdate))
+            yield return playerUpdate;
+    }
+
+    private static bool Prefix() => HostAuthorityPolicy.CanWriteHostOwnedSave;
+}
+
+[HarmonyPatch]
+internal static class SaveSlotJsonAuthorityPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        var parameters = new[] { typeof(string), typeof(int), typeof(SaveSlotType) };
+        var gameSave = AccessTools.Method(
+            typeof(SaveSystemGameDataManager), nameof(SaveSystemGameDataManager.SaveSlotWithJson),
+            parameters);
+        if (gameSave != null)
+            yield return gameSave;
+
+        var playerSave = AccessTools.Method(
+            typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.SaveSlotWithJson),
+            parameters);
+        if (playerSave != null && playerSave != gameSave)
+            yield return playerSave;
+    }
+
+    private static bool Prefix(ref bool __result)
+    {
+        if (HostAuthorityPolicy.CanWriteHostOwnedSave)
+            return true;
+        __result = false;
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(SteamAchievements), nameof(SteamAchievements.UnlockProgressSyncFromSave))]
+internal static class RemoteSaveAchievementAuthorityPatch
+{
+    private static bool Prefix() => !MultiplayerSaveSync.IsApplyingRemoteSnapshot;
 }
 
 [HarmonyPatch]
