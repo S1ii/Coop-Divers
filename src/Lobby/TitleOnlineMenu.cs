@@ -107,6 +107,7 @@ internal static class TitleOnlineMenu
     private static bool _closing;
     private static bool _startingCampaign;
     private static string _lastSaveStatus = string.Empty;
+    private static string _lastHandshakeReject = string.Empty;
 
     internal static void SelfTest()
     {
@@ -372,13 +373,16 @@ internal static class TitleOnlineMenu
         var remoteName = session?.RemoteName ?? string.Empty;
         var language = CurrentLanguage();
         var saveStatus = MultiplayerSaveSync.Status;
+        var handshakeReject = session?.ConnectionFailure ?? string.Empty;
         if (_lastConnected != connected || _lastRemoteName != remoteName ||
-            _lastLanguage != language || _lastSaveStatus != saveStatus)
+            _lastLanguage != language || _lastSaveStatus != saveStatus ||
+            _lastHandshakeReject != handshakeReject)
         {
             _lastConnected = connected;
             _lastRemoteName = remoteName;
             _lastLanguage = language;
             _lastSaveStatus = saveStatus;
+            _lastHandshakeReject = handshakeReject;
             MarkDirty();
         }
         if (_dirty && !_keyboardVisible)
@@ -511,6 +515,7 @@ internal static class TitleOnlineMenu
         _pendingKeyboardApply = null;
         _startingCampaign = false;
         _lastSaveStatus = string.Empty;
+        _lastHandshakeReject = string.Empty;
         MultiplayerSaveSync.Reset();
         _closing = false;
     }
@@ -552,7 +557,9 @@ internal static class TitleOnlineMenu
         {
             AddLabel(language => session != null && session.Connected
                 ? Value(OnlineText.Host, session.RemoteName, language)
-                : Value(OnlineText.Host, Text(OnlineText.Connecting, language), language));
+                : Value(OnlineText.Host, string.IsNullOrEmpty(session?.ConnectionFailure)
+                    ? Text(OnlineText.Connecting, language)
+                    : session.ConnectionFailure, language));
             AddLabel(language => Value(OnlineText.PlayerTwo, DisplayName(), language));
             if (session != null && session.Connected && _roomId != 0 && MultiplayerSaveSync.ClientLoaded)
                 AddAction(language => Text(_clientReady ? OnlineText.NotReady : OnlineText.Ready, language), Ready);

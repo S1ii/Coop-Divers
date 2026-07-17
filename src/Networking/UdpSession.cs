@@ -24,6 +24,7 @@ internal sealed class UdpSession : IDisposable
     private const float ReliableExpirySeconds = 15f;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
+    private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
 
     private sealed class ReliableReceiveWindow
@@ -193,6 +194,7 @@ internal sealed class UdpSession : IDisposable
     private bool _hasRemotePlayerState;
     private volatile bool _receiveFailed;
     private string _peerLostReason = string.Empty;
+    private string _handshakeRejectReason = string.Empty;
     private uint _lastSceneSequence;
     private uint _lastSnapshotSequence;
     private uint _lastVisualSequence;
@@ -262,6 +264,11 @@ internal sealed class UdpSession : IDisposable
         if (!HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks - 1, MaxPendingSaveSnapshotChunks) ||
             HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks, MaxPendingSaveSnapshotChunks))
             throw new InvalidOperationException("Save snapshot queue cap self-test failed");
+        if (!HasDecodedQueueCapacity(
+                MaxPendingIngredientsSnapshotChunks - 1, MaxPendingIngredientsSnapshotChunks) ||
+            HasDecodedQueueCapacity(
+                MaxPendingIngredientsSnapshotChunks, MaxPendingIngredientsSnapshotChunks))
+            throw new InvalidOperationException("Ingredients snapshot queue cap self-test failed");
         if (!WorldMatches(true, true, 11, 11, 8, 11, 8) ||
             WorldMatches(true, true, 11, 11, 8, 11, 7) ||
             WorldMatches(true, true, 11, 12, 8, 11, 8))
@@ -275,6 +282,7 @@ internal sealed class UdpSession : IDisposable
         TestCargoEpochGate();
         TestManagerEventEpochGate();
         TestSceneSeedEpochGate();
+        TestHandshakeReject();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -523,9 +531,29 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Scene seed stale queue self-test failed");
     }
 
+    private static void TestHandshakeReject()
+    {
+        if (!ShouldRetryHello(SessionRole.Client, false, string.Empty) ||
+            ShouldRetryHello(SessionRole.Client, true, string.Empty) ||
+            ShouldRetryHello(SessionRole.Client, false, "Incompatible multiplayer protocol") ||
+            ShouldRetryHello(SessionRole.Host, false, string.Empty))
+            throw new InvalidOperationException("Handshake retry policy self-test failed");
+
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        session.RejectHandshake(HandshakeRejectReason.IncompatibleBuild);
+        if (session.Connected ||
+            session.ConnectionFailure != "Incompatible game or mod build")
+            throw new InvalidOperationException("Handshake rejection state self-test failed");
+    }
+
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
+    internal string ConnectionFailure => _handshakeRejectReason;
     internal uint LocalSceneEpoch => _localSceneEpoch;
     internal uint NextLocalSceneEpoch =>
         _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
@@ -1449,6 +1477,7 @@ internal sealed class UdpSession : IDisposable
     internal void Start(SessionRole role, string address, int port, string localName, uint buildId)
     {
         _receiveFailed = false;
+        _handshakeRejectReason = string.Empty;
         _role = role;
         _localName = Protocol.NormalizePlayerName(localName);
         _buildId = buildId;
@@ -1552,7 +1581,7 @@ internal sealed class UdpSession : IDisposable
             return;
 
         _nextSend = now + 1f;
-        if (_role == SessionRole.Client && !_connected)
+        if (ShouldRetryHello(_role, _connected, _handshakeRejectReason))
             SendIdentity(PacketType.Hello);
         else if (_remote != null)
             SendSceneState();
@@ -1607,8 +1636,26 @@ internal sealed class UdpSession : IDisposable
 
     private void Handle(UdpReceiveResult received, float now)
     {
-        if (!Protocol.TryDecode(received.Buffer, out var type, out var sequence, out var sessionId))
+        if (_role == SessionRole.Client && !_connected && _remote != null &&
+            received.RemoteEndPoint.Equals(_remote) &&
+            Protocol.TryDecodeHandshakeReject(
+                received.Buffer, out _, out var rejectSessionId, out var rejectReason) &&
+            rejectSessionId == _sessionId)
+        {
+            RejectHandshake(rejectReason);
             return;
+        }
+
+        if (!Protocol.TryDecode(received.Buffer, out var type, out var sequence, out var sessionId))
+        {
+            if (_role == SessionRole.Host && _remote == null &&
+                Protocol.TryDecodeHelloIdentityAnyVersion(
+                    received.Buffer, out var peerVersion, out var foreignSessionId, out _))
+                SendHandshakeReject(
+                    received.RemoteEndPoint, foreignSessionId, peerVersion,
+                    HandshakeRejectReason.IncompatibleProtocol);
+            return;
+        }
 
         if (_role == SessionRole.Host && _remote == null)
         {
@@ -1621,6 +1668,9 @@ internal sealed class UdpSession : IDisposable
                 if (_lastRejectedBuildId != remoteBuildId)
                     _log.LogWarning($"Network: rejected incompatible build {remoteBuildId:X8}; expected {_buildId:X8}");
                 _lastRejectedBuildId = remoteBuildId;
+                SendHandshakeReject(
+                    received.RemoteEndPoint, sessionId, received.Buffer[4],
+                    HandshakeRejectReason.IncompatibleBuild);
                 return;
             }
             _remoteName = remoteName;
@@ -2026,7 +2076,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _ingredientsSnapshotChunks.Enqueue(chunk);
+                    QueueIngredientsSnapshotChunk(chunk);
             }
             return;
         }
@@ -2381,6 +2431,28 @@ internal sealed class UdpSession : IDisposable
         Send(Protocol.EncodeIdentity(type, ++_sequence, _buildId, _localName));
     }
 
+    private void SendHandshakeReject(
+        IPEndPoint endpoint,
+        ulong sessionId,
+        byte peerVersion,
+        HandshakeRejectReason reason)
+    {
+        if (_udp == null || sessionId == 0)
+            return;
+        try
+        {
+            var packet = Protocol.EncodeHandshakeReject(++_sequence, reason, peerVersion);
+            Protocol.SetSessionId(packet, sessionId);
+            _udp.Send(packet, packet.Length, endpoint);
+            _sentBytes += packet.Length;
+            _sentPackets++;
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning($"Network handshake rejection send failed: {exception.Message}");
+        }
+    }
+
     private void SendSceneState()
     {
         if (_localSceneEpoch != 0)
@@ -2643,6 +2715,10 @@ internal sealed class UdpSession : IDisposable
 
     private static bool ShouldAcceptIncoming(int queued) => queued < MaxIncomingDatagrams;
 
+    private static bool ShouldRetryHello(
+        SessionRole role, bool connected, string handshakeRejectReason) =>
+        role == SessionRole.Client && !connected && string.IsNullOrEmpty(handshakeRejectReason);
+
     private static bool HasDecodedQueueCapacity(int queued, int capacity) => queued < capacity;
 
     private void QueueSaveSnapshotChunk(SaveSnapshotChunk chunk)
@@ -2653,6 +2729,17 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("save snapshot receive queue overflow");
+    }
+
+    private void QueueIngredientsSnapshotChunk(IngredientsSnapshotChunk chunk)
+    {
+        if (HasDecodedQueueCapacity(
+                _ingredientsSnapshotChunks.Count, MaxPendingIngredientsSnapshotChunks))
+        {
+            _ingredientsSnapshotChunks.Enqueue(chunk);
+            return;
+        }
+        FailReliableDelivery("ingredients snapshot receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
@@ -2713,6 +2800,18 @@ internal sealed class UdpSession : IDisposable
     {
         if (_role == SessionRole.Client && _connected && string.IsNullOrEmpty(_peerLostReason))
             _peerLostReason = reason;
+    }
+
+    private void RejectHandshake(HandshakeRejectReason reason)
+    {
+        _handshakeRejectReason = reason switch
+        {
+            HandshakeRejectReason.IncompatibleProtocol => "Incompatible multiplayer protocol",
+            HandshakeRejectReason.IncompatibleBuild => "Incompatible game or mod build",
+            _ => "Connection rejected"
+        };
+        ResetPeerState();
+        _log?.LogWarning($"Network: {_handshakeRejectReason}");
     }
 
     private void ResetPeerState()

@@ -442,7 +442,19 @@ internal sealed class PickupReplicator
         result.ItemId == request.ItemId && result.Revision == request.KnownRevision;
 
     internal static uint WorldId(PickupInstanceItem item) =>
-        WorldObjectId.For(item, ItemId(item));
+        WorldObjectId.For(item, ItemId(item), SpawnerUniqueId(item));
+
+    private static string SpawnerUniqueId(PickupInstanceItem item)
+    {
+        try
+        {
+            return item?.GetComponentInParent<SpawnerBase>()?.UniqueID;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static int ItemId(PickupInstanceItem item)
     {

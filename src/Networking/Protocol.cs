@@ -66,6 +66,12 @@ internal enum PacketType : byte
     DiverWeaponResult = 60
 }
 
+internal enum HandshakeRejectReason : byte
+{
+    IncompatibleProtocol = 1,
+    IncompatibleBuild = 2
+}
+
 internal readonly record struct PlayerSnapshot(
     uint SceneId,
     uint SceneEpoch,
@@ -723,9 +729,12 @@ internal static class Protocol
     }
 
     private static void WriteHeader(Span<byte> packet, PacketType type, uint sequence)
+        => WriteHeader(packet, type, sequence, Version);
+
+    private static void WriteHeader(Span<byte> packet, PacketType type, uint sequence, byte version)
     {
         BinaryPrimitives.WriteUInt32LittleEndian(packet, Magic);
-        packet[4] = Version;
+        packet[4] = version;
         packet[5] = (byte)type;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.Slice(6), sequence);
     }
@@ -760,6 +769,67 @@ internal static class Protocol
         sequence = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(6));
         sessionId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(10));
         return true;
+    }
+
+    internal static byte[] EncodeHandshakeReject(
+        uint sequence, HandshakeRejectReason reason, byte peerVersion)
+    {
+        if (peerVersion == 0)
+            throw new ArgumentOutOfRangeException(nameof(peerVersion));
+        if (!Enum.IsDefined(typeof(HandshakeRejectReason), reason))
+            throw new ArgumentOutOfRangeException(nameof(reason));
+        var packet = new byte[HeaderSize + 1];
+        WriteHeader(packet, PacketType.Disconnect, sequence, peerVersion);
+        packet[HeaderSize] = (byte)reason;
+        return packet;
+    }
+
+    internal static bool TryDecodeHandshakeReject(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out ulong sessionId,
+        out HandshakeRejectReason reason)
+    {
+        sequence = 0;
+        sessionId = 0;
+        reason = default;
+        if (packet.Length != HeaderSize + 1 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(packet) != Magic ||
+            packet[4] == 0 || packet[5] != (byte)PacketType.Disconnect ||
+            !Enum.IsDefined(typeof(HandshakeRejectReason), packet[HeaderSize]))
+            return false;
+        sequence = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(6));
+        sessionId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(10));
+        reason = (HandshakeRejectReason)packet[HeaderSize];
+        return true;
+    }
+
+    internal static bool TryDecodeHelloIdentityAnyVersion(
+        ReadOnlySpan<byte> packet,
+        out byte version,
+        out ulong sessionId,
+        out uint buildId)
+    {
+        version = 0;
+        sessionId = 0;
+        buildId = 0;
+        if (packet.Length < HeaderSize + 5 ||
+            BinaryPrimitives.ReadUInt32LittleEndian(packet) != Magic ||
+            packet[4] == 0 || packet[5] != (byte)PacketType.Hello ||
+            packet.Length != HeaderSize + 5 + packet[HeaderSize + 4])
+            return false;
+        try
+        {
+            StrictUtf8.GetString(packet.Slice(HeaderSize + 5));
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+        version = packet[4];
+        sessionId = BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(10));
+        buildId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        return sessionId != 0;
     }
 
     internal static byte[] EncodeSnapshot(uint sequence, PlayerSnapshot snapshot)
@@ -3971,6 +4041,26 @@ internal static class Protocol
         identityPacket[^1] = 0xff;
         if (TryDecodeIdentity(identityPacket, PacketType.Hello, out _, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid UTF-8 identity");
+
+        var rejectPacket = EncodeHandshakeReject(
+            44, HandshakeRejectReason.IncompatibleBuild, 47);
+        SetSessionId(rejectPacket, 0x123456789abcdef0);
+        if (!TryDecodeHandshakeReject(
+                rejectPacket, out sequence, out var rejectSessionId, out var rejectReason) ||
+            sequence != 44 || rejectSessionId != 0x123456789abcdef0 ||
+            rejectReason != HandshakeRejectReason.IncompatibleBuild)
+            throw new InvalidOperationException("Handshake rejection round-trip failed");
+        rejectPacket[HeaderSize] = 0;
+        if (TryDecodeHandshakeReject(rejectPacket, out _, out _, out _))
+            throw new InvalidOperationException("Protocol accepted an empty handshake rejection");
+
+        var foreignHello = EncodeIdentity(PacketType.Hello, 45, 0x12345678, "Diver");
+        SetSessionId(foreignHello, 11);
+        foreignHello[4] = 47;
+        if (!TryDecodeHelloIdentityAnyVersion(
+                foreignHello, out var foreignVersion, out var foreignSessionId, out buildId) ||
+            foreignVersion != 47 || foreignSessionId != 11 || buildId != 0x12345678)
+            throw new InvalidOperationException("Foreign protocol hello decode failed");
 
         var scenePacket = EncodeSceneState(44, SceneId("A02_01_01"), 3);
         if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId, out var sceneEpoch) ||
