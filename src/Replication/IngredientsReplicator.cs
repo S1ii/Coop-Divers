@@ -277,6 +277,8 @@ internal sealed class IngredientsReplicator
 
     private void UpdateClient(UdpSession session, float now)
     {
+        if (session.TryConsumeIngredientsDeltaResync())
+            RequestClientSnapshot(session, now);
         if (_clientRequestId != 0 && now >= _clientSyncDeadline)
             RequestClientSnapshot(session, now);
 

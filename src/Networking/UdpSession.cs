@@ -25,12 +25,14 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishLifecycles = 256;
+    private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingDiveExitRequests = 256;
     private const int MaxPendingTravelReady = 256;
     private const int MaxPendingDiverLifeStates = 256;
+    private const int MaxPendingIngredientsDeltas = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -162,6 +164,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<IngredientsSyncRequest> _ingredientsSyncRequests = new();
     private readonly ConcurrentQueue<IngredientsSnapshotChunk> _ingredientsSnapshotChunks = new();
     private readonly ConcurrentQueue<IngredientsDelta> _ingredientsDeltas = new();
+    private bool _ingredientsDeltaResyncNeeded;
     private readonly ConcurrentQueue<RoomReady> _roomReady = new();
     private readonly ConcurrentQueue<RoomState> _roomStates = new();
     private readonly ConcurrentQueue<SaveSnapshotChunk> _saveSnapshotChunks = new();
@@ -303,9 +306,11 @@ internal sealed class UdpSession : IDisposable
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
         TestFishLifecycleQueueOverflow();
+        TestFishActionAckQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
+        TestIngredientsDeltaQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
         TestDiverLifeStateQueueOverflow();
@@ -378,6 +383,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._fishLifecycles.IsEmpty ||
             session._peerLostReason != "fish lifecycle receive queue overflow")
             throw new InvalidOperationException("Fish lifecycle queue overflow self-test failed");
+    }
+
+    private static void TestFishActionAckQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishActionAcks; index++)
+            session._fishActionAcks.Enqueue(default);
+        session.QueueFishActionAck(default);
+        if (session._connected || !session._fishActionAcks.IsEmpty ||
+            session._peerLostReason != "fish action acknowledgement receive queue overflow")
+            throw new InvalidOperationException("Fish action acknowledgement queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -635,6 +655,21 @@ internal sealed class UdpSession : IDisposable
         session.QueueIngredientsSyncRequest(default);
         if (session._connected || !session._ingredientsSyncRequests.IsEmpty)
             throw new InvalidOperationException("Ingredients sync request queue overflow self-test failed");
+    }
+
+    private static void TestIngredientsDeltaQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingIngredientsDeltas; index++)
+            session._ingredientsDeltas.Enqueue(default);
+        session.QueueIngredientsDelta(default);
+        if (!session._ingredientsDeltas.IsEmpty || !session.TryConsumeIngredientsDeltaResync() ||
+            session.TryConsumeIngredientsDeltaResync() || !session._connected)
+            throw new InvalidOperationException("Ingredients delta queue overflow self-test failed");
     }
 
     private static void TestDiveExitRequestQueueOverflow()
@@ -1506,6 +1541,14 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakeIngredientsDelta(out IngredientsDelta delta) =>
         _ingredientsDeltas.TryDequeue(out delta);
 
+    internal bool TryConsumeIngredientsDeltaResync()
+    {
+        if (!_ingredientsDeltaResyncNeeded)
+            return false;
+        _ingredientsDeltaResyncNeeded = false;
+        return true;
+    }
+
     internal void SendRoomReady(RoomReady ready)
     {
         if (_role == SessionRole.Client && _connected)
@@ -2186,7 +2229,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && ack.SceneId == _remoteSceneId &&
                     ack.SceneEpoch == _remoteSceneEpoch)
-                    _fishActionAcks.Enqueue(ack);
+                    QueueFishActionAck(ack);
             }
             return;
         }
@@ -2396,7 +2439,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _ingredientsDeltas.Enqueue(delta);
+                    QueueIngredientsDelta(delta);
             }
             return;
         }
@@ -3105,6 +3148,20 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("ingredients snapshot receive queue overflow");
     }
 
+    private void QueueIngredientsDelta(IngredientsDelta delta)
+    {
+        if (HasDecodedQueueCapacity(_ingredientsDeltas.Count, MaxPendingIngredientsDeltas))
+        {
+            _ingredientsDeltas.Enqueue(delta);
+            return;
+        }
+        while (_ingredientsDeltas.TryDequeue(out _))
+        {
+        }
+        _ingredientsDeltaResyncNeeded = true;
+        _log?.LogWarning("Ingredients delta receive backlog reset; client will resnapshot");
+    }
+
     private void QueueFishActionRequest(FishActionRequest request)
     {
         if (HasDecodedQueueCapacity(_fishActionRequests.Count, MaxPendingFishActionRequests))
@@ -3123,6 +3180,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish lifecycle receive queue overflow");
+    }
+
+    private void QueueFishActionAck(FishActionAck ack)
+    {
+        if (HasDecodedQueueCapacity(_fishActionAcks.Count, MaxPendingFishActionAcks))
+        {
+            _fishActionAcks.Enqueue(ack);
+            return;
+        }
+        FailReliableDelivery("fish action acknowledgement receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
@@ -3332,6 +3399,7 @@ internal sealed class UdpSession : IDisposable
         while (_ingredientsDeltas.TryDequeue(out _))
         {
         }
+        _ingredientsDeltaResyncNeeded = false;
         _snapshot = default;
         _lastSnapshotReceive = 0f;
         _hasSnapshot = false;
