@@ -26,6 +26,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
+    private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -299,6 +300,7 @@ internal sealed class UdpSession : IDisposable
         TestSaveSnapshotAckQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
+        TestIngredientsSyncRequestQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -596,6 +598,20 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._managerEvents.IsEmpty ||
             session._peerLostReason != "manager event receive queue overflow")
             throw new InvalidOperationException("Manager event queue overflow self-test failed");
+    }
+
+    private static void TestIngredientsSyncRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingIngredientsSyncRequests; index++)
+            session._ingredientsSyncRequests.Enqueue(default);
+        session.QueueIngredientsSyncRequest(default);
+        if (session._connected || !session._ingredientsSyncRequests.IsEmpty)
+            throw new InvalidOperationException("Ingredients sync request queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2290,7 +2306,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _ingredientsSyncRequests.Enqueue(request);
+                    QueueIngredientsSyncRequest(request);
             }
             return;
         }
@@ -3041,6 +3057,17 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("manager event receive queue overflow");
+    }
+
+    private void QueueIngredientsSyncRequest(IngredientsSyncRequest request)
+    {
+        if (HasDecodedQueueCapacity(
+                _ingredientsSyncRequests.Count, MaxPendingIngredientsSyncRequests))
+        {
+            _ingredientsSyncRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("ingredients sync request receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>

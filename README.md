@@ -32,6 +32,11 @@ Unofficial community mod, not supported by the game's developer or
 platform. It is still in active development: expect rough edges after game
 updates, unsupported story moments, and the occasional desync.
 
+## Trust model
+
+Traffic is plain UDP with no encryption or peer authentication. Only play
+with people you trust, and do not expose a public lobby.
+
 ## Install
 
 1. Install BepInEx IL2CPP for Dave the Diver.
