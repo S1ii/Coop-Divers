@@ -1523,7 +1523,9 @@ internal sealed class ManagerEventReplicator
     {
         _storySnapshotPublished = false;
         _nextStoryScan = 0f;
-        _nextStorySafetyKeyframe = 0f;
+        _nextStorySafetyKeyframe = _wasConnected
+            ? Time.realtimeSinceStartup + 5f
+            : 0f;
         _hostDayTicks = long.MinValue;
         _hostDayTime = int.MinValue;
         _hostWeather = int.MinValue;
