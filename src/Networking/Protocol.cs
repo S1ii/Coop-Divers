@@ -496,7 +496,8 @@ internal readonly record struct CargoState(
     uint SceneId,
     float WeightMax,
     float OverloadedThreshold,
-    float WeightParameter);
+    float WeightParameter,
+    uint SceneEpoch = 0);
 internal enum NpcInteractionAction : byte
 {
     Request = 1,
@@ -632,7 +633,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 45;
+    private const byte Version = 46;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -678,7 +679,7 @@ internal static class Protocol
     private const int DiveReadyPacketSize = HeaderSize + 5;
     private const int DiveStatePacketSize = HeaderSize + 14;
     private const int SceneSeedPacketSize = HeaderSize + 8;
-    private const int CargoStatePacketSize = HeaderSize + 16;
+    private const int CargoStatePacketSize = HeaderSize + 20;
     private const int NpcInteractionPacketSize = HeaderSize + 38;
     private const int BoatDecoStatePacketSize = HeaderSize + 4;
     private const int DiverLifeStatePacketSize = HeaderSize + 5;
@@ -1191,16 +1192,18 @@ internal static class Protocol
 
     internal static byte[] EncodeCargoState(uint sequence, CargoState state)
     {
-        if (state.SceneId == 0 || state.WeightMax <= 0f || state.OverloadedThreshold <= 0f ||
+        if (state.SceneId == 0 || state.SceneEpoch == 0 || state.WeightMax <= 0f ||
+            state.OverloadedThreshold <= 0f ||
             !float.IsFinite(state.WeightMax) || !float.IsFinite(state.OverloadedThreshold) ||
             !float.IsFinite(state.WeightParameter))
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[CargoStatePacketSize];
         WriteHeader(packet, PacketType.CargoState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
-        WriteSingle(packet.AsSpan(HeaderSize + 4), state.WeightMax);
-        WriteSingle(packet.AsSpan(HeaderSize + 8), state.OverloadedThreshold);
-        WriteSingle(packet.AsSpan(HeaderSize + 12), state.WeightParameter);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        WriteSingle(packet.AsSpan(HeaderSize + 8), state.WeightMax);
+        WriteSingle(packet.AsSpan(HeaderSize + 12), state.OverloadedThreshold);
+        WriteSingle(packet.AsSpan(HeaderSize + 16), state.WeightParameter);
         return packet;
     }
 
@@ -1216,10 +1219,12 @@ internal static class Protocol
             return false;
         state = new CargoState(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            ReadSingle(packet.Slice(HeaderSize + 4)),
             ReadSingle(packet.Slice(HeaderSize + 8)),
-            ReadSingle(packet.Slice(HeaderSize + 12)));
-        return state.SceneId != 0 && state.WeightMax > 0f && state.OverloadedThreshold > 0f &&
+            ReadSingle(packet.Slice(HeaderSize + 12)),
+            ReadSingle(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)));
+        return state.SceneId != 0 && state.SceneEpoch != 0 && state.WeightMax > 0f &&
+               state.OverloadedThreshold > 0f &&
                float.IsFinite(state.WeightMax) && float.IsFinite(state.OverloadedThreshold) &&
                float.IsFinite(state.WeightParameter);
     }
@@ -3965,11 +3970,15 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 4), 0);
         if (TryDecodeSceneSeed(sceneSeedPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted a zero scene seed");
-        var cargoState = new CargoState(SceneId("A02_01_01"), 9f, 13f, 0f);
+        var cargoState = new CargoState(SceneId("A02_01_01"), 9f, 13f, 0f, 7);
         var cargoPacket = EncodeCargoState(46, cargoState);
         if (!TryDecodeCargoState(cargoPacket, out sequence, out var actualCargoState) ||
             sequence != 46 || actualCargoState != cargoState)
             throw new InvalidOperationException("Cargo state round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(cargoPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeCargoState(cargoPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted a cargo state without a scene epoch");
+        BinaryPrimitives.WriteUInt32LittleEndian(cargoPacket.AsSpan(HeaderSize + 4), cargoState.SceneEpoch);
         WriteSingle(cargoPacket.AsSpan(HeaderSize + 8), 0f);
         if (TryDecodeCargoState(cargoPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid cargo state");

@@ -90,11 +90,12 @@ internal sealed class RemoteCatchLedger
 
     internal static void SelfTest()
     {
-        var state = new CargoState(123, 9f, 13f, 0f);
-        if (!ShouldApplyCargoState(SessionRole.Client, true, 123, state) ||
-            ShouldApplyCargoState(SessionRole.Host, true, 123, state) ||
-            ShouldApplyCargoState(SessionRole.Client, false, 123, state) ||
-            ShouldApplyCargoState(SessionRole.Client, true, 124, state))
+        var state = new CargoState(123, 9f, 13f, 0f, 7);
+        if (!ShouldApplyCargoState(SessionRole.Client, true, 123, 7, state) ||
+            ShouldApplyCargoState(SessionRole.Host, true, 123, 7, state) ||
+            ShouldApplyCargoState(SessionRole.Client, false, 123, 7, state) ||
+            ShouldApplyCargoState(SessionRole.Client, true, 124, 7, state) ||
+            ShouldApplyCargoState(SessionRole.Client, true, 123, 8, state))
             throw new InvalidOperationException("Cargo state apply decision failed");
 
         var accepted = new HashSet<ulong>();
@@ -230,12 +231,16 @@ internal sealed class RemoteCatchLedger
             }
             return;
         }
+        var sceneId = Protocol.SceneId(sceneName);
+        if (_clientCargoState.SceneEpoch != 0 &&
+            !ShouldApplyCargoState(role, _inDiveSession, sceneId, session.RemoteSceneEpoch, _clientCargoState))
+            _clientCargoState = default;
         while (session.TryTakeCargoState(out var cargoState))
             if (ShouldApplyCargoState(
-                    role, _inDiveSession, Protocol.SceneId(sceneName), cargoState))
+                    role, _inDiveSession, sceneId, session.RemoteSceneEpoch, cargoState))
             {
                 _clientCargoState = cargoState;
-                ApplyClientCargoState(LootBox.Instance);
+                ApplyClientCargoState(LootBox.Instance, role, sceneId, session.RemoteSceneEpoch);
                 _trace?.Write("CARGO-APPLY",
                     $"max={cargoState.WeightMax:F2} threshold={cargoState.OverloadedThreshold:F2} " +
                     $"parameter={cargoState.WeightParameter:F2}");
@@ -845,9 +850,14 @@ internal sealed class RemoteCatchLedger
     internal static ulong PickupSource(uint sceneId, uint worldId) =>
         0x5000000000000000UL ^ ((ulong)sceneId << 32) ^ worldId;
 
-    internal void ApplyClientCargoState(LootBox lootBox)
+    internal void ApplyClientCargoState(
+        LootBox lootBox,
+        SessionRole role,
+        uint sceneId,
+        uint sceneEpoch)
     {
-        if (lootBox == null || _clientCargoState.SceneId == 0)
+        if (lootBox == null || !ShouldApplyCargoState(
+                role, _inDiveSession, sceneId, sceneEpoch, _clientCargoState))
             return;
         lootBox.WeightParameter = _clientCargoState.WeightParameter;
         lootBox.m_WeightMax = _clientCargoState.WeightMax;
@@ -864,7 +874,8 @@ internal sealed class RemoteCatchLedger
             lootBox.overloadedThreshold <= 0f)
             return;
         var state = new CargoState(
-            sceneId, lootBox.weightMax, lootBox.overloadedThreshold, lootBox.WeightParameter);
+            sceneId, lootBox.weightMax, lootBox.overloadedThreshold, lootBox.WeightParameter,
+            session.LocalSceneEpoch);
         if (_hasHostCargoState && state == _lastHostCargoState && now < _nextHostCargoSend)
             return;
         session.SendCargoState(state);
@@ -880,8 +891,10 @@ internal sealed class RemoteCatchLedger
         SessionRole role,
         bool inDive,
         uint sceneId,
+        uint sceneEpoch,
         CargoState state) =>
-        role == SessionRole.Client && inDive && sceneId != 0 && sceneId == state.SceneId;
+        role == SessionRole.Client && inDive && sceneId != 0 && sceneEpoch != 0 &&
+        sceneId == state.SceneId && sceneEpoch == state.SceneEpoch;
 
     // Matching the native inventory, the pickup that crosses the limit is
     // accepted and makes the diver overloaded; later pickups stop.

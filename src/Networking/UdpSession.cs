@@ -268,6 +268,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
+        TestCargoEpochGate();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -448,6 +449,26 @@ internal sealed class UdpSession : IDisposable
         if (!future.TryTakeDiverWeaponResult(out var deliveredFuture) ||
             deliveredFuture.RequestId != 7 || future._pendingWorldDiverWeaponResults.Count != 0)
             throw new InvalidOperationException("Diver weapon future-world delivery self-test failed");
+    }
+
+    private static void TestCargoEpochGate()
+    {
+        var session = new UdpSession(null)
+        {
+            _connected = true,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 20,
+            _hasRemoteScene = true
+        };
+        var current = new CargoState(10, 9f, 13f, 0f, 20);
+        var stale = current with { SceneEpoch = 19 };
+        if (!session.ShouldQueueCargoState(current) || session.ShouldQueueCargoState(stale))
+            throw new InvalidOperationException("Cargo scene epoch gate self-test failed");
+        session._cargoStates.Enqueue(current);
+        session.ClearRemoteWorldState();
+        if (session.TryTakeCargoState(out _))
+            throw new InvalidOperationException("Cargo state survived a world reset");
     }
 
     internal bool Connected => _connected;
@@ -1069,11 +1090,15 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendCargoState(CargoState state)
     {
-        if (_role == SessionRole.Host && _connected)
+        state = state with { SceneEpoch = _localSceneEpoch };
+        if (_role == SessionRole.Host && MatchesLocalWorld(state.SceneId, state.SceneEpoch))
             SendReliable(Protocol.EncodeCargoState(++_sequence, state));
     }
 
     internal bool TryTakeCargoState(out CargoState state) => _cargoStates.TryDequeue(out state);
+
+    private bool ShouldQueueCargoState(CargoState state) =>
+        MatchesRemoteWorld(state.SceneId, state.SceneEpoch);
 
     internal void SendIngredientsSyncRequest(IngredientsSyncRequest request)
     {
@@ -1661,7 +1686,7 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeCargoState(received.Buffer, out _, out var state))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) && ShouldQueueCargoState(state))
                     _cargoStates.Enqueue(state);
             }
             return;
@@ -2391,6 +2416,9 @@ internal sealed class UdpSession : IDisposable
         while (_pickupResults.TryDequeue(out _))
         {
         }
+        while (_cargoStates.TryDequeue(out _))
+        {
+        }
         while (_bossDamageRequests.TryDequeue(out _))
         {
         }
@@ -2660,6 +2688,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_sceneTransitions.TryDequeue(out _))
+        {
+        }
+        while (_cargoStates.TryDequeue(out _))
         {
         }
         while (_ingredientsSyncRequests.TryDequeue(out _))

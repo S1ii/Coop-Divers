@@ -1284,7 +1284,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void ApplyClientCargoState(LootBox lootBox)
     {
         if (Role == SessionRole.Client && IsDiveScene())
-            _remoteCatchLedger?.ApplyClientCargoState(lootBox);
+            _remoteCatchLedger?.ApplyClientCargoState(
+                lootBox, Role, _sceneId, _session?.RemoteSceneEpoch ?? 0);
     }
 
     internal void TraceHarpoon(string stage, HarpoonWeaponHandler handler, bool? success = null)
