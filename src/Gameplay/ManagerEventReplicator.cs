@@ -696,6 +696,8 @@ internal sealed class ManagerEventReplicator
     {
         if (_applyingTimeAuthority || session == null || !session.Connected)
             return true;
+        if (role == SessionRole.Client && !_remoteTimeScopeActive)
+            return true;
         if (role != SessionRole.Host)
             return role != SessionRole.Client;
         Publish(session, ManagerDomain.Time, ManagerAction.TimeReset, 0, 0);

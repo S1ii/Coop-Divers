@@ -1686,7 +1686,7 @@ internal static class Protocol
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
-        if (state.Domain == 0 || state.Domain > 17 || state.Action == 0 || state.Action > 77)
+        if (state.Domain == 0 || state.Domain > 18 || state.Action == 0 || state.Action > 80)
             throw new ArgumentOutOfRangeException(nameof(state));
         var invocationSize = 0;
         if (state.Invocation is { } invocation &&
@@ -2004,12 +2004,13 @@ internal static class Protocol
             15 => state.Action == 27,
             16 => state.Action is 32 or 33 or 34,
             17 => state.Action is >= 40 and <= 70,
+            18 => state.Action is 78 or 79 or 80,
             _ => false
         };
         if (!pairIsValid)
             return false;
         if ((state.SceneId == 0) != (state.SceneEpoch == 0) ||
-            state.Domain is 3 or 16 && state.SceneId != 0)
+            state.Domain is 3 or 16 or 18 && state.SceneId != 0)
             return false;
         if (state.Action is 32 or 35 && (state.Value == 0 || state.Context != 0) ||
             state.Action is 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
@@ -2052,6 +2053,15 @@ internal static class Protocol
                 (state.Value is < 1 or > 6 || state.Context < -1_000_000_000))
                 return false;
             if (state.Action == 70 && (state.Value < 0 || state.Context is < 0 or > 3))
+                return false;
+        }
+        if (state.Domain == 18)
+        {
+            if (state.Action == 78 &&
+                (state.Value is < 1 or > 16 ||
+                 BitConverter.Int32BitsToSingle(state.Context) is not (>= 0f and <= 4f)))
+                return false;
+            if (state.Action is 79 or 80 && (state.Value != 0 || state.Context != 0))
                 return false;
         }
         if (state.Action is >= 71 and <= 77)
@@ -4541,6 +4551,19 @@ internal static class Protocol
             if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
                 managerEvent != progressionEvent)
                 throw new InvalidOperationException("Progression manager event round-trip failed");
+        }
+        var timeEvents = new[]
+        {
+            new ManagerEvent(15, 0, 1247, 18, 78, 3, BitConverter.SingleToInt32Bits(0.25f)),
+            new ManagerEvent(16, 0, 1248, 18, 79, 0, 0),
+            new ManagerEvent(17, 0, 1249, 18, 80, 0, 0)
+        };
+        foreach (var timeEvent in timeEvents)
+        {
+            managerEventPacket = EncodeManagerEvent(62, timeEvent);
+            if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+                managerEvent != timeEvent)
+                throw new InvalidOperationException("Time manager event round-trip failed");
         }
         var sushiActionEvents = new[]
         {
