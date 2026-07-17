@@ -62,6 +62,7 @@ internal sealed class NpcInteractionCoordinator
                 NpcInteractionAction.Granted, NpcInteractionResult.Accepted, false) ||
             ShouldApplyGrant(
                 NpcInteractionAction.Released, NpcInteractionResult.Accepted, true) ||
+            !ScopeMatches(7, 9, 7, 9) || ScopeMatches(7, 9, 7, 10) ||
             StableTargetId("talk", 101, "0:Root/2:Npc") !=
                 StableTargetId("talk", 101, "0:Root/2:Npc") ||
             StableTargetId("talk", 101, "0:Root/2:Npc") ==
@@ -87,6 +88,10 @@ internal sealed class NpcInteractionCoordinator
         _wasConnected = connected;
         if (!connected)
             return;
+
+        var epoch = role == SessionRole.Host ? session.LocalSceneEpoch : session.RemoteSceneEpoch;
+        if ((_token != 0 || _hostBusy) && !ScopeMatches(_sceneId, _sceneEpoch, sceneId, epoch))
+            LocalClear();
 
         while (session.TryTakeNpcInteraction(out var state))
         {
@@ -463,6 +468,9 @@ internal sealed class NpcInteractionCoordinator
         _pendingTalkTarget = null;
         _pendingMissionNpc = null;
     }
+
+    private static bool ScopeMatches(uint sceneId, uint sceneEpoch, uint currentSceneId, uint currentEpoch) =>
+        sceneId != 0 && sceneEpoch != 0 && sceneId == currentSceneId && sceneEpoch == currentEpoch;
 
     private static MethodBase[] GetPatchTargets() => new[]
     {

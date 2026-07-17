@@ -25,6 +25,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
     private const int MaxPendingFishActionRequests = 256;
+    private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -297,6 +298,7 @@ internal sealed class UdpSession : IDisposable
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
         TestFishActionRequestQueueOverflow();
+        TestManagerEventQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -579,6 +581,21 @@ internal sealed class UdpSession : IDisposable
         session.QueueFishActionRequest(default);
         if (session._connected || !session._fishActionRequests.IsEmpty)
             throw new InvalidOperationException("Fish action request queue overflow self-test failed");
+    }
+
+    private static void TestManagerEventQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingManagerEvents; index++)
+            session._managerEvents.Enqueue(default);
+        session.QueueManagerEvent(default);
+        if (session._connected || !session._managerEvents.IsEmpty ||
+            session._peerLostReason != "manager event receive queue overflow")
+            throw new InvalidOperationException("Manager event queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2555,7 +2572,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && ShouldQueueManagerEvent(state))
-                    _managerEvents.Enqueue(state);
+                    QueueManagerEvent(state);
             }
             return;
         }
@@ -3014,6 +3031,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish action request receive queue overflow");
+    }
+
+    private void QueueManagerEvent(ManagerEvent state)
+    {
+        if (HasDecodedQueueCapacity(_managerEvents.Count, MaxPendingManagerEvents))
+        {
+            _managerEvents.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("manager event receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
