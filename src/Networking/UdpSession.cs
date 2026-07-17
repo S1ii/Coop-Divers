@@ -29,6 +29,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingDiveExitRequests = 256;
     private const int MaxPendingTravelReady = 256;
+    private const int MaxPendingDiverLifeStates = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -305,6 +306,7 @@ internal sealed class UdpSession : IDisposable
         TestIngredientsSyncRequestQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
+        TestDiverLifeStateQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -644,6 +646,21 @@ internal sealed class UdpSession : IDisposable
         session.QueueTravelReady(default);
         if (session._connected || !session._travelReady.IsEmpty)
             throw new InvalidOperationException("Travel ready queue overflow self-test failed");
+    }
+
+    private static void TestDiverLifeStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingDiverLifeStates; index++)
+            session._diverLifeStates.Enqueue(default);
+        session.QueueDiverLifeState(default);
+        if (session._connected || !session._diverLifeStates.IsEmpty ||
+            session._peerLostReason != "diver life state receive queue overflow")
+            throw new InvalidOperationException("Diver life state queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2446,7 +2463,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _diverLifeStates.Enqueue(state);
+                    QueueDiverLifeState(state);
             }
             return;
         }
@@ -3120,6 +3137,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("travel ready receive queue overflow");
+    }
+
+    private void QueueDiverLifeState(DiverLifeState state)
+    {
+        if (HasDecodedQueueCapacity(_diverLifeStates.Count, MaxPendingDiverLifeStates))
+        {
+            _diverLifeStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("diver life state receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
