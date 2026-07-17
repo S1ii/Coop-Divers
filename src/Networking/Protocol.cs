@@ -583,10 +583,15 @@ internal readonly record struct WorldFlagState(uint Revision, string Key, bool V
 internal readonly record struct BossDamageRequest(
     uint SceneId,
     uint SceneEpoch,
+    uint RequestId,
     uint BossId,
+    uint TargetId,
     int Damage,
     int Element,
-    int AttackType);
+    int AttackType,
+    float HitX,
+    float HitY,
+    float HitZ);
 internal readonly record struct BossState(
     uint SceneId,
     uint SceneEpoch,
@@ -600,6 +605,7 @@ internal readonly record struct BossState(
     float Z,
     int AnimationHash,
     float AnimationTime,
+    int Phase,
     byte Flags);
 internal enum ManagerInvocationKind : byte
 {
@@ -658,8 +664,8 @@ internal static class Protocol
     private const int FishSnapshotCompactEntrySize = 26;
     private const int FishSnapshotFullEntrySize = 38;
     private const int FishDamageRequestSize = HeaderSize + 28;
-    private const int BossDamageRequestSize = HeaderSize + 24;
-    private const int BossStateSize = HeaderSize + 49;
+    private const int BossDamageRequestSize = HeaderSize + 44;
+    private const int BossStateSize = HeaderSize + 53;
     private const int ManagerEventSize = HeaderSize + 26;
     private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 16;
@@ -1582,18 +1588,27 @@ internal static class Protocol
 
     internal static byte[] EncodeBossDamageRequest(uint sequence, BossDamageRequest request)
     {
-        if (request.SceneId == 0 || request.SceneEpoch == 0 || request.BossId == 0 ||
+        if (request.SceneId == 0 || request.SceneEpoch == 0 || request.RequestId == 0 ||
+            request.BossId == 0 || request.TargetId == 0 ||
             request.Damage is < 1 or > 10_000 || request.Element is < 0 or > 32 ||
-            request.AttackType is < 0 or > 64)
+            request.AttackType is < 0 or > 64 || !float.IsFinite(request.HitX) ||
+            !float.IsFinite(request.HitY) || !float.IsFinite(request.HitZ) ||
+            MathF.Abs(request.HitX) > 1_000_000f || MathF.Abs(request.HitY) > 1_000_000f ||
+            MathF.Abs(request.HitZ) > 1_000_000f)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[BossDamageRequestSize];
         WriteHeader(packet, PacketType.BossDamageRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.SceneEpoch);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.BossId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Damage);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.Element);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.AttackType);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.RequestId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.BossId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.TargetId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 24), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 28), request.AttackType);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), request.HitX);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), request.HitY);
+        WriteSingle(packet.AsSpan(HeaderSize + 40), request.HitZ);
         return packet;
     }
 
@@ -1609,14 +1624,24 @@ internal static class Protocol
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
         var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        var bossId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
-        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
-        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20));
-        if (sceneId == 0 || sceneEpoch == 0 || bossId == 0 || damage is < 1 or > 10_000 ||
-            element is < 0 or > 32 || attackType is < 0 or > 64)
+        var requestId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var bossId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12));
+        var targetId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 16));
+        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20));
+        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 24));
+        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 28));
+        var hitX = ReadSingle(packet.Slice(HeaderSize + 32));
+        var hitY = ReadSingle(packet.Slice(HeaderSize + 36));
+        var hitZ = ReadSingle(packet.Slice(HeaderSize + 40));
+        if (sceneId == 0 || sceneEpoch == 0 || requestId == 0 || bossId == 0 || targetId == 0 ||
+            damage is < 1 or > 10_000 || element is < 0 or > 32 || attackType is < 0 or > 64 ||
+            !float.IsFinite(hitX) || !float.IsFinite(hitY) || !float.IsFinite(hitZ) ||
+            MathF.Abs(hitX) > 1_000_000f || MathF.Abs(hitY) > 1_000_000f ||
+            MathF.Abs(hitZ) > 1_000_000f)
             return false;
-        request = new BossDamageRequest(sceneId, sceneEpoch, bossId, damage, element, attackType);
+        request = new BossDamageRequest(
+            sceneId, sceneEpoch, requestId, bossId, targetId, damage, element, attackType,
+            hitX, hitY, hitZ);
         return true;
     }
 
@@ -1638,7 +1663,8 @@ internal static class Protocol
         WriteSingle(packet.AsSpan(HeaderSize + 36), state.Z);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 40), state.AnimationHash);
         WriteSingle(packet.AsSpan(HeaderSize + 44), state.AnimationTime);
-        packet[HeaderSize + 48] = state.Flags;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 48), state.Phase);
+        packet[HeaderSize + 52] = state.Flags;
         return packet;
     }
 
@@ -1665,7 +1691,8 @@ internal static class Protocol
             ReadSingle(packet.Slice(HeaderSize + 36)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 40)),
             ReadSingle(packet.Slice(HeaderSize + 44)),
-            packet[HeaderSize + 48]);
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 48)),
+            packet[HeaderSize + 52]);
         if (!IsValidBossState(state))
         {
             state = default;
@@ -1682,7 +1709,7 @@ internal static class Protocol
         float.IsFinite(state.Z) && MathF.Abs(state.X) <= 1_000_000f &&
         MathF.Abs(state.Y) <= 1_000_000f && MathF.Abs(state.Z) <= 1_000_000f &&
         float.IsFinite(state.AnimationTime) && state.AnimationTime is >= 0f and <= 1f &&
-        state.Flags <= 1;
+        state.Phase >= 0 && state.Flags <= 1;
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
@@ -4461,12 +4488,13 @@ internal static class Protocol
         if (TryDecodeFishLootComplete(lootCompletePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish loot completion");
 
-        var expectedBossDamage = new BossDamageRequest(fishSceneId, 7, 0x11223344, 37, 2, 4);
+        var expectedBossDamage = new BossDamageRequest(
+            fishSceneId, 7, 9, 0x11223344, 0x11223345, 37, 2, 4, 2.5f, -4f, 0f);
         var bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
         if (!TryDecodeBossDamageRequest(bossDamagePacket, out sequence, out var actualBossDamage) ||
             sequence != 46 || actualBossDamage != expectedBossDamage)
             throw new InvalidOperationException("Boss damage request round-trip failed");
-        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 8), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 12), 0);
         if (TryDecodeBossDamageRequest(bossDamagePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted an invalid boss ID");
         bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
@@ -4476,7 +4504,7 @@ internal static class Protocol
 
         var expectedBossState = new BossState(
             fishSceneId, 7, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f,
-            0x12345678, 0.25f, 0);
+            0x12345678, 0.25f, 2, 0);
         var bossStatePacket = EncodeBossState(46, expectedBossState);
         if (!TryDecodeBossState(bossStatePacket, out sequence, out var actualBossState) ||
             sequence != 46 || actualBossState != expectedBossState)

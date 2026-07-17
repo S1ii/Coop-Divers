@@ -12,6 +12,7 @@ internal static class FishSpawnSeedCoordinator
     private static readonly Dictionary<(uint SceneId, uint SceneEpoch), int> SceneSeeds = new();
     private static readonly Dictionary<uint, uint> StagedSceneEpochs = new();
     private static readonly Dictionary<uint, uint> ActiveSceneEpochs = new();
+    private static readonly HashSet<(uint SceneId, uint SceneEpoch, string Scope)> LoggedScopes = new();
 
     internal readonly struct Scope
     {
@@ -33,8 +34,10 @@ internal static class FishSpawnSeedCoordinator
             (int)Protocol.SceneId("allocator-a"));
         var fallback = BuildFallbackAllocatorUid(
             0x1234ABCD, "Game.FishAllocator", "/0:Root/2:Spawner");
+        var scoped = BuildScopedUid("pickup", "A02/Pickup/4");
         if (first == 0 || first != expected || first == CombineSeed(123, "allocator-b") ||
             fallback != "1234ABCD|Game.FishAllocator|/0:Root/2:Spawner" ||
+            scoped != "pickup|A02/Pickup/4" ||
             fallback == BuildFallbackAllocatorUid(
                 0x1234ABCE, "Game.FishAllocator", "/0:Root/2:Spawner") ||
             fallback == BuildFallbackAllocatorUid(
@@ -126,20 +129,37 @@ internal static class FishSpawnSeedCoordinator
         SceneSeeds.Clear();
         StagedSceneEpochs.Clear();
         ActiveSceneEpochs.Clear();
+        LoggedScopes.Clear();
     }
 
     internal static Scope Begin(FishAllocator allocator)
     {
         if (allocator == null)
             return default;
-        var sceneId = Protocol.SceneId(allocator.gameObject.scene.name);
+        return Begin(allocator, "fish", GetAllocatorUid(Protocol.SceneId(allocator.gameObject.scene.name), allocator));
+    }
+
+    internal static Scope Begin(Component source, string subsystem, string nativeUid = null)
+    {
+        if (source == null)
+            return default;
+        var sceneId = Protocol.SceneId(source.gameObject.scene.name);
         if (!ActiveSceneEpochs.TryGetValue(sceneId, out var sceneEpoch) ||
             !SceneSeeds.TryGetValue((sceneId, sceneEpoch), out var sceneSeed))
             return default;
 
-        var uid = GetAllocatorUid(sceneId, allocator);
+        var uid = string.IsNullOrWhiteSpace(nativeUid)
+            ? BuildFallbackAllocatorUid(sceneId, source.GetType().FullName ?? source.GetType().Name,
+                HierarchyPath(source.transform))
+            : nativeUid;
+        var scope = BuildScopedUid(subsystem, uid);
+        var finalSeed = CombineSeed(sceneSeed, scope);
+        if (LoggedScopes.Add((sceneId, sceneEpoch, scope)))
+            ProbeBehaviour.Logger?.LogDebug(
+                $"RNG scope: scene={sceneId:X8}; epoch={sceneEpoch}; subsystem={subsystem}; " +
+                $"uid={uid}; seed={finalSeed}");
         var previous = UnityEngine.Random.state;
-        UnityEngine.Random.InitState(CombineSeed(sceneSeed, uid));
+        UnityEngine.Random.InitState(finalSeed);
         return new Scope(true, previous);
     }
 
@@ -160,15 +180,24 @@ internal static class FishSpawnSeedCoordinator
         catch
         {
         }
-        var path = new StringBuilder();
-        for (var current = allocator.transform; current != null; current = current.parent)
-            path.Insert(0, $"/{current.GetSiblingIndex()}:{current.name}");
+        var path = HierarchyPath(allocator.transform);
         return BuildFallbackAllocatorUid(
-            sceneId, allocator.GetType().FullName ?? nameof(FishAllocator), path.ToString());
+            sceneId, allocator.GetType().FullName ?? nameof(FishAllocator), path);
     }
 
     private static string BuildFallbackAllocatorUid(uint sceneId, string componentType, string path) =>
         $"{sceneId:X8}|{componentType}|{path}";
+
+    private static string BuildScopedUid(string subsystem, string nativeUid) =>
+        $"{subsystem ?? string.Empty}|{nativeUid ?? string.Empty}";
+
+    private static string HierarchyPath(Transform transform)
+    {
+        var path = new StringBuilder();
+        for (var current = transform; current != null; current = current.parent)
+            path.Insert(0, $"/{current.GetSiblingIndex()}:{current.name}");
+        return path.ToString();
+    }
 
     private static int CombineSeed(int sceneSeed, string allocatorUid)
     {
@@ -187,13 +216,27 @@ internal static class FishSpawnSeedCoordinator
 
     private static bool IsNewer(uint value, uint previous) =>
         value != previous && unchecked((int)(value - previous)) > 0;
+
+    internal static IEnumerable<MethodBase> DeclaredFamilyRoots(
+        Type root, string methodName, Type[] arguments)
+    {
+        foreach (var type in AccessTools.GetTypesFromAssembly(root.Assembly))
+        {
+            if (!root.IsAssignableFrom(type))
+                continue;
+            var method = AccessTools.DeclaredMethod(type, methodName, arguments);
+            if (method != null)
+                yield return method;
+        }
+    }
 }
 
 [HarmonyPatch]
 internal static class FishAllocatorSpawnSeedPatch
 {
-    private static MethodBase TargetMethod() =>
-        AccessTools.Method(typeof(FishAllocator), nameof(FishAllocator.Spawn), Type.EmptyTypes);
+    private static IEnumerable<MethodBase> TargetMethods() =>
+        FishSpawnSeedCoordinator.DeclaredFamilyRoots(
+            typeof(FishAllocator), nameof(FishAllocator.Spawn), Type.EmptyTypes);
 
     private static void Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
         __state = FishSpawnSeedCoordinator.Begin(__instance);
@@ -210,8 +253,9 @@ internal static class FishAllocatorSpawnSeedPatch
 [HarmonyPatch]
 internal static class FishAllocatorSpawnForceSeedPatch
 {
-    private static MethodBase TargetMethod() =>
-        AccessTools.Method(typeof(FishAllocator), nameof(FishAllocator.Spawn), new[] { typeof(bool) });
+    private static IEnumerable<MethodBase> TargetMethods() =>
+        FishSpawnSeedCoordinator.DeclaredFamilyRoots(
+            typeof(FishAllocator), nameof(FishAllocator.Spawn), new[] { typeof(bool) });
 
     private static void Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
         __state = FishSpawnSeedCoordinator.Begin(__instance);
@@ -253,4 +297,88 @@ internal static class FishAllocatorInstanceSeedPatch
         FishSpawnSeedCoordinator.End(__state);
         return __exception;
     }
+}
+
+[HarmonyPatch]
+internal static class FishBushSpawnSeedPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods() =>
+        FishSpawnSeedCoordinator.DeclaredFamilyRoots(
+            typeof(FishBushAllocator), nameof(FishBushAllocator.TrySpawnFish), new[] { typeof(bool) });
+
+    private static void Prefix(FishBushAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance?.fishAllocator, "fish-bush");
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class PickupSpawnerSeedPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods() =>
+        FishSpawnSeedCoordinator.DeclaredFamilyRoots(
+            typeof(SpawnerPickupItem), nameof(SpawnerPickupItem.Start), Type.EmptyTypes);
+
+    private static void Prefix(SpawnerPickupItem __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "pickup", __instance?.UniqueID);
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
+[HarmonyPatch]
+internal static class ChestSpawnerSeedPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods() =>
+        FishSpawnSeedCoordinator.DeclaredFamilyRoots(
+            typeof(SpawnerChestItem), nameof(SpawnerChestItem.Start), Type.EmptyTypes);
+
+    private static void Prefix(SpawnerChestItem __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "chest", __instance?.UniqueID);
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
+[HarmonyPatch(typeof(SavedRandomActivator), nameof(SavedRandomActivator.SelectRandomOne))]
+internal static class SavedRandomActivatorSeedPatch
+{
+    private static void Prefix(SavedRandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "saved-random", __instance?.UniqueID);
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
+[HarmonyPatch(typeof(RandomActivator), nameof(RandomActivator.Awake))]
+internal static class RandomActivatorSeedPatch
+{
+    private static void Prefix(RandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "random-activator");
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
+[HarmonyPatch(typeof(JungleProximitySavedRandomActivator),
+    nameof(JungleProximitySavedRandomActivator.TryLockNearestCandidate))]
+internal static class JungleProximityRandomAuthorityPatch
+{
+    private static bool Prefix() => HostAuthorityPolicy.CanOwnHostAction;
 }

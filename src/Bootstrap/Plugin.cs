@@ -33,6 +33,8 @@ public sealed class Plugin : BasePlugin
         DiveCoordinator.SelfTest();
         TravelCoordinator.SelfTest();
         DiverRuntimeAuthority.SelfTest();
+        DiverVitalReplicator.SelfTest();
+        DiverEquipmentPolicy.SelfTest();
         DiverWeaponAuthority.SelfTest();
         DiverWeaponReplicator.SelfTest();
         SceneReplicator.SelfTest();

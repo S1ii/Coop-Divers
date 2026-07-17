@@ -1516,7 +1516,9 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendDiverRuntimeState(DiverRuntimeState state)
     {
-        if (_role == SessionRole.Host && MatchesLocalWorld(state.SceneId, state.SceneEpoch))
+        if (((_role == SessionRole.Host && state.Owner == DiverOwner.Host) ||
+             (_role == SessionRole.Client && state.Owner == DiverOwner.Client)) &&
+            MatchesLocalWorld(state.SceneId, state.SceneEpoch))
             Send(Protocol.EncodeDiverRuntimeState(++_sequence, state));
     }
 
@@ -2769,8 +2771,10 @@ internal sealed class UdpSession : IDisposable
 
         if (type == PacketType.DiverRuntimeState)
         {
-            if (_connected && _role == SessionRole.Client &&
+            var expectedOwner = _role == SessionRole.Host ? DiverOwner.Client : DiverOwner.Host;
+            if (_connected && _role is SessionRole.Host or SessionRole.Client &&
                 Protocol.TryDecodeDiverRuntimeState(received.Buffer, out _, out var state) &&
+                state.Owner == expectedOwner &&
                 MatchesRemoteWorld(state.SceneId, state.SceneEpoch))
             {
                 ref var revision = ref (state.Owner == DiverOwner.Host

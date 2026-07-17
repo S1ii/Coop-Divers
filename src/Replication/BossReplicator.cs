@@ -20,6 +20,18 @@ internal sealed class BossReplicator
         internal int AuthoritativeHp;
         internal Vector3 OriginalPosition;
         internal Animator Animator;
+        internal readonly List<BehaviourState> Behaviours = new();
+        internal readonly List<Collider2DState> Colliders = new();
+    }
+
+    private readonly record struct BehaviourState(MonoBehaviour Behaviour, bool Enabled);
+    private readonly record struct Collider2DState(Collider2D Collider, bool Enabled);
+
+    private sealed class HostOnlyTarget
+    {
+        internal MonoBehaviour Boss;
+        internal readonly List<BehaviourState> Behaviours = new();
+        internal readonly List<Collider2DState> Colliders = new();
     }
 
     private readonly ManualLogSource _log;
@@ -31,9 +43,14 @@ internal sealed class BossReplicator
     private readonly HashSet<uint> _unsupportedClientDamage = new();
     private readonly HashSet<int> _reportedUnsupportedFamilies = new();
     private readonly HashSet<uint> _reportedAmbiguousIds = new();
+    private readonly Dictionary<int, HostOnlyTarget> _hostOnlyClientTargets = new();
+    private readonly HashSet<int> _reportedHostOnlyFamilies = new();
+    private readonly HashSet<uint> _appliedRemoteRequests = new();
     private float _nextScan;
+    private float _nextHostOnlyScan;
     private float _nextSend;
     private uint _tick;
+    private uint _nextClientRequestId;
     private bool _applyingClientState;
     private uint _activeSceneId;
     private uint _activeSceneEpoch;
@@ -55,7 +72,10 @@ internal sealed class BossReplicator
         if (unique.Count != 1 || !unique.TryGetValue(8, out var owner) ||
             !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { 7u }) ||
             !IsSnapshotFamily("BossGiantSquidController") ||
-            IsSnapshotFamily("BossGoblinSharkController"))
+            IsSnapshotFamily("BossGoblinSharkController") ||
+            !IsKnownHostOnlyFamily("BossGoblinSharkController") ||
+            !IsKnownHostOnlyFamily("SABossEbirah") ||
+            IsKnownHostOnlyFamily("UnknownBoss"))
             throw new InvalidOperationException("Boss unique-ID policy failed");
     }
 
@@ -88,7 +108,7 @@ internal sealed class BossReplicator
                 ScanHost(sceneId);
             }
             while (session.TryTakeBossDamageRequest(out var request))
-                RejectUnsupportedHostDamage(session, sceneId, request);
+                ApplyHostDamage(session, sceneId, request);
             if (now >= _nextSend)
             {
                 _nextSend = now + 0.1f;
@@ -117,6 +137,11 @@ internal sealed class BossReplicator
             _nextScan = now + 0.1f;
             BindClientTargets(sceneId);
         }
+        if (now >= _nextHostOnlyScan)
+        {
+            _nextHostOnlyScan = now + 1f;
+            BindHostOnlyClientTargets();
+        }
         ApplyClientStates(deltaTime);
     }
 
@@ -130,18 +155,57 @@ internal sealed class BossReplicator
         if (_applyingClientState || role != SessionRole.Client || session == null ||
             !session.Connected || boss == null)
             return true;
-        foreach (var pair in _clientTargets)
-        {
-            var target = pair.Value;
-            if (target.Boss != boss)
-                continue;
-            if (hp < target.AuthoritativeHp)
-                session.SendBossDamageRequest(new BossDamageRequest(
-                    sceneId, session.RemoteSceneEpoch, pair.Key,
-                    Math.Clamp(target.AuthoritativeHp - hp, 1, 10_000),
-                    0, (int)AttackType.Player_All));
-            return false;
-        }
+        foreach (var target in _clientTargets.Values)
+            if (target.Boss == boss)
+                return false;
+        return true;
+    }
+
+    internal bool ObserveClientDamage(
+        SessionRole role,
+        UdpSession session,
+        uint sceneId,
+        BossControllerBase boss,
+        AttackData attack)
+    {
+        if (_applyingClientState || role != SessionRole.Client || session == null ||
+            !session.Connected || boss == null || attack == null)
+            return true;
+        if (!TryFindClientBossId(boss, out var bossId))
+            return true;
+        return !SendClientDamage(
+            session, sceneId, bossId, boss, attack.damage, attack.element, attack.attackType,
+            boss.transform.position);
+    }
+
+    internal bool ObserveClientHarpoon(
+        SessionRole role,
+        UdpSession session,
+        uint sceneId,
+        BossControllerBase boss,
+        Vector3 hitPosition,
+        int damage)
+    {
+        if (_applyingClientState || role != SessionRole.Client || session == null ||
+            !session.Connected || boss == null)
+            return true;
+        if (!TryFindClientBossId(boss, out var bossId))
+            return true;
+        return !SendClientDamage(
+            session, sceneId, bossId, boss, damage, EElement.None,
+            AttackType.Player_Harpoon, hitPosition);
+    }
+
+    internal bool AllowClientBossMutation(
+        SessionRole role,
+        UdpSession session,
+        BossControllerBase boss)
+    {
+        if (role != SessionRole.Client || session == null || !session.Connected || boss == null)
+            return true;
+        foreach (var target in _clientTargets.Values)
+            if (target.Boss == boss)
+                return false;
         return true;
     }
 
@@ -151,13 +215,9 @@ internal sealed class BossReplicator
         try
         {
             foreach (var target in _clientTargets.Values)
-                if (target.Boss != null)
-                {
-                    target.Boss.enabled = target.WasEnabled;
-                    target.Boss.bossMaxHP = target.OriginalMaxHp;
-                    target.Boss.CurrentBossHP = target.OriginalHp;
-                    target.Boss.transform.position = target.OriginalPosition;
-                }
+                RestoreClientTarget(target);
+            foreach (var target in _hostOnlyClientTargets.Values)
+                RestoreHostOnlyTarget(target);
         }
         finally
         {
@@ -171,9 +231,14 @@ internal sealed class BossReplicator
         _unsupportedClientDamage.Clear();
         _reportedUnsupportedFamilies.Clear();
         _reportedAmbiguousIds.Clear();
+        _hostOnlyClientTargets.Clear();
+        _reportedHostOnlyFamilies.Clear();
+        _appliedRemoteRequests.Clear();
         _nextScan = 0f;
+        _nextHostOnlyScan = 0f;
         _nextSend = 0f;
         _tick = 0;
+        _nextClientRequestId = 0;
         _activeSceneId = 0;
         _activeSceneEpoch = 0;
         _activeRole = SessionRole.Offline;
@@ -246,7 +311,7 @@ internal sealed class BossReplicator
                 OriginalPosition = boss.transform.position,
                 Animator = boss.GetComponentInChildren<Animator>(true)
             };
-            boss.enabled = false;
+            SuppressClientSimulation(_clientTargets[id]);
             _log.LogInfo($"Network boss bound: {boss.GetType().Name}; id={id:X8}");
         }
     }
@@ -255,19 +320,7 @@ internal sealed class BossReplicator
     {
         if (!_clientTargets.Remove(id, out var target) || target.Boss == null)
             return;
-        var applying = _applyingClientState;
-        _applyingClientState = true;
-        try
-        {
-            target.Boss.enabled = target.WasEnabled;
-            target.Boss.bossMaxHP = target.OriginalMaxHp;
-            target.Boss.CurrentBossHP = target.OriginalHp;
-            target.Boss.transform.position = target.OriginalPosition;
-        }
-        finally
-        {
-            _applyingClientState = applying;
-        }
+        RestoreClientTarget(target);
     }
 
     private void ReportAmbiguousId(uint id)
@@ -287,6 +340,97 @@ internal sealed class BossReplicator
         typeName is "BossGiantSquidController" or "BossHermitCrabController" or
             "BossWolffishController";
 
+    private static bool IsKnownHostOnlyFamily(string typeName) => typeName is
+        "BossGoblinSharkController" or "BossKronosaurus" or "SABossAnomalocaris" or
+        "BossLuscaController" or "BossMantisShrimpController" or
+        "BossGiantGardonController" or "BossClioneController" or
+        "BossJW2Controller" or "BossJW3Controller" or "SABossEbirah";
+
+    private void BindHostOnlyClientTargets()
+    {
+        // A one-second all-MonoBehaviour scan only covers native SA families
+        // without a common safe damage ABI; replace with direct adapters when one is proven.
+        foreach (var boss in UnityEngine.Object.FindObjectsByType<MonoBehaviour>(
+                     FindObjectsInactive.Exclude, FindObjectsSortMode.None))
+        {
+            if (boss == null || !boss.gameObject.scene.IsValid() ||
+                !IsKnownHostOnlyFamily(boss.GetType().Name) ||
+                _hostOnlyClientTargets.ContainsKey(boss.GetInstanceID()))
+                continue;
+            var target = new HostOnlyTarget { Boss = boss };
+            SuppressClientSimulation(boss, target.Behaviours, target.Colliders);
+            _hostOnlyClientTargets.Add(boss.GetInstanceID(), target);
+            if (_reportedHostOnlyFamilies.Add(boss.GetInstanceID()))
+                _log.LogWarning(
+                    $"Network boss is host-only until its native damage ABI is proven: " +
+                    boss.GetType().Name);
+        }
+    }
+
+    private static void SuppressClientSimulation(ClientTarget target) =>
+        SuppressClientSimulation(target.Boss, target.Behaviours, target.Colliders);
+
+    private static void SuppressClientSimulation(
+        BossControllerBase boss,
+        List<BehaviourState> behaviours,
+        List<Collider2DState> colliders) =>
+        SuppressClientSimulation((MonoBehaviour)boss, behaviours, colliders);
+
+    private static void SuppressClientSimulation(
+        MonoBehaviour boss,
+        List<BehaviourState> behaviours,
+        List<Collider2DState> colliders)
+    {
+        foreach (var behaviour in boss.GetComponentsInChildren<MonoBehaviour>(true))
+        {
+            if (behaviour == null)
+                continue;
+            behaviours.Add(new BehaviourState(behaviour, behaviour.enabled));
+            behaviour.enabled = false;
+        }
+        foreach (var collider in boss.GetComponentsInChildren<Collider2D>(true))
+        {
+            if (collider == null)
+                continue;
+            colliders.Add(new Collider2DState(collider, collider.enabled));
+            collider.enabled = false;
+        }
+    }
+
+    private void RestoreClientTarget(ClientTarget target)
+    {
+        if (target.Boss == null)
+            return;
+        var applying = _applyingClientState;
+        _applyingClientState = true;
+        try
+        {
+            RestoreSimulation(target.Behaviours, target.Colliders);
+            target.Boss.bossMaxHP = target.OriginalMaxHp;
+            target.Boss.CurrentBossHP = target.OriginalHp;
+            target.Boss.transform.position = target.OriginalPosition;
+        }
+        finally
+        {
+            _applyingClientState = applying;
+        }
+    }
+
+    private static void RestoreHostOnlyTarget(HostOnlyTarget target) =>
+        RestoreSimulation(target.Behaviours, target.Colliders);
+
+    private static void RestoreSimulation(
+        List<BehaviourState> behaviours,
+        List<Collider2DState> colliders)
+    {
+        foreach (var state in colliders)
+            if (state.Collider != null)
+                state.Collider.enabled = state.Enabled;
+        foreach (var state in behaviours)
+            if (state.Behaviour != null)
+                state.Behaviour.enabled = state.Enabled;
+    }
+
     private static void AddUniqueId<T>(
         IDictionary<uint, T> unique,
         ISet<uint> duplicates,
@@ -304,22 +448,89 @@ internal sealed class BossReplicator
         unique.Add(id, value);
     }
 
-    private void RejectUnsupportedHostDamage(
+    private bool SendClientDamage(
+        UdpSession session,
+        uint sceneId,
+        uint bossId,
+        BossControllerBase boss,
+        int damage,
+        EElement element,
+        AttackType attackType,
+        Vector3 hitPosition)
+    {
+        if (damage is < 1 or > 10_000 || !FishReplicator.IsPlayerAttack(attackType) ||
+            !Enum.IsDefined(typeof(EElement), element) ||
+            !TryFindDamageable(boss, hitPosition, out var target))
+            return false;
+        var targetId = WorldObjectId.For(target, boss.fishID);
+        if (targetId == 0)
+            return false;
+        var requestId = NextRequestId(ref _nextClientRequestId);
+        var position = target.transform.position;
+        session.SendBossDamageRequest(new BossDamageRequest(
+            sceneId, session.RemoteSceneEpoch, requestId, bossId, targetId, damage,
+            (int)element, (int)attackType, position.x, position.y, position.z));
+        return true;
+    }
+
+    private bool TryFindClientBossId(BossControllerBase boss, out uint id)
+    {
+        foreach (var pair in _clientTargets)
+            if (pair.Value.Boss == boss)
+            {
+                id = pair.Key;
+                return true;
+            }
+        id = 0;
+        return false;
+    }
+
+    private void ApplyHostDamage(
         UdpSession session,
         uint sceneId,
         BossDamageRequest request)
     {
         if (request.SceneId != sceneId || request.SceneEpoch != session.LocalSceneEpoch ||
             !_hostBosses.TryGetValue(request.BossId, out var boss) ||
-            boss == null || !FishReplicator.IsPlayerAttack((AttackType)request.AttackType))
+            boss == null || !FishReplicator.IsPlayerAttack((AttackType)request.AttackType) ||
+            !Enum.IsDefined(typeof(EElement), request.Element) ||
+            !session.TryGetFreshRemotePlayerSnapshot(
+                Time.realtimeSinceStartup, 0.75f, out var remote) ||
+            remote.SceneId != sceneId || remote.SceneEpoch != session.RemoteSceneEpoch ||
+            _appliedRemoteRequests.Contains(request.RequestId) ||
+            !TryFindDamageable(boss, request.TargetId, out var target))
             return;
-        if (_unsupportedClientDamage.Add(request.BossId))
-            _log.LogWarning(
-                $"Network boss damage rejected until a native family adapter exists: " +
-                $"{boss.GetType().Name}; id={request.BossId:X8}");
+        var targetPosition = target.transform.position;
+        if (!InRange(targetPosition, remote, 2_500f) ||
+            (targetPosition - new Vector3(request.HitX, request.HitY, request.HitZ)).sqrMagnitude > 9f)
+            return;
+        try
+        {
+            _appliedRemoteRequests.Add(request.RequestId);
+            var attackType = (AttackType)request.AttackType;
+            if (attackType == AttackType.Player_Harpoon && HasNativeHarpoonPath(boss))
+                boss.OnHitHarpoon(targetPosition, request.Damage, null);
+            else
+            {
+                var attack = new AttackData
+                {
+                    damage = request.Damage,
+                    attackType = attackType,
+                    element = (EElement)request.Element,
+                    attackID = unchecked((int)request.RequestId)
+                };
+                attack.SetHitPos(targetPosition);
+                boss.OnTakeDamage(attack, new DefenseData(null, target));
+            }
+            SendHostStates(session, sceneId, Time.realtimeSinceStartup, true);
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning($"Network boss native hit rejected: {boss.GetType().Name}; {exception.Message}");
+        }
     }
 
-    private void SendHostStates(UdpSession session, uint sceneId, float now)
+    private void SendHostStates(UdpSession session, uint sceneId, float now, bool force = false)
     {
         _tick = _tick == uint.MaxValue ? 1 : _tick + 1;
         foreach (var pair in _hostBosses)
@@ -346,10 +557,11 @@ internal sealed class BossReplicator
                 Math.Max(0, boss.fishID), hp, maxHp,
                 position.x, position.y, position.z,
                 animationHash, animationTime,
+                PhaseFor(boss),
                 hp == 0 || boss.IsDeadBoss() ? (byte)1 : (byte)0);
             _lastHostStates.TryGetValue(pair.Key, out var previous);
             _lastHostKeyframes.TryGetValue(pair.Key, out var lastKeyframe);
-            if (Same(previous, state) && now - lastKeyframe < 1f)
+            if (!force && Same(previous, state) && now - lastKeyframe < 1f)
                 continue;
             _lastHostStates[pair.Key] = state;
             _lastHostKeyframes[pair.Key] = now;
@@ -393,6 +605,7 @@ internal sealed class BossReplicator
         left.SceneId == right.SceneId && left.SceneEpoch == right.SceneEpoch &&
         left.BossId == right.BossId && left.FishId == right.FishId &&
         left.CurrentHp == right.CurrentHp && left.MaxHp == right.MaxHp && left.Flags == right.Flags &&
+        left.Phase == right.Phase &&
         left.AnimationHash == right.AnimationHash &&
         MathF.Abs(left.X - right.X) < 0.02f && MathF.Abs(left.Y - right.Y) < 0.02f &&
         MathF.Abs(left.Z - right.Z) < 0.02f;
@@ -416,6 +629,63 @@ internal sealed class BossReplicator
 
     private static bool IsNewer(uint value, uint previous) =>
         unchecked((int)(value - previous)) > 0;
+
+    private static uint NextRequestId(ref uint value) =>
+        value = value == uint.MaxValue ? 1 : value + 1;
+
+    private static bool HasNativeHarpoonPath(BossControllerBase boss) =>
+        boss is BossGiantSquidController or BossWolffishController;
+
+    private static int PhaseFor(BossControllerBase boss) => boss switch
+    {
+        BossGiantSquidController squid => Math.Max(0, (int)squid.currentBossState),
+        BossWolffishController wolffish => Math.Max(0, (int)wolffish.currentBossState),
+        _ => 0
+    };
+
+    private static bool TryFindDamageable(
+        BossControllerBase boss,
+        Vector3 hitPosition,
+        out Damageable target)
+    {
+        target = null;
+        if (boss is BossGiantSquidController squid && squid.bossEyeDamageable != null)
+        {
+            target = squid.bossEyeDamageable;
+            return true;
+        }
+        var bestDistance = float.PositiveInfinity;
+        foreach (var candidate in boss.GetComponentsInChildren<Damageable>(true))
+        {
+            if (candidate == null)
+                continue;
+            var distance = (candidate.transform.position - hitPosition).sqrMagnitude;
+            if (distance >= bestDistance)
+                continue;
+            target = candidate;
+            bestDistance = distance;
+        }
+        return target != null;
+    }
+
+    private static bool TryFindDamageable(BossControllerBase boss, uint targetId, out Damageable target)
+    {
+        target = null;
+        foreach (var candidate in boss.GetComponentsInChildren<Damageable>(true))
+            if (candidate != null && WorldObjectId.For(candidate, boss.fishID) == targetId)
+            {
+                target = candidate;
+                return true;
+            }
+        return false;
+    }
+
+    private static bool InRange(Vector3 position, PlayerSnapshot player, float maxSquaredDistance)
+    {
+        var dx = position.x - player.X;
+        var dy = position.y - player.Y;
+        return dx * dx + dy * dy <= maxSquaredDistance;
+    }
 }
 
 [HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.CurrentBossHP), MethodType.Setter)]
@@ -423,4 +693,35 @@ internal static class BossHpAuthorityPatch
 {
     private static bool Prefix(BossControllerBase __instance, int __0) =>
         ProbeBehaviour.Instance?.AllowBossHpWrite(__instance, __0) ?? true;
+}
+
+[HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.OnTakeDamage))]
+internal static class BossDamageAuthorityPatch
+{
+    private static bool Prefix(BossControllerBase __instance, AttackData __0, ref bool __result)
+    {
+        if (ProbeBehaviour.Instance?.ObserveBossDamage(__instance, __0) ?? true)
+            return true;
+        __result = false;
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.OnHitHarpoon))]
+internal static class BossHarpoonAuthorityPatch
+{
+    private static bool Prefix(BossControllerBase __instance, Vector3 __0, int __1) =>
+        ProbeBehaviour.Instance?.ObserveBossHarpoon(__instance, __0, __1) ?? true;
+}
+
+[HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.OnReflectProjectile))]
+internal static class BossReflectAuthorityPatch
+{
+    private static bool Prefix(BossControllerBase __instance, ref Vector2 __result)
+    {
+        if (ProbeBehaviour.Instance?.AllowBossMutation(__instance) ?? true)
+            return true;
+        __result = Vector2.zero;
+        return false;
+    }
 }

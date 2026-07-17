@@ -189,6 +189,8 @@ internal sealed class RemoteDiverHitbox : IDisposable
     {
         if (!_armed || _disposed || _onDamage == null || attackData == null || defenseData == null)
             return false;
+        if (FishReplicator.IsPlayerAttack(attackData.attackType))
+            return false;
         try
         {
             return _onDamage(attackData, defenseData);

@@ -59,6 +59,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private DiveCoordinator _diveCoordinator;
     private TravelCoordinator _travelCoordinator;
     private ProjectileVisualReplicator _projectileVisualReplicator;
+    private DiverVitalReplicator _diverVitalReplicator;
     private DiverWeaponReplicator _diverWeaponReplicator;
     private RemoteCatchLedger _remoteCatchLedger;
     private SessionTrace _sessionTrace;
@@ -140,6 +141,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _diveCoordinator = new DiveCoordinator(Logger);
         _travelCoordinator = new TravelCoordinator(Logger);
         _projectileVisualReplicator = new ProjectileVisualReplicator();
+        _diverVitalReplicator = new DiverVitalReplicator();
         _diverWeaponReplicator = new DiverWeaponReplicator();
         _lobbyAddress = Address;
         _lobbyPort = Port.ToString();
@@ -218,6 +220,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diveCoordinator?.Reset();
             _travelCoordinator?.Reset();
             _projectileVisualReplicator?.Clear();
+            _diverVitalReplicator?.Clear();
             _diverWeaponReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
             BeginRecovery("scene changed");
@@ -300,6 +303,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _diverWeaponReplicator?.Update(
             Role, _session, _sceneId, _player, _remoteAvatar,
             Role == SessionRole.Host && (_diveCoordinator?.ClientDead ?? false));
+        if (Role == SessionRole.Client)
+            _diverVitalReplicator?.ApplyClientResults(_session, _sceneId, _player);
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
         if (!UnsafeWorldReplicationBlocked)
         {
@@ -331,7 +336,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         {
             var renderer = _playerRenderer ?? _lobbyRenderer ?? _sushiRenderer;
             if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
-                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene());
+                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene(),
+                    HandleRemoteDiverDamage, Role == SessionRole.Host && IsDiveScene());
             else
                 _remoteAvatar.Clear();
         }
@@ -342,7 +348,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 _remoteAvatar.ApplyVisual(visualState, _session.RemoteName);
         }
         while (_session != null && _session.TryTakeDiverRuntimeState(out var runtimeState))
-            if (runtimeState.Owner == DiverOwner.Host)
+            if (Role == SessionRole.Host && runtimeState.Owner == DiverOwner.Client)
+            {
+                _diverVitalReplicator?.ObserveHostRuntime(_session, runtimeState, _remoteAvatar);
+                _remoteAvatar.ArmProxy();
+            }
+            else if (Role == SessionRole.Client && runtimeState.Owner == DiverOwner.Host)
                 _remoteAvatar.ApplyRuntime(runtimeState);
         _remoteAvatar.Update(Time.unscaledDeltaTime);
 
@@ -399,12 +410,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _nextVisual = Time.realtimeSinceStartup + 0.1f;
         }
 
-        if (Role == SessionRole.Host && _session != null && _player != null &&
+        if (Role is SessionRole.Host or SessionRole.Client && _session != null && _player != null &&
             _session.SceneMatches(_sceneId) && Time.realtimeSinceStartup >= _nextRuntimeState)
         {
             _runtimeRevision = _runtimeRevision == uint.MaxValue ? 1 : _runtimeRevision + 1;
             if (RemoteAvatar.TryCaptureRuntimeState(
-                    _sceneId, _session.LocalSceneEpoch, _runtimeRevision, _player,
+                    _sceneId, _session.LocalSceneEpoch, _runtimeRevision,
+                    Role == SessionRole.Host ? DiverOwner.Host : DiverOwner.Client, _player,
                     out var runtimeState))
                 _session.SendDiverRuntimeState(runtimeState);
             _nextRuntimeState = Time.realtimeSinceStartup + 0.2f;
@@ -532,6 +544,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
+        _diverVitalReplicator?.Clear();
         _diverWeaponReplicator?.Clear();
         FishSpawnSeedCoordinator.Clear();
         _remoteCatchLedger?.Clear("plugin stopped");
@@ -974,6 +987,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
+        _diverVitalReplicator?.Clear();
         _diverWeaponReplicator?.Clear();
         FishSpawnSeedCoordinator.Clear();
     }
@@ -1395,6 +1409,19 @@ public sealed class ProbeBehaviour : MonoBehaviour
             ? false
             : _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
 
+    internal bool AllowBossMutation(BossControllerBase boss) =>
+        !UnsafeWorldReplicationBlocked &&
+        (_bossReplicator?.AllowClientBossMutation(Role, _session, boss) ?? true);
+
+    internal bool ObserveBossDamage(BossControllerBase boss, AttackData attack) =>
+        !UnsafeWorldReplicationBlocked &&
+        (_bossReplicator?.ObserveClientDamage(Role, _session, _sceneId, boss, attack) ?? true);
+
+    internal bool ObserveBossHarpoon(BossControllerBase boss, Vector3 hitPosition, int damage) =>
+        !UnsafeWorldReplicationBlocked &&
+        (_bossReplicator?.ObserveClientHarpoon(
+            Role, _session, _sceneId, boss, hitPosition, damage) ?? true);
+
     internal bool TryCaptureRemoteLoot(
         int itemId,
         int count,
@@ -1736,8 +1763,36 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void ReportDiveLife(bool dead)
     {
-        if (IsSharedActionScene())
+        if (IsSharedActionScene() && !(_diverVitalReplicator?.ApplyingClientResult ?? false))
             _diveCoordinator?.ReportLocalLife(Role, _session, dead);
+    }
+
+    private bool HandleRemoteDiverDamage(AttackData attack, DefenseData _) =>
+        Role == SessionRole.Host && IsDiveScene() &&
+        (_diverVitalReplicator?.TryApplyHostDamage(_session, attack, _remoteAvatar) ?? false);
+
+    internal bool AllowDiverGunFire(GunWeaponHandler gun)
+    {
+        if (!IsSharedActionScene() || !DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true) || gun?.CurrentMetaGunSlot == null)
+            return true;
+        _sessionTrace?.Write("DIVER-POLICY", "reject=meta-gun client-only");
+        return false;
+    }
+
+    internal bool AllowDiverDeviceUse(PlayerCharacter player) =>
+        AllowDiverClientOnlyMutation(player == _player, "sub-helper");
+
+    internal bool AllowDiverBuff(BuffHandler handler) =>
+        AllowDiverClientOnlyMutation(handler != null && handler == _player?.m_PlayerBuffHandler, "buff");
+
+    private bool AllowDiverClientOnlyMutation(bool localOwner, string kind)
+    {
+        if (!localOwner || !IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true))
+            return true;
+        _sessionTrace?.Write("DIVER-POLICY", $"reject={kind} client-only");
+        return false;
     }
 
     internal bool RequestDiveDeathReturn()

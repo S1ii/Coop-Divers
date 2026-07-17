@@ -56,6 +56,8 @@ internal sealed class DiverRuntimeAuthority
     internal bool IsInitializedFor(uint sceneId, uint sceneEpoch) =>
         _initialized && _sceneId == sceneId && _sceneEpoch == sceneEpoch;
 
+    internal bool IsInitialized => _initialized;
+
     internal void Initialize(
         uint sceneId,
         uint sceneEpoch,

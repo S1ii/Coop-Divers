@@ -190,6 +190,7 @@ internal sealed class RemoteAvatar : IDisposable
         uint sceneId,
         uint sceneEpoch,
         uint revision,
+        DiverOwner owner,
         PlayerCharacter player,
         out DiverRuntimeState state)
     {
@@ -250,7 +251,7 @@ internal sealed class RemoteAvatar : IDisposable
             }
 
             state = new DiverRuntimeState(
-                sceneId, sceneEpoch, revision, DiverOwner.Host, player.IsDead(), fields, flags,
+                sceneId, sceneEpoch, revision, owner, player.IsDead(), fields, flags,
                 0f, 0f, oxygen, maxOxygen, cargoWeight, weaponId, ammo, maxAmmo);
             return true;
         }
