@@ -1460,6 +1460,8 @@ internal sealed class UdpSession : IDisposable
         _lastDiverVitalCommitRevision);
     internal PacketReceiveDiagnostics[] PacketReceiveDiagnostics =>
         SnapshotPacketReceiveDiagnostics();
+    internal int PendingReliableCount => _pendingReliable.Count;
+    internal int ReliableBacklogCount => _reliableBacklog.Count + _reliableBulkBacklog.Count;
     internal int ReliableCapacityRemaining => ReliableBacklogCount == 0
         ? Math.Max(0, 256 - _pendingReliable.Count)
         : 0;
@@ -3738,8 +3740,6 @@ internal sealed class UdpSession : IDisposable
                 TrackReliable(queued.Packet, sequence);
         }
     }
-
-    private int ReliableBacklogCount => _reliableBacklog.Count + _reliableBulkBacklog.Count;
 
     private bool TryTakeReliableBacklog(out QueuedReliable queued)
     {

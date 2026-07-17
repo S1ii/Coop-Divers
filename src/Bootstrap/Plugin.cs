@@ -22,6 +22,7 @@ public sealed class Plugin : BasePlugin
     {
         Protocol.SelfTest();
         UdpSession.SelfTest();
+        ProbeBehaviour.SelfTest();
         LobbyInput.SelfTest();
         TitleOnlineMenu.SelfTest();
         MultiplayerSaveSync.SelfTest();

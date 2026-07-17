@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -84,6 +85,25 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     public ProbeBehaviour(IntPtr pointer) : base(pointer)
     {
+    }
+
+    internal static void SelfTest()
+    {
+        if (!ShouldEmitSessionDesyncDump(
+                SessionRole.Host, true, true, 7, 11, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Client, true, true, 7, 11, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Host, false, true, 7, 11, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Host, true, false, 7, 11, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Host, true, true, 0, 11, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Host, true, true, 7, 0, 13) ||
+            ShouldEmitSessionDesyncDump(
+                SessionRole.Host, true, true, 7, 11, 0))
+            throw new InvalidOperationException("Session desync dump gate self-test failed");
     }
 
     private void Start()
@@ -288,6 +308,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _missionProgressReplicator?.ForceHostKeyframe();
             _managerEventReplicator?.ForceHostKeyframe();
             _sessionTrace?.Write("AUTH-KEYFRAME", "reason=scene-or-rejoin-settled missions=1 story=1 day=1");
+            WriteSessionDesyncDump(_session);
         }
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
@@ -489,6 +510,47 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private bool UnsafeWorldReplicationBlocked =>
         !_loadedGameplayScenes.AllowsWorldScopedReplication(
             Role, _session?.Connected == true);
+
+    private void WriteSessionDesyncDump(UdpSession session)
+    {
+        if (session == null || !ShouldEmitSessionDesyncDump(
+                Role, session.Connected, session.SceneMatches(_sceneId),
+                _sceneId, session.LocalSceneEpoch, session.RemoteSceneEpoch))
+            return;
+
+        var commits = session.LastDiverCommitDiagnostics;
+        var details =
+            $"scope=session connection={session.ConnectionId:X16} " +
+            $"scene={_sceneId:X8} localEpoch={session.LocalSceneEpoch} " +
+            $"remoteEpoch={session.RemoteSceneEpoch} pendingReliable={session.PendingReliableCount} " +
+            $"reliableBacklog={session.ReliableBacklogCount} " +
+            $"diver=hostRev:{commits.HostRuntimeRevision},clientRev:{commits.ClientRuntimeRevision}," +
+            $"weaponCommit:{commits.WeaponCommitRevision},vitalCommit:{commits.VitalCommitRevision} " +
+            $"packets={FormatPacketReceiveDiagnostics(session.PacketReceiveDiagnostics)} " +
+            "open=owner-map,manager-leases,entity-counts,save-commits";
+        Logger?.LogWarning($"DESYNC-DUMP {details}");
+        _sessionTrace?.Write("DESYNC-DUMP", details);
+    }
+
+    private static bool ShouldEmitSessionDesyncDump(
+        SessionRole role,
+        bool connected,
+        bool scenesMatch,
+        uint sceneId,
+        uint localEpoch,
+        uint remoteEpoch) =>
+        role == SessionRole.Host && connected && scenesMatch && sceneId != 0 &&
+        localEpoch != 0 && remoteEpoch != 0;
+
+    private static string FormatPacketReceiveDiagnostics(PacketReceiveDiagnostics[] diagnostics)
+    {
+        if (diagnostics == null || diagnostics.Length == 0)
+            return "none";
+        var entries = new List<string>(diagnostics.Length);
+        foreach (var entry in diagnostics)
+            entries.Add($"{entry.Type}:{entry.Received}/{entry.Dropped}/{entry.QueueOverflows}");
+        return string.Join(',', entries);
+    }
 
     private void OnUnitySceneLoaded(Scene scene, LoadSceneMode mode)
     {

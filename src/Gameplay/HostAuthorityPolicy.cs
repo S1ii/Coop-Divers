@@ -62,6 +62,10 @@ internal static class HostAuthorityPolicy
         if (SaveOwnerCode(SessionRole.Client, true) != "host" ||
             SaveOwnerCode(SessionRole.Host, true) != "host" ||
             SaveOwnerCode(SessionRole.Offline, false) != "local" ||
+            DescribeCurrentOwnership(SessionRole.Client, true) !=
+                "campaign=host;save=host;mission=host;reward=host;economy=host" ||
+            DescribeCurrentOwnership(SessionRole.Offline, false) !=
+                "campaign=local;save=local;mission=local;reward=local;economy=local" ||
             SaveWriteRejectReason(SessionRole.Client, true, false, false, false) != "client_not_owner" ||
             SaveWriteRejectReason(SessionRole.Client, true, false, true, false) != "original_restore_required" ||
             SaveWriteRejectReason(SessionRole.Client, true, false, false, true) != "restart_required")
@@ -95,6 +99,12 @@ internal static class HostAuthorityPolicy
             MultiplayerSaveSync.IsApplyingRemoteSnapshot,
             MultiplayerSaveSync.OriginalProfileRestoreRequired,
             MultiplayerSaveSync.NormalSaveRestartRequired);
+
+    internal static string DescribeCurrentOwnership(SessionRole role, bool connected)
+    {
+        var owner = SaveOwnerCode(role, connected);
+        return $"campaign={owner};save={owner};mission={owner};reward={owner};economy={owner}";
+    }
 
     internal static bool AllowHostOwnedSave(string method)
     {
