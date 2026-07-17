@@ -38,6 +38,8 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingPickupRequests = 256;
     private const int MaxPendingPickupResults = 256;
     private const int MaxPendingWorldFlagRequests = 256;
+    private const int MaxPendingWorldFlagStates = 256;
+    private const int MaxPendingBossStates = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
@@ -51,6 +53,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
+    private const int MaxPendingDiveResultEntries = 256;
     private const int MaxFishHookPoses = 128;
 
     private sealed class ReliableReceiveWindow
@@ -339,12 +342,15 @@ internal sealed class UdpSession : IDisposable
         TestPickupRequestQueueOverflow();
         TestPickupResultQueueOverflow();
         TestWorldFlagRequestQueueOverflow();
+        TestWorldFlagStateQueueOverflow();
+        TestBossStateQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
         TestRoomReadyQueueOverflow();
         TestRoomStateQueueOverflow();
         TestIngredientsDeltaQueueOverflow();
+        TestDiveResultEntryQueueOverflow();
         TestDiveReadyQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
@@ -659,6 +665,36 @@ internal sealed class UdpSession : IDisposable
         session.QueueWorldFlagRequest(default);
         if (session._connected || !session._worldFlagRequests.IsEmpty)
             throw new InvalidOperationException("World flag request queue overflow self-test failed");
+    }
+
+    private static void TestWorldFlagStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingWorldFlagStates; index++)
+            session._worldFlagStates.Enqueue(default);
+        session.QueueWorldFlagState(default);
+        if (session._connected || !session._worldFlagStates.IsEmpty ||
+            session._peerLostReason != "world flag state receive queue overflow")
+            throw new InvalidOperationException("World flag state queue overflow self-test failed");
+    }
+
+    private static void TestBossStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingBossStates; index++)
+            session._bossStates.Enqueue(default);
+        session.QueueBossState(default);
+        if (session._connected || !session._bossStates.IsEmpty ||
+            session._peerLostReason != "boss state receive queue overflow")
+            throw new InvalidOperationException("Boss state queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -988,6 +1024,21 @@ internal sealed class UdpSession : IDisposable
         session.QueueDiveReady(default);
         if (session._connected || !session._diveReady.IsEmpty)
             throw new InvalidOperationException("Dive ready queue overflow self-test failed");
+    }
+
+    private static void TestDiveResultEntryQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingDiveResultEntries; index++)
+            session._diveResultEntries.Enqueue(default);
+        session.QueueDiveResultEntry(default);
+        if (session._connected || !session._diveResultEntries.IsEmpty ||
+            session._peerLostReason != "dive result entry receive queue overflow")
+            throw new InvalidOperationException("Dive result entry queue overflow self-test failed");
     }
 
     private static void TestTravelReadyQueueOverflow()
@@ -2926,7 +2977,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _diveResultEntries.Enqueue(entry);
+                    QueueDiveResultEntry(entry);
             }
             return;
         }
@@ -2986,7 +3037,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _worldFlagStates.Enqueue(state);
+                    QueueWorldFlagState(state);
             }
             return;
         }
@@ -3011,7 +3062,7 @@ internal sealed class UdpSession : IDisposable
                 MatchesRemoteWorld(state.SceneId, state.SceneEpoch))
             {
                 _lastReceive = now;
-                _bossStates.Enqueue(state);
+                QueueBossState(state);
             }
             return;
         }
@@ -3648,6 +3699,26 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("world flag request receive queue overflow");
     }
 
+    private void QueueWorldFlagState(WorldFlagState state)
+    {
+        if (HasDecodedQueueCapacity(_worldFlagStates.Count, MaxPendingWorldFlagStates))
+        {
+            _worldFlagStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("world flag state receive queue overflow");
+    }
+
+    private void QueueBossState(BossState state)
+    {
+        if (HasDecodedQueueCapacity(_bossStates.Count, MaxPendingBossStates))
+        {
+            _bossStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("boss state receive queue overflow");
+    }
+
     private void QueueManagerEvent(ManagerEvent state)
     {
         if (HasDecodedQueueCapacity(_managerEvents.Count, MaxPendingManagerEvents))
@@ -3687,6 +3758,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("dive ready receive queue overflow");
+    }
+
+    private void QueueDiveResultEntry(DiveResultEntry entry)
+    {
+        if (HasDecodedQueueCapacity(_diveResultEntries.Count, MaxPendingDiveResultEntries))
+        {
+            _diveResultEntries.Enqueue(entry);
+            return;
+        }
+        FailReliableDelivery("dive result entry receive queue overflow");
     }
 
     private void QueueTravelReady(TravelReady ready)
