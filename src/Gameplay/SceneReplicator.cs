@@ -350,19 +350,21 @@ internal sealed class SceneReplicator
         Set(ref options, 6, isRetry);
         Set(ref options, 7, skipEmptySceneOptionIsUnloadAssets);
         Set(ref options, 8, firstFindSceneManagerInActiveScene);
-        var seed = FishSpawnSeedCoordinator.GetOrCreate(Protocol.SceneId(sceneName));
+        var seed = FishSpawnSeedCoordinator.GetOrCreate(
+            Protocol.SceneId(sceneName), session.NextLocalSceneEpoch);
         session.SendSceneTransition(new SceneTransitionCommand(
-            sceneName, (int)transitionType, options, seed.SceneId, seed.Seed));
+            sceneName, (int)transitionType, options, seed.SceneId, seed.SceneEpoch, seed.Seed));
     }
 
     internal void OnHostObservedScene(UdpSession session, string sceneName)
     {
         if (session == null || string.IsNullOrWhiteSpace(sceneName) || sceneName == "Empty")
             return;
-        var seed = FishSpawnSeedCoordinator.GetOrCreate(Protocol.SceneId(sceneName));
+        var seed = FishSpawnSeedCoordinator.GetOrCreate(
+            Protocol.SceneId(sceneName), session.LocalSceneEpoch);
         session.SendSceneTransition(new SceneTransitionCommand(
             sceneName, (int)SceneTransitionType.FadeOutIn, NativeDefaults,
-            seed.SceneId, seed.Seed));
+            seed.SceneId, seed.SceneEpoch, seed.Seed));
     }
 
     internal void BeginClientNativeDiveTransition(string sceneName, float now)
@@ -396,7 +398,11 @@ internal sealed class SceneReplicator
             CancelClientNativeDiveTransition();
 
         while (session.TryTakeSceneTransition(out var command))
+        {
+            FishSpawnSeedCoordinator.StageRemoteScene(
+                new SceneSeed(command.SceneId, command.SceneEpoch, command.Seed));
             _pending = command;
+        }
         if (!_pending.HasValue || SceneLoader.IsSceneLoading)
             return;
 
@@ -409,7 +415,7 @@ internal sealed class SceneReplicator
         if (ShouldWaitForSceneSeed(
                 SceneMetadataResolver.Resolve(pending.SceneName).CanDive,
                 FishSpawnSeedCoordinator.HasSeed(
-                    new SceneSeed(pending.SceneId, pending.Seed))))
+                    new SceneSeed(pending.SceneId, pending.SceneEpoch, pending.Seed))))
             return;
 
         var loader = UnityEngine.Object.FindFirstObjectByType<SceneLoader>();

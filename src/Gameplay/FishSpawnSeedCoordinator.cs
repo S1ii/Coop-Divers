@@ -9,7 +9,9 @@ namespace DaveTheDiverMP;
 
 internal static class FishSpawnSeedCoordinator
 {
-    private static readonly Dictionary<uint, int> SceneSeeds = new();
+    private static readonly Dictionary<(uint SceneId, uint SceneEpoch), int> SceneSeeds = new();
+    private static readonly Dictionary<uint, uint> StagedSceneEpochs = new();
+    private static readonly Dictionary<uint, uint> ActiveSceneEpochs = new();
 
     internal readonly struct Scope
     {
@@ -25,6 +27,7 @@ internal static class FishSpawnSeedCoordinator
 
     internal static void SelfTest()
     {
+        Clear();
         var first = CombineSeed(123, "allocator-a");
         var expected = unchecked((17 * 31 + 123) * 31 +
             (int)Protocol.SceneId("allocator-a"));
@@ -39,6 +42,23 @@ internal static class FishSpawnSeedCoordinator
             fallback == BuildFallbackAllocatorUid(
                 0x1234ABCD, "Game.FishAllocator", "/0:Root/3:Spawner"))
             throw new InvalidOperationException("Fish spawn seed mixing failed");
+
+        var previous = new SceneSeed(7, 3, 11);
+        var current = new SceneSeed(7, 4, 22);
+        StageRemoteScene(previous);
+        ActivateStagedScene(previous.SceneId);
+        if (!HasActiveSeed(previous))
+            throw new InvalidOperationException("Fish spawn seed activation failed");
+        StageRemoteScene(current);
+        if (!HasActiveSeed(previous))
+            throw new InvalidOperationException("Future fish seed activated too early");
+        ActivateStagedScene(current.SceneId);
+        if (!HasActiveSeed(current) || HasActiveSeed(previous))
+            throw new InvalidOperationException("Fish seed epoch replacement failed");
+        ActivateStagedScene(current.SceneId);
+        if (HasActiveSeed(current))
+            throw new InvalidOperationException("Stale fish seed remained active");
+        Clear();
     }
 
     internal static void Update(SessionRole role, UdpSession session)
@@ -46,40 +66,75 @@ internal static class FishSpawnSeedCoordinator
         if (role != SessionRole.Client || session == null)
             return;
         while (session.TryTakeSceneSeed(out var seed))
-            SetSeed(seed);
+            StageRemoteScene(seed);
     }
 
-    internal static SceneSeed GetOrCreate(uint sceneId)
+    internal static SceneSeed GetOrCreate(uint sceneId, uint sceneEpoch)
     {
-        if (sceneId == 0)
+        if (sceneId == 0 || sceneEpoch == 0)
             return default;
-        if (!SceneSeeds.TryGetValue(sceneId, out var seed))
+        var key = (sceneId, sceneEpoch);
+        if (!SceneSeeds.TryGetValue(key, out var seed))
         {
-            seed = unchecked((int)(sceneId ^ (uint)Environment.TickCount ^ 0x9E3779B9u));
+            seed = unchecked((int)(sceneId ^ sceneEpoch ^ (uint)Environment.TickCount ^ 0x9E3779B9u));
             if (seed == 0)
                 seed = 1;
-            SceneSeeds[sceneId] = seed;
+            SceneSeeds[key] = seed;
         }
-        return new SceneSeed(sceneId, seed);
+        return new SceneSeed(sceneId, sceneEpoch, seed);
     }
 
     internal static void SetSeed(SceneSeed seed)
     {
-        if (seed.SceneId == 0 || seed.Seed == 0)
+        if (seed.SceneId == 0 || seed.SceneEpoch == 0 || seed.Seed == 0)
             return;
-        if (!SceneSeeds.TryGetValue(seed.SceneId, out var current) || current != seed.Seed)
-            SceneSeeds[seed.SceneId] = seed.Seed;
+        var key = (seed.SceneId, seed.SceneEpoch);
+        if (!SceneSeeds.TryGetValue(key, out var current) || current != seed.Seed)
+            SceneSeeds[key] = seed.Seed;
     }
 
     internal static bool HasSeed(SceneSeed seed) =>
-        SceneSeeds.TryGetValue(seed.SceneId, out var value) && value == seed.Seed;
+        SceneSeeds.TryGetValue((seed.SceneId, seed.SceneEpoch), out var value) &&
+        value == seed.Seed;
+
+    internal static void StageRemoteScene(SceneSeed seed)
+    {
+        SetSeed(seed);
+        if (seed.SceneId == 0 || seed.SceneEpoch == 0 ||
+            StagedSceneEpochs.TryGetValue(seed.SceneId, out var current) &&
+            !IsNewer(seed.SceneEpoch, current))
+            return;
+        StagedSceneEpochs[seed.SceneId] = seed.SceneEpoch;
+    }
+
+    internal static void ActivateLocalScene(uint sceneId, uint sceneEpoch)
+    {
+        if (sceneId == 0 || sceneEpoch == 0)
+            return;
+        ActiveSceneEpochs[sceneId] = sceneEpoch;
+    }
+
+    internal static void ActivateStagedScene(uint sceneId)
+    {
+        ActiveSceneEpochs.Remove(sceneId);
+        if (StagedSceneEpochs.Remove(sceneId, out var sceneEpoch))
+            ActiveSceneEpochs[sceneId] = sceneEpoch;
+    }
+
+    internal static void Clear()
+    {
+        SceneSeeds.Clear();
+        StagedSceneEpochs.Clear();
+        ActiveSceneEpochs.Clear();
+    }
 
     internal static Scope Begin(FishAllocator allocator)
     {
         if (allocator == null)
             return default;
         var sceneId = Protocol.SceneId(allocator.gameObject.scene.name);
-        if (!SceneSeeds.TryGetValue(sceneId, out var sceneSeed))
+        if (!ActiveSceneEpochs.TryGetValue(sceneId, out var sceneEpoch) ||
+            !SceneSeeds.TryGetValue((sceneId, sceneEpoch), out var sceneSeed))
             return default;
 
         var uid = GetAllocatorUid(sceneId, allocator);
@@ -125,6 +180,13 @@ internal static class FishSpawnSeedCoordinator
             return hash == 0 ? 1 : hash;
         }
     }
+
+    private static bool HasActiveSeed(SceneSeed seed) =>
+        ActiveSceneEpochs.TryGetValue(seed.SceneId, out var sceneEpoch) &&
+        sceneEpoch == seed.SceneEpoch && HasSeed(seed);
+
+    private static bool IsNewer(uint value, uint previous) =>
+        value != previous && unchecked((int)(value - previous)) > 0;
 }
 
 [HarmonyPatch]

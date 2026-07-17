@@ -192,7 +192,8 @@ internal sealed class DiveCoordinator
                 _lastStateRevision = state.Revision;
                 _hostReady = state.HostReady;
                 _clientReady = state.ClientReady;
-                FishSpawnSeedCoordinator.SetSeed(new SceneSeed(state.SceneId, state.Seed));
+                FishSpawnSeedCoordinator.StageRemoteScene(
+                    new SceneSeed(state.SceneId, state.SceneEpoch, state.Seed));
                 _log.LogInfo($"Dive: host={_hostReady}; client={_clientReady}");
             }
             while (session.TryTakeDiverLifeState(out var life))
@@ -282,10 +283,12 @@ internal sealed class DiveCoordinator
         _stateRevision = NextRevision(_stateRevision);
         var targetScene = _startParameter?.StartSceneName;
         var seed = !string.IsNullOrWhiteSpace(targetScene)
-            ? FishSpawnSeedCoordinator.GetOrCreate(Protocol.SceneId(targetScene))
-            : new SceneSeed(1, 1);
+            ? FishSpawnSeedCoordinator.GetOrCreate(
+                Protocol.SceneId(targetScene), session.NextLocalSceneEpoch)
+            : new SceneSeed(1, session.NextLocalSceneEpoch, 1);
         session.SendDiveState(new DiveState(
-            _stateRevision, _hostReady, _clientReady, seed.SceneId, seed.Seed));
+            _stateRevision, _hostReady, _clientReady,
+            seed.SceneId, seed.SceneEpoch, seed.Seed));
     }
 
     internal bool RequestExit(

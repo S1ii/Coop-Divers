@@ -190,6 +190,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diverWeaponReplicator?.Clear();
             _session?.SetLocalScene(_sceneId);
             if (Role == SessionRole.Host)
+                FishSpawnSeedCoordinator.ActivateLocalScene(
+                    _sceneId, _session?.LocalSceneEpoch ?? 0);
+            else if (Role == SessionRole.Client)
+                FishSpawnSeedCoordinator.ActivateStagedScene(_sceneId);
+            if (Role == SessionRole.Host)
                 _sceneReplicator?.OnHostObservedScene(_session, _scene);
             LogSceneMetadata("entered");
             _hostAuthorityRefreshAt = Role == SessionRole.Host &&
@@ -458,6 +463,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
         _diverWeaponReplicator?.Clear();
+        FishSpawnSeedCoordinator.Clear();
         _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
         _sessionTrace?.Dispose();
@@ -762,6 +768,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
         _diverWeaponReplicator?.Clear();
+        FishSpawnSeedCoordinator.Clear();
     }
 
     private void SetLobbyVisible(bool visible, bool restoreCursor = true)

@@ -24,6 +24,7 @@ internal sealed class UdpSession : IDisposable
     private const float ReliableExpirySeconds = 15f;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
+    private const int MaxPendingSaveSnapshotChunks = 256;
 
     private sealed class ReliableReceiveWindow
     {
@@ -258,6 +259,9 @@ internal sealed class UdpSession : IDisposable
             ShouldExpireQueuedReliable(2f, 1f) ||
             !ShouldExpireQueuedReliable(1f, 1f + ReliableExpirySeconds))
             throw new InvalidOperationException("Reliable backlog expiry self-test failed");
+        if (!HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks - 1, MaxPendingSaveSnapshotChunks) ||
+            HasDecodedQueueCapacity(MaxPendingSaveSnapshotChunks, MaxPendingSaveSnapshotChunks))
+            throw new InvalidOperationException("Save snapshot queue cap self-test failed");
         if (!WorldMatches(true, true, 11, 11, 8, 11, 8) ||
             WorldMatches(true, true, 11, 11, 8, 11, 7) ||
             WorldMatches(true, true, 11, 12, 8, 11, 8))
@@ -270,6 +274,7 @@ internal sealed class UdpSession : IDisposable
         TestDiverWeaponOrdering();
         TestCargoEpochGate();
         TestManagerEventEpochGate();
+        TestSceneSeedEpochGate();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -496,10 +501,34 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Manager event stale queue self-test failed");
     }
 
+    private static void TestSceneSeedEpochGate()
+    {
+        var session = new UdpSession(null)
+        {
+            _connected = true,
+            _role = SessionRole.Client,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = 20,
+            _hasRemoteScene = true
+        };
+        var current = new SceneSeed(10, 20, 123);
+        var stale = current with { SceneEpoch = 19 };
+        if (!session.ShouldQueueSceneSeed(current) || session.ShouldQueueSceneSeed(stale))
+            throw new InvalidOperationException("Scene seed epoch gate self-test failed");
+        session._sceneSeeds.Enqueue(stale);
+        session._sceneSeeds.Enqueue(current);
+        if (!session.TryTakeSceneSeed(out var delivered) || delivered != current ||
+            session.TryTakeSceneSeed(out _))
+            throw new InvalidOperationException("Scene seed stale queue self-test failed");
+    }
+
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
     internal uint LocalSceneEpoch => _localSceneEpoch;
+    internal uint NextLocalSceneEpoch =>
+        _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
     internal uint RemoteSceneEpoch => _remoteSceneEpoch;
     internal ulong ConnectionId => _connected ? _sessionId : 0;
     internal int ReliableCapacityRemaining => _reliableBacklog.Count == 0
@@ -1107,11 +1136,21 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendSceneSeed(SceneSeed seed)
     {
-        if (_role == SessionRole.Host && _connected)
+        if (_role == SessionRole.Host && MatchesLocalWorld(seed.SceneId, seed.SceneEpoch))
             SendReliable(Protocol.EncodeSceneSeed(++_sequence, seed));
     }
 
-    internal bool TryTakeSceneSeed(out SceneSeed seed) => _sceneSeeds.TryDequeue(out seed);
+    internal bool TryTakeSceneSeed(out SceneSeed seed)
+    {
+        while (_sceneSeeds.TryDequeue(out seed))
+            if (ShouldQueueSceneSeed(seed))
+                return true;
+        seed = default;
+        return false;
+    }
+
+    private bool ShouldQueueSceneSeed(SceneSeed seed) =>
+        MatchesRemoteWorld(seed.SceneId, seed.SceneEpoch);
 
     internal void SendCargoState(CargoState state)
     {
@@ -1724,7 +1763,7 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeSceneSeed(received.Buffer, out _, out var seed))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) && ShouldQueueSceneSeed(seed))
                     _sceneSeeds.Enqueue(seed);
             }
             return;
@@ -1962,7 +2001,6 @@ internal sealed class UdpSession : IDisposable
                 if (AcceptReliable(sequence) && IsNewer(sequence, _lastTransitionSequence))
                 {
                     _lastTransitionSequence = sequence;
-                    _sceneSeeds.Enqueue(new SceneSeed(command.SceneId, command.Seed));
                     _sceneTransitions.Enqueue(command);
                 }
             }
@@ -2036,7 +2074,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _saveSnapshotChunks.Enqueue(chunk);
+                    QueueSaveSnapshotChunk(chunk);
             }
             return;
         }
@@ -2604,6 +2642,18 @@ internal sealed class UdpSession : IDisposable
         revision == uint.MaxValue ? 1 : revision + 1;
 
     private static bool ShouldAcceptIncoming(int queued) => queued < MaxIncomingDatagrams;
+
+    private static bool HasDecodedQueueCapacity(int queued, int capacity) => queued < capacity;
+
+    private void QueueSaveSnapshotChunk(SaveSnapshotChunk chunk)
+    {
+        if (HasDecodedQueueCapacity(_saveSnapshotChunks.Count, MaxPendingSaveSnapshotChunks))
+        {
+            _saveSnapshotChunks.Enqueue(chunk);
+            return;
+        }
+        FailReliableDelivery("save snapshot receive queue overflow");
+    }
 
     private static int DatagramsToProcess(int queued) =>
         Math.Clamp(queued, 0, MaxDatagramsPerUpdate);

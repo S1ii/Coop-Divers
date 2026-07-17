@@ -459,6 +459,7 @@ internal readonly record struct SceneTransitionCommand(
     int TransitionType,
     ushort Options,
     uint SceneId,
+    uint SceneEpoch,
     int Seed);
 
 internal readonly record struct IngredientCount(
@@ -490,8 +491,9 @@ internal readonly record struct DiveState(
     bool HostReady,
     bool ClientReady,
     uint SceneId,
+    uint SceneEpoch,
     int Seed);
-internal readonly record struct SceneSeed(uint SceneId, int Seed);
+internal readonly record struct SceneSeed(uint SceneId, uint SceneEpoch, int Seed);
 internal readonly record struct CargoState(
     uint SceneId,
     float WeightMax,
@@ -634,7 +636,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 47;
+    private const byte Version = 48;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -678,8 +680,8 @@ internal static class Protocol
     private const int IngredientCountSize = 12;
     private const int RoomPacketSize = HeaderSize + 9;
     private const int DiveReadyPacketSize = HeaderSize + 5;
-    private const int DiveStatePacketSize = HeaderSize + 14;
-    private const int SceneSeedPacketSize = HeaderSize + 8;
+    private const int DiveStatePacketSize = HeaderSize + 18;
+    private const int SceneSeedPacketSize = HeaderSize + 12;
     private const int CargoStatePacketSize = HeaderSize + 20;
     private const int NpcInteractionPacketSize = HeaderSize + 38;
     private const int BoatDecoStatePacketSize = HeaderSize + 4;
@@ -1167,12 +1169,13 @@ internal static class Protocol
 
     internal static byte[] EncodeSceneSeed(uint sequence, SceneSeed seed)
     {
-        if (seed.SceneId == 0 || seed.Seed == 0)
+        if (seed.SceneId == 0 || seed.SceneEpoch == 0 || seed.Seed == 0)
             throw new ArgumentOutOfRangeException(nameof(seed));
         var packet = new byte[SceneSeedPacketSize];
         WriteHeader(packet, PacketType.SceneSeed, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), seed.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), seed.Seed);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), seed.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), seed.Seed);
         return packet;
     }
 
@@ -1184,10 +1187,11 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.SceneSeed)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var value = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        if (sceneId == 0 || value == 0)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var value = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        if (sceneId == 0 || sceneEpoch == 0 || value == 0)
             return false;
-        seed = new SceneSeed(sceneId, value);
+        seed = new SceneSeed(sceneId, sceneEpoch, value);
         return true;
     }
 
@@ -2743,16 +2747,17 @@ internal static class Protocol
         var sceneName = command.SceneName ?? string.Empty;
         var encodedName = StrictUtf8.GetBytes(sceneName);
         if (encodedName.Length is < 1 or > 128 || (command.Options & 0x7e00) != 0 ||
-            command.SceneId != SceneId(sceneName) || command.Seed == 0)
+            command.SceneId != SceneId(sceneName) || command.SceneEpoch == 0 || command.Seed == 0)
             throw new ArgumentOutOfRangeException(nameof(command));
-        var packet = new byte[HeaderSize + 15 + encodedName.Length];
+        var packet = new byte[HeaderSize + 19 + encodedName.Length];
         WriteHeader(packet, PacketType.SceneTransition, sequence);
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), command.TransitionType);
         BinaryPrimitives.WriteUInt16LittleEndian(packet.AsSpan(HeaderSize + 4), command.Options);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 6), command.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), command.Seed);
-        packet[HeaderSize + 14] = (byte)encodedName.Length;
-        encodedName.CopyTo(packet, HeaderSize + 15);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 10), command.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), command.Seed);
+        packet[HeaderSize + 18] = (byte)encodedName.Length;
+        encodedName.CopyTo(packet, HeaderSize + 19);
         return packet;
     }
 
@@ -2764,24 +2769,27 @@ internal static class Protocol
         sequence = 0;
         command = default;
         if (!TryDecode(packet, out var type, out sequence) || type != PacketType.SceneTransition ||
-            packet.Length < HeaderSize + 16 || packet[HeaderSize + 14] is < 1 or > 128 ||
-            packet.Length != HeaderSize + 15 + packet[HeaderSize + 14])
+            packet.Length < HeaderSize + 20 || packet[HeaderSize + 18] is < 1 or > 128 ||
+            packet.Length != HeaderSize + 19 + packet[HeaderSize + 18])
             return false;
         var options = BinaryPrimitives.ReadUInt16LittleEndian(packet.Slice(HeaderSize + 4));
         if ((options & 0x7e00) != 0)
             return false;
         try
         {
-            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 15));
+            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 19));
             var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 6));
-            var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10));
-            if (string.IsNullOrWhiteSpace(sceneName) || sceneId != SceneId(sceneName) || seed == 0)
+            var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 10));
+            var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14));
+            if (string.IsNullOrWhiteSpace(sceneName) || sceneId != SceneId(sceneName) ||
+                sceneEpoch == 0 || seed == 0)
                 return false;
             command = new SceneTransitionCommand(
                 sceneName,
                 BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize)),
                 options,
                 sceneId,
+                sceneEpoch,
                 seed);
             return true;
         }
@@ -2950,7 +2958,7 @@ internal static class Protocol
 
     internal static byte[] EncodeDiveState(uint sequence, DiveState state)
     {
-        if (state.Revision == 0 || state.SceneId == 0 || state.Seed == 0)
+        if (state.Revision == 0 || state.SceneId == 0 || state.SceneEpoch == 0 || state.Seed == 0)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[DiveStatePacketSize];
         WriteHeader(packet, PacketType.DiveState, sequence);
@@ -2958,7 +2966,8 @@ internal static class Protocol
         packet[HeaderSize + 4] = state.HostReady ? (byte)1 : (byte)0;
         packet[HeaderSize + 5] = state.ClientReady ? (byte)1 : (byte)0;
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 6), state.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 10), state.Seed);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 10), state.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 14), state.Seed);
         return packet;
     }
 
@@ -2972,12 +2981,13 @@ internal static class Protocol
             return false;
         var revision = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 6));
-        var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 10));
-        if (revision == 0 || sceneId == 0 || seed == 0)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 10));
+        var seed = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 14));
+        if (revision == 0 || sceneId == 0 || sceneEpoch == 0 || seed == 0)
             return false;
         state = new DiveState(
             revision, packet[HeaderSize + 4] == 1, packet[HeaderSize + 5] == 1,
-            sceneId, seed);
+            sceneId, sceneEpoch, seed);
         return true;
     }
 
@@ -3966,12 +3976,17 @@ internal static class Protocol
         if (!TryDecodeSceneState(scenePacket, out sequence, out var sceneId, out var sceneEpoch) ||
             sequence != 44 || sceneId != SceneId("A02_01_01") || sceneEpoch != 3)
             throw new InvalidOperationException("Scene state round-trip failed");
-        var sceneSeed = new SceneSeed(SceneId("A02_01_01"), 1234567);
+        var sceneSeed = new SceneSeed(SceneId("A02_01_01"), 7, 1234567);
         var sceneSeedPacket = EncodeSceneSeed(45, sceneSeed);
         if (!TryDecodeSceneSeed(sceneSeedPacket, out sequence, out var actualSceneSeed) ||
             sequence != 45 || actualSceneSeed != sceneSeed)
             throw new InvalidOperationException("Scene seed round-trip failed");
-        BinaryPrimitives.WriteInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeSceneSeed(sceneSeedPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted a scene seed without an epoch");
+        BinaryPrimitives.WriteUInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 4),
+            sceneSeed.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 8), 0);
         if (TryDecodeSceneSeed(sceneSeedPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted a zero scene seed");
         var cargoState = new CargoState(SceneId("A02_01_01"), 9f, 13f, 0f, 7);
@@ -4671,11 +4686,14 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted pickup without scene epoch");
 
         var expectedTransition = new SceneTransitionCommand(
-            "A02_02_01", 3, 0x8155, SceneId("A02_02_01"), 4567);
+            "A02_02_01", 3, 0x8155, SceneId("A02_02_01"), 8, 4567);
         var transitionPacket = EncodeSceneTransition(51, expectedTransition);
         if (!TryDecodeSceneTransition(transitionPacket, out sequence, out var actualTransition) ||
             sequence != 51 || actualTransition != expectedTransition)
             throw new InvalidOperationException("Scene transition round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(transitionPacket.AsSpan(HeaderSize + 10), 0);
+        if (TryDecodeSceneTransition(transitionPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted a scene transition without an epoch");
 
         var syncRequest = new IngredientsSyncRequest(0x0102030405060708UL);
         var syncPacket = EncodeIngredientsSyncRequest(52, syncRequest);
@@ -4733,14 +4751,18 @@ internal static class Protocol
             throw new InvalidOperationException("Protocol accepted invalid dive ready state");
 
         var diveStatePacket = EncodeDiveState(
-            62, new DiveState(5, true, false, SceneId("A02_01_01"), 3456));
+            62, new DiveState(5, true, false, SceneId("A02_01_01"), 9, 3456));
         if (!TryDecodeDiveState(diveStatePacket, out sequence, out var diveState) ||
             sequence != 62 || diveState != new DiveState(
-                5, true, false, SceneId("A02_01_01"), 3456))
+                5, true, false, SceneId("A02_01_01"), 9, 3456))
             throw new InvalidOperationException("Dive state round-trip failed");
         diveStatePacket[HeaderSize + 5] = 2;
         if (TryDecodeDiveState(diveStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid dive state");
+        diveStatePacket[HeaderSize + 5] = 0;
+        BinaryPrimitives.WriteUInt32LittleEndian(diveStatePacket.AsSpan(HeaderSize + 10), 0);
+        if (TryDecodeDiveState(diveStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted a dive state without a scene epoch");
 
         var boatDecoPacket = EncodeBoatDecoState(63, new BoatDecoState(0));
         if (!TryDecodeBoatDecoState(boatDecoPacket, out sequence, out var boatDeco) ||
