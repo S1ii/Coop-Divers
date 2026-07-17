@@ -37,6 +37,7 @@ public sealed class Plugin : BasePlugin
         HostAuthorityPolicy.SelfTest();
         MissionProgressReplicator.SelfTest();
         WorldStateReplicator.SelfTest();
+        BossReplicator.SelfTest();
         PickupReplicator.SelfTest();
         RemoteCatchLedger.SelfTest();
         RemoteAvatar.SelfTest();

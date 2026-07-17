@@ -279,6 +279,12 @@ internal sealed class ManagerEventReplicator
         if (!HasManagerEventCapacity(MaxPendingManagerEvents - 1) ||
             HasManagerEventCapacity(MaxPendingManagerEvents))
             throw new InvalidOperationException("Manager event queue capacity self-test failed");
+        if (!ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 2f, 2f) ||
+            ShouldForceSceneEntryKeyframe(SessionRole.Client, true, 2f, 2f) ||
+            ShouldForceSceneEntryKeyframe(SessionRole.Host, false, 2f, 3f) ||
+            ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 0f, 3f) ||
+            ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 3f, 2f))
+            throw new InvalidOperationException("Manager scene keyframe gate self-test failed");
 
         var outboundOverflow = new ManagerEventReplicator(null);
         var outboundSession = new UdpSession(null);
@@ -1487,6 +1493,13 @@ internal sealed class ManagerEventReplicator
         _nextProgressionScan = 0f;
         _activeSessionSnapshotPublished = false;
     }
+
+    internal static bool ShouldForceSceneEntryKeyframe(
+        SessionRole role,
+        bool scenesMatch,
+        float requestedAt,
+        float now) =>
+        role == SessionRole.Host && scenesMatch && requestedAt > 0f && now >= requestedAt;
 
     internal void OnSceneChanged()
     {

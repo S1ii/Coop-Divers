@@ -29,6 +29,7 @@ internal sealed class BossReplicator
     private readonly Dictionary<uint, float> _lastHostKeyframes = new();
     private readonly Dictionary<uint, BossState> _pendingClientStates = new();
     private readonly HashSet<uint> _unsupportedClientDamage = new();
+    private readonly HashSet<uint> _reportedAmbiguousIds = new();
     private float _nextScan;
     private float _nextSend;
     private uint _tick;
@@ -38,6 +39,22 @@ internal sealed class BossReplicator
     private SessionRole _activeRole;
 
     internal BossReplicator(ManualLogSource log) => _log = log;
+
+    internal static void SelfTest()
+    {
+        var unique = new Dictionary<uint, object>();
+        var duplicates = new HashSet<uint>();
+        var first = new object();
+        var second = new object();
+        AddUniqueId(unique, duplicates, 7, first);
+        AddUniqueId(unique, duplicates, 8, second);
+        AddUniqueId(unique, duplicates, 7, new object());
+        AddUniqueId(unique, duplicates, 7, new object());
+        AddUniqueId(unique, duplicates, 0, new object());
+        if (unique.Count != 1 || !unique.TryGetValue(8, out var owner) ||
+            !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { 7u }))
+            throw new InvalidOperationException("Boss unique-ID policy failed");
+    }
 
     internal void Update(
         SessionRole role,
@@ -149,6 +166,7 @@ internal sealed class BossReplicator
         _lastHostKeyframes.Clear();
         _pendingClientStates.Clear();
         _unsupportedClientDamage.Clear();
+        _reportedAmbiguousIds.Clear();
         _nextScan = 0f;
         _nextSend = 0f;
         _tick = 0;
@@ -159,24 +177,48 @@ internal sealed class BossReplicator
 
     private void ScanHost(uint sceneId)
     {
-        _hostBosses.Clear();
+        var unique = new Dictionary<uint, BossControllerBase>();
+        var duplicates = new HashSet<uint>();
         foreach (var boss in UnityEngine.Object.FindObjectsByType<BossControllerBase>(
                      FindObjectsInactive.Exclude, FindObjectsSortMode.None))
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            _hostBosses[WorldObjectId.For(boss, boss.fishID)] = boss;
+            AddUniqueId(unique, duplicates, WorldObjectId.For(boss, boss.fishID), boss);
         }
+        foreach (var id in duplicates)
+        {
+            _lastHostStates.Remove(id);
+            _lastHostKeyframes.Remove(id);
+            _unsupportedClientDamage.Remove(id);
+            ReportAmbiguousId(id);
+        }
+        _hostBosses.Clear();
+        foreach (var pair in unique)
+            _hostBosses.Add(pair.Key, pair.Value);
     }
 
     private void BindClientTargets(uint sceneId)
     {
+        var unique = new Dictionary<uint, BossControllerBase>();
+        var duplicates = new HashSet<uint>();
         foreach (var boss in UnityEngine.Object.FindObjectsByType<BossControllerBase>(
                      FindObjectsInactive.Exclude, FindObjectsSortMode.None))
         {
             if (boss == null || !boss.gameObject.scene.IsValid())
                 continue;
-            var id = WorldObjectId.For(boss, boss.fishID);
+            AddUniqueId(unique, duplicates, WorldObjectId.For(boss, boss.fishID), boss);
+        }
+        foreach (var id in duplicates)
+        {
+            RemoveClientTarget(id);
+            _pendingClientStates.Remove(id);
+            ReportAmbiguousId(id);
+        }
+        foreach (var pair in unique)
+        {
+            var id = pair.Key;
+            var boss = pair.Value;
             if (_clientTargets.ContainsKey(id))
                 continue;
             _clientTargets[id] = new ClientTarget
@@ -193,6 +235,48 @@ internal sealed class BossReplicator
             boss.enabled = false;
             _log.LogInfo($"Network boss bound: {boss.GetType().Name}; id={id:X8}");
         }
+    }
+
+    private void RemoveClientTarget(uint id)
+    {
+        if (!_clientTargets.Remove(id, out var target) || target.Boss == null)
+            return;
+        var applying = _applyingClientState;
+        _applyingClientState = true;
+        try
+        {
+            target.Boss.enabled = target.WasEnabled;
+            target.Boss.bossMaxHP = target.OriginalMaxHp;
+            target.Boss.CurrentBossHP = target.OriginalHp;
+            target.Boss.transform.position = target.OriginalPosition;
+        }
+        finally
+        {
+            _applyingClientState = applying;
+        }
+    }
+
+    private void ReportAmbiguousId(uint id)
+    {
+        if (_reportedAmbiguousIds.Add(id))
+            _log.LogWarning($"Network boss replication disabled for duplicate world ID: {id:X8}");
+    }
+
+    private static void AddUniqueId<T>(
+        IDictionary<uint, T> unique,
+        ISet<uint> duplicates,
+        uint id,
+        T value)
+    {
+        if (id == 0 || duplicates.Contains(id))
+            return;
+        if (unique.ContainsKey(id))
+        {
+            unique.Remove(id);
+            duplicates.Add(id);
+            return;
+        }
+        unique.Add(id, value);
     }
 
     private void RejectUnsupportedHostDamage(

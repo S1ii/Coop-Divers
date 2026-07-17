@@ -59,6 +59,13 @@ internal static class HostAuthorityPolicy
             AllowsSaveWrite(SessionRole.Offline, false, false, false, true) ||
             !AllowsSaveWrite(SessionRole.Offline, false, true, false, true))
             throw new InvalidOperationException("Host-owned save policy failed");
+        if (SaveOwnerCode(SessionRole.Client, true) != "host" ||
+            SaveOwnerCode(SessionRole.Host, true) != "host" ||
+            SaveOwnerCode(SessionRole.Offline, false) != "local" ||
+            SaveWriteRejectReason(SessionRole.Client, true, false, false, false) != "client_not_owner" ||
+            SaveWriteRejectReason(SessionRole.Client, true, false, true, false) != "original_restore_required" ||
+            SaveWriteRejectReason(SessionRole.Client, true, false, false, true) != "restart_required")
+            throw new InvalidOperationException("Host-owned save diagnostic codes failed");
     }
 
     internal static bool CanMutatePersistentProgress
@@ -89,6 +96,22 @@ internal static class HostAuthorityPolicy
             MultiplayerSaveSync.OriginalProfileRestoreRequired,
             MultiplayerSaveSync.NormalSaveRestartRequired);
 
+    internal static bool AllowHostOwnedSave(string method)
+    {
+        var probe = ProbeBehaviour.Instance;
+        var role = ProbeBehaviour.Role;
+        var connected = probe?._session?.Connected == true;
+        var remoteSnapshot = MultiplayerSaveSync.IsApplyingRemoteSnapshot;
+        var restoreRequired = MultiplayerSaveSync.OriginalProfileRestoreRequired;
+        var restartRequired = MultiplayerSaveSync.NormalSaveRestartRequired;
+        if (AllowsSaveWrite(role, connected, remoteSnapshot, restoreRequired, restartRequired))
+            return true;
+        probe?.TraceAuthorityRejected(
+            "save", method, SaveOwnerCode(role, connected),
+            SaveWriteRejectReason(role, connected, remoteSnapshot, restoreRequired, restartRequired));
+        return false;
+    }
+
     private static bool AllowsPersistentMutation(
         SessionRole role,
         bool connected,
@@ -107,6 +130,25 @@ internal static class HostAuthorityPolicy
         bool restartRequired = false) =>
         remoteSnapshot || !restoreRequired && !restartRequired &&
             (role != SessionRole.Client || !connected);
+
+    private static string SaveOwnerCode(SessionRole role, bool connected) =>
+        role == SessionRole.Offline ? "local" : connected ? "host" : "local";
+
+    private static string SaveWriteRejectReason(
+        SessionRole role,
+        bool connected,
+        bool remoteSnapshot,
+        bool restoreRequired,
+        bool restartRequired)
+    {
+        if (remoteSnapshot)
+            return "allowed";
+        if (restartRequired)
+            return "restart_required";
+        if (restoreRequired)
+            return "original_restore_required";
+        return role == SessionRole.Client && connected ? "client_not_owner" : "policy_denied";
+    }
 
     internal static bool IsPersistentMissionMutationRoot(string name, Type returnType) =>
         returnType == typeof(void) && PersistentMissionMutationRoots.Contains(name);
@@ -266,9 +308,9 @@ internal static class GameSaveAuthorityPatch
                     yield return method;
     }
 
-    private static bool Prefix(ref bool __result)
+    private static bool Prefix(ref bool __result, MethodBase __originalMethod)
     {
-        if (HostAuthorityPolicy.CanWriteHostOwnedSave)
+        if (HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveGameData"))
             return true;
         __result = true;
         return false;
@@ -305,7 +347,8 @@ internal static class CentralSaveAuthorityPatch
             yield return playerUpdate;
     }
 
-    private static bool Prefix() => HostAuthorityPolicy.CanWriteHostOwnedSave;
+    private static bool Prefix(MethodBase __originalMethod) =>
+        HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveData");
 }
 
 [HarmonyPatch]
@@ -327,9 +370,9 @@ internal static class SaveSlotJsonAuthorityPatch
             yield return playerSave;
     }
 
-    private static bool Prefix(ref bool __result)
+    private static bool Prefix(ref bool __result, MethodBase __originalMethod)
     {
-        if (HostAuthorityPolicy.CanWriteHostOwnedSave)
+        if (HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveSlotWithJson"))
             return true;
         __result = false;
         return false;

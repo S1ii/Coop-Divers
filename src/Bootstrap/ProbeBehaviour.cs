@@ -197,8 +197,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             if (Role == SessionRole.Host)
                 _sceneReplicator?.OnHostObservedScene(_session, _scene);
             LogSceneMetadata("entered");
-            _hostAuthorityRefreshAt = Role == SessionRole.Host &&
-                _sceneMetadata.SceneType == SceneType.lobby
+            _hostAuthorityRefreshAt = Role == SessionRole.Host
                 ? Time.realtimeSinceStartup + 2f
                 : 0f;
         }
@@ -270,12 +269,16 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _pickupReplicator?.Update(
                 Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
         }
-        if (_hostAuthorityRefreshAt > 0f && Time.realtimeSinceStartup >= _hostAuthorityRefreshAt)
+        if (ManagerEventReplicator.ShouldForceSceneEntryKeyframe(
+                Role,
+                _session?.SceneMatches(_sceneId) == true,
+                _hostAuthorityRefreshAt,
+                Time.realtimeSinceStartup))
         {
             _hostAuthorityRefreshAt = 0f;
             _missionProgressReplicator?.ForceHostKeyframe();
             _managerEventReplicator?.ForceHostKeyframe();
-            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=lobby-settled missions=1 story=1 day=1");
+            _sessionTrace?.Write("AUTH-KEYFRAME", "reason=scene-settled missions=1 story=1 day=1");
         }
 
         while (_session != null && _session.TryTakeSnapshot(out var snapshot))
@@ -1403,6 +1406,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
             $"enabled={body?.IsEnableInteraction ?? false} interaction={body?.InteractionType} " +
             $"result={(result.HasValue ? result.Value.ToString() : "-")}");
     }
+
+    internal void TraceAuthorityRejected(string domain, string method, string owner, string reason) =>
+        _sessionTrace?.Write("AUTH-REJECT",
+            $"domain={domain} method={method} owner={owner} reason={reason}");
 
     internal void TracePlayerInteraction(string stage, PlayerCharacter player)
     {
