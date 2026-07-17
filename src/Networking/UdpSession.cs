@@ -28,7 +28,9 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingFishDamageRequests = 256;
     private const int MaxPendingFishRemovals = 256;
     private const int MaxPendingFishPickupResults = 256;
+    private const int MaxPendingPickupRemovals = 256;
     private const int MaxPendingFishManifests = 256;
+    private const int MaxPendingFishManifestStates = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishLootGrants = 256;
@@ -326,7 +328,9 @@ internal sealed class UdpSession : IDisposable
         TestFishDamageRequestQueueOverflow();
         TestFishRemovedQueueOverflow();
         TestFishPickupResultQueueOverflow();
+        TestPickupRemovedQueueOverflow();
         TestFishManifestQueueOverflow();
+        TestFishManifestStateQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
         TestFishLootGrantQueueOverflow();
@@ -465,6 +469,21 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Fish pickup result queue overflow self-test failed");
     }
 
+    private static void TestPickupRemovedQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingPickupRemovals; index++)
+            session._pickupRemovals.Enqueue(default);
+        session.QueuePickupRemoved(default);
+        if (session._connected || !session._pickupRemovals.IsEmpty ||
+            session._peerLostReason != "pickup removal receive queue overflow")
+            throw new InvalidOperationException("Pickup removal queue overflow self-test failed");
+    }
+
     private static void TestFishManifestQueueOverflow()
     {
         var session = new UdpSession(null)
@@ -478,6 +497,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._fishManifests.IsEmpty ||
             session._peerLostReason != "fish manifest receive queue overflow")
             throw new InvalidOperationException("Fish manifest queue overflow self-test failed");
+    }
+
+    private static void TestFishManifestStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishManifestStates; index++)
+            session._fishManifestStates.Enqueue(default);
+        session.QueueFishManifestState(default);
+        if (session._connected || !session._fishManifestStates.IsEmpty ||
+            session._peerLostReason != "fish manifest state receive queue overflow")
+            throw new InvalidOperationException("Fish manifest state queue overflow self-test failed");
     }
 
     private static void TestBulkReliableControlReserve()
@@ -2626,7 +2660,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && state.SceneId == _remoteSceneId &&
                     state.SceneEpoch == _remoteSceneEpoch)
-                    _fishManifestStates.Enqueue(state);
+                    QueueFishManifestState(state);
             }
             return;
         }
@@ -2639,7 +2673,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) &&
                     MatchesRemoteWorld(removed.SceneId, removed.SceneEpoch))
-                    _pickupRemovals.Enqueue(removed);
+                    QueuePickupRemoved(removed);
             }
             return;
         }
@@ -3498,6 +3532,16 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("fish manifest receive queue overflow");
     }
 
+    private void QueueFishManifestState(FishManifestState state)
+    {
+        if (HasDecodedQueueCapacity(_fishManifestStates.Count, MaxPendingFishManifestStates))
+        {
+            _fishManifestStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("fish manifest state receive queue overflow");
+    }
+
     private void QueueFishPickupResult(FishPickupResult result)
     {
         if (HasDecodedQueueCapacity(_fishPickupResults.Count, MaxPendingFishPickupResults))
@@ -3506,6 +3550,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish pickup result receive queue overflow");
+    }
+
+    private void QueuePickupRemoved(PickupRemoved removed)
+    {
+        if (HasDecodedQueueCapacity(_pickupRemovals.Count, MaxPendingPickupRemovals))
+        {
+            _pickupRemovals.Enqueue(removed);
+            return;
+        }
+        FailReliableDelivery("pickup removal receive queue overflow");
     }
 
     private void QueueFishLifecycle(FishLifecycle state)
