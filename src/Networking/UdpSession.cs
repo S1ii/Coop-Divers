@@ -39,6 +39,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingPickupResults = 256;
     private const int MaxPendingWorldFlagRequests = 256;
     private const int MaxPendingWorldFlagStates = 256;
+    private const int MaxPendingBossDamageRequests = 256;
     private const int MaxPendingBossStates = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
@@ -59,6 +60,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingDiveResultStates = 256;
     private const int MaxPendingTravelStates = 256;
     private const int MaxPendingSushiResultStates = 256;
+    private const int MaxPendingNpcInteractions = 256;
     private const int MaxFishHookPoses = 128;
 
     private sealed class ReliableReceiveWindow
@@ -197,7 +199,8 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<DiveReady> _diveReady = new();
     private readonly ConcurrentQueue<DiverLifeState> _diverLifeStates = new();
     private readonly ConcurrentQueue<DiveExitRequest> _diveExitRequests = new();
-    private readonly ConcurrentQueue<BoatDecoState> _boatDecoStates = new();
+    private BoatDecoState _latestBoatDecoState;
+    private bool _hasBoatDecoState;
     private readonly ConcurrentQueue<TravelReady> _travelReady = new();
     private readonly ConcurrentQueue<TravelState> _travelStates = new();
     private readonly ConcurrentQueue<DiveLootRequest> _diveLootRequests = new();
@@ -327,6 +330,7 @@ internal sealed class UdpSession : IDisposable
         TestFishSnapshotCoalescing();
         TestFishHookPoseCoalescing();
         TestPlayerVisualCoalescing();
+        TestBoatDecoCoalescing();
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
         TestDiverWeaponOrdering();
@@ -348,6 +352,7 @@ internal sealed class UdpSession : IDisposable
         TestPickupResultQueueOverflow();
         TestWorldFlagRequestQueueOverflow();
         TestWorldFlagStateQueueOverflow();
+        TestBossDamageRequestQueueOverflow();
         TestBossStateQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
@@ -361,6 +366,7 @@ internal sealed class UdpSession : IDisposable
         TestDiveResultStateQueueOverflow();
         TestTravelStateQueueOverflow();
         TestSushiResultStateQueueOverflow();
+        TestNpcInteractionQueueOverflow();
         TestDiveReadyQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
@@ -707,6 +713,20 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Boss state queue overflow self-test failed");
     }
 
+    private static void TestBossDamageRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingBossDamageRequests; index++)
+            session._bossDamageRequests.Enqueue(default);
+        session.QueueBossDamageRequest(default);
+        if (session._connected || !session._bossDamageRequests.IsEmpty)
+            throw new InvalidOperationException("Boss damage request queue overflow self-test failed");
+    }
+
     private static void TestWorldReceiveCacheReset()
     {
         var session = new UdpSession(null)
@@ -732,6 +752,16 @@ internal sealed class UdpSession : IDisposable
         if (!session.TryTakePlayerVisualState(out var state) || state.SceneId != 2 ||
             session.TryTakePlayerVisualState(out _))
             throw new InvalidOperationException("Player visual coalescing self-test failed");
+    }
+
+    private static void TestBoatDecoCoalescing()
+    {
+        var session = new UdpSession(null);
+        session.EnqueueBoatDecoState(new BoatDecoState(1));
+        session.EnqueueBoatDecoState(new BoatDecoState(2));
+        if (!session.TryTakeBoatDecoState(out var state) || state.Id != 2 ||
+            session.TryTakeBoatDecoState(out _))
+            throw new InvalidOperationException("Boat decoration coalescing self-test failed");
     }
 
     private static void TestDiverRuntimeCoalescing()
@@ -1124,6 +1154,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._sushiResultStates.IsEmpty ||
             session._peerLostReason != "sushi result receive queue overflow")
             throw new InvalidOperationException("Sushi result queue overflow self-test failed");
+    }
+
+    private static void TestNpcInteractionQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingNpcInteractions; index++)
+            session._npcInteractions.Enqueue(default);
+        session.QueueNpcInteraction(default);
+        if (session._connected || !session._npcInteractions.IsEmpty ||
+            session._peerLostReason != "npc interaction receive queue overflow")
+            throw new InvalidOperationException("NPC interaction queue overflow self-test failed");
     }
 
     private static void TestTravelReadyQueueOverflow()
@@ -1666,6 +1711,12 @@ internal sealed class UdpSession : IDisposable
         _hasPlayerVisualState = true;
     }
 
+    private void EnqueueBoatDecoState(BoatDecoState state)
+    {
+        _latestBoatDecoState = state;
+        _hasBoatDecoState = true;
+    }
+
     internal void SendProjectileVisualState(ProjectileVisualState state)
     {
         if (MatchesLocalWorld(state.SceneId, state.SceneEpoch))
@@ -2104,8 +2155,18 @@ internal sealed class UdpSession : IDisposable
             SendReliable(Protocol.EncodeBoatDecoState(++_sequence, state));
     }
 
-    internal bool TryTakeBoatDecoState(out BoatDecoState state) =>
-        _boatDecoStates.TryDequeue(out state);
+    internal bool TryTakeBoatDecoState(out BoatDecoState state)
+    {
+        if (!_hasBoatDecoState)
+        {
+            state = default;
+            return false;
+        }
+        state = _latestBoatDecoState;
+        _latestBoatDecoState = default;
+        _hasBoatDecoState = false;
+        return true;
+    }
 
     internal void SendTravelReady(TravelReady ready)
     {
@@ -3013,7 +3074,7 @@ internal sealed class UdpSession : IDisposable
                     IsNewer(sequence, _lastBoatDecoSequence))
                 {
                     _lastBoatDecoSequence = sequence;
-                    _boatDecoStates.Enqueue(state);
+                    EnqueueBoatDecoState(state);
                 }
             }
             return;
@@ -3135,7 +3196,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) &&
                     MatchesLocalWorld(request.SceneId, request.SceneEpoch))
-                    _bossDamageRequests.Enqueue(request);
+                    QueueBossDamageRequest(request);
             }
             return;
         }
@@ -3187,7 +3248,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && MatchesNpcInteractionWorld(state))
-                    _npcInteractions.Enqueue(state);
+                    QueueNpcInteraction(state);
             }
             return;
         }
@@ -3804,6 +3865,16 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("boss state receive queue overflow");
     }
 
+    private void QueueBossDamageRequest(BossDamageRequest request)
+    {
+        if (HasDecodedQueueCapacity(_bossDamageRequests.Count, MaxPendingBossDamageRequests))
+        {
+            _bossDamageRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("boss damage request receive queue overflow");
+    }
+
     private void QueueManagerEvent(ManagerEvent state)
     {
         if (HasDecodedQueueCapacity(_managerEvents.Count, MaxPendingManagerEvents))
@@ -3883,6 +3954,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("sushi result receive queue overflow");
+    }
+
+    private void QueueNpcInteraction(NpcInteraction state)
+    {
+        if (HasDecodedQueueCapacity(_npcInteractions.Count, MaxPendingNpcInteractions))
+        {
+            _npcInteractions.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("npc interaction receive queue overflow");
     }
 
     private void QueueMissionState(MissionState state)
@@ -4136,9 +4217,8 @@ internal sealed class UdpSession : IDisposable
         while (_travelStates.TryDequeue(out _))
         {
         }
-        while (_boatDecoStates.TryDequeue(out _))
-        {
-        }
+        _latestBoatDecoState = default;
+        _hasBoatDecoState = false;
         while (_diveLootRequests.TryDequeue(out _))
         {
         }
