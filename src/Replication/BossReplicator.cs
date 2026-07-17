@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
@@ -8,6 +9,26 @@ namespace DaveTheDiverMP;
 
 internal sealed class BossReplicator
 {
+    private readonly record struct FamilyMap(
+        string Root,
+        string DamageEntry,
+        string WeakPoint,
+        string PhaseEntry,
+        string CompletionEntry);
+
+    // These are native entry points from the generated IL2CPP interop, not guessed aliases.
+    // The map is deliberately also the allow-list: a family without a complete ABI stays host-only.
+    private static readonly FamilyMap[] FamilyMaps =
+    {
+        new("BossGiantSquidController", "OnTakeDamage(AttackData,DefenseData)", "bossEyeDamageable", "currentBossState", "OnDie"),
+        new("BossHermitCrabController", "OnTakeDamage(AttackData,DefenseData)", "BossControllerBase", "CheckAndChangeState", "OnDie"),
+        new("BossWolffishController", "OnTakeDamage(AttackData,DefenseData)", "BossControllerBase", "currentBossState", "OnDie"),
+        new("BossGoblinSharkController", "SABossControllerBase native damage", "native child damageables", "BossAngryCutSceneStart", "OnDie"),
+        new("BossKronosaurus", "SABossControllerBase native damage", "native child damageables", "rock-breath actions", "OnDie"),
+        new("SABossAnomalocaris", "OnTakeDamage(Int32,Vector3,Boolean)", "native collision target", "chasing/angry actions", "OnDie"),
+        new("BossLuscaController", "SABossControllerBase native damage", "luscaWeakPoint", "electric-damage actions", "SABossControllerBase OnDie"),
+        new("GodzillaSubmarineController", "OnTakeDamage(AttackData,DefenseData)", "m_Damageable", "torpedo state", "OnDie")
+    };
     private sealed class ClientTarget
     {
         internal BossControllerBase Boss;
@@ -69,6 +90,10 @@ internal sealed class BossReplicator
             !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { 7u }) ||
             !IsSnapshotFamily("BossGiantSquidController") ||
             IsSnapshotFamily("BossGoblinSharkController") ||
+            !TryGetFamilyMap("BossGiantSquidController", out var squid) ||
+            squid.WeakPoint != "bossEyeDamageable" ||
+            !TryGetFamilyMap("SABossAnomalocaris", out var anomalocaris) ||
+            anomalocaris.DamageEntry != "OnTakeDamage(Int32,Vector3,Boolean)" ||
             !IsKnownHostOnlyFamily("BossGoblinSharkController") ||
             !IsKnownHostOnlyFamily("SABossEbirah") ||
             !IsKnownHostOnlyFamily("GodzillaSubmarineController") ||
@@ -193,6 +218,26 @@ internal sealed class BossReplicator
         if (role != SessionRole.Client || session == null || !session.Connected || boss == null)
             return true;
         return false;
+    }
+
+    internal bool AllowClientFamilyMutation(SessionRole role, UdpSession session, MonoBehaviour boss)
+    {
+        if (role != SessionRole.Client || session == null || !session.Connected || boss == null)
+            return true;
+        return false;
+    }
+
+    internal void ObserveNativeTransition(
+        SessionRole role,
+        UdpSession session,
+        uint sceneId,
+        BossControllerBase boss)
+    {
+        if (role != SessionRole.Host || session == null || !session.Connected || boss == null ||
+            !session.SceneMatches(sceneId) || !IsSnapshotFamily(boss.GetType().Name))
+            return;
+        ScanHost(sceneId);
+        SendHostStates(session, sceneId, Time.unscaledTime, true);
     }
 
     internal void Clear()
@@ -329,6 +374,18 @@ internal sealed class BossReplicator
         "BossJW2Controller" or "BossJW3Controller" or "SABossEbirah" or
         "HermitCrabController" or "BossGreatWhiteSharkController" or
         "BossHelicoprionController" or "GodzillaSubmarineController";
+
+    private static bool TryGetFamilyMap(string typeName, out FamilyMap map)
+    {
+        foreach (var candidate in FamilyMaps)
+            if (candidate.Root == typeName)
+            {
+                map = candidate;
+                return true;
+            }
+        map = default;
+        return false;
+    }
 
     private static bool IsHostOnlyBoss(MonoBehaviour boss)
     {
@@ -589,4 +646,94 @@ internal static class BossReflectAuthorityPatch
         __result = Vector2.zero;
         return false;
     }
+}
+
+[HarmonyPatch]
+internal static class SnapshotBossDamagePatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var type in SnapshotTypes)
+        {
+            var method = AccessTools.Method(type, nameof(BossControllerBase.OnTakeDamage),
+                new[] { typeof(AttackData), typeof(DefenseData) });
+            if (method != null)
+                yield return method;
+        }
+    }
+
+    private static bool Prefix(BossControllerBase __instance, AttackData __0, ref bool __result)
+    {
+        if (ProbeBehaviour.Instance?.ObserveBossDamage(__instance, __0) ?? true)
+            return true;
+        __result = false;
+        return false;
+    }
+
+    private static void Postfix(BossControllerBase __instance) =>
+        ProbeBehaviour.Instance?.ObserveBossTransition(__instance);
+
+    private static readonly Type[] SnapshotTypes =
+    {
+        typeof(BossGiantSquidController), typeof(BossHermitCrabController),
+        typeof(BossWolffishController)
+    };
+}
+
+[HarmonyPatch]
+internal static class SnapshotBossTransitionPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var type in SnapshotTypes)
+        foreach (var name in new[] { nameof(BossControllerBase.CheckAndChangeState), nameof(BossControllerBase.OnDie) })
+        {
+            var method = AccessTools.Method(type, name);
+            if (method != null)
+                yield return method;
+        }
+    }
+
+    private static bool Prefix(BossControllerBase __instance) =>
+        ProbeBehaviour.Instance?.AllowBossMutation(__instance) ?? true;
+
+    private static void Postfix(BossControllerBase __instance) =>
+        ProbeBehaviour.Instance?.ObserveBossTransition(__instance);
+
+    private static readonly Type[] SnapshotTypes =
+    {
+        typeof(BossGiantSquidController), typeof(BossHermitCrabController),
+        typeof(BossWolffishController)
+    };
+}
+
+[HarmonyPatch]
+internal static class KnownBossFamilyAuthorityPatch
+{
+    private static IEnumerable<MethodBase> TargetMethods()
+    {
+        foreach (var name in FamilyTypes)
+        {
+            var type = AccessTools.TypeByName(name);
+            if (type == null)
+                continue;
+            foreach (var method in type.GetMethods(BindingFlags.Instance | BindingFlags.Public |
+                                                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                if (method.Name is "OnTakeDamage" or "OnDie" or "CheckAndChangeState" or
+                    "OnHitHarpoon" or "OnReflectProjectile")
+                    yield return method;
+        }
+    }
+
+    private static bool Prefix(MonoBehaviour __instance) =>
+        ProbeBehaviour.Instance?.AllowBossFamilyMutation(__instance) ?? true;
+
+    private static readonly string[] FamilyTypes =
+    {
+        "BossGoblinSharkController", "BossKronosaurus", "SABossAnomalocaris",
+        "BossLuscaController", "BossMantisShrimpController", "BossGiantGardonController",
+        "BossClioneController", "BossJW2Controller", "BossJW3Controller",
+        "SABossEbirah", "BossGreatWhiteSharkController", "BossHelicoprionController",
+        "GodzillaSubmarineController"
+    };
 }

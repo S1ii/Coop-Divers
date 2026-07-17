@@ -176,6 +176,9 @@ internal sealed class UdpSession : IDisposable
     private uint _lastDiverWeaponCommitRevision;
     private uint _lastDiverVitalCommitRevision;
     private readonly ConcurrentQueue<DiverVitalResult> _diverVitalResults = new();
+    private readonly ConcurrentQueue<DiverVitalIntent> _diverVitalIntents = new();
+    private readonly HashSet<ulong> _receivedDiverVitalRequests = new();
+    private readonly Queue<ulong> _receivedDiverVitalRequestOrder = new();
     private readonly Dictionary<uint, DiverVitalResult> _pendingWorldDiverVitalResults = new();
     private readonly Dictionary<uint, DiverVitalResult> _pendingDiverVitalCommits = new();
     private readonly HashSet<ulong> _deliveredDiverVitalEvents = new();
@@ -1451,6 +1454,7 @@ internal sealed class UdpSession : IDisposable
     internal uint LocalSceneEpoch => _localSceneEpoch;
     internal uint NextLocalSceneEpoch =>
         _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
+    internal uint RemoteSceneId => _remoteSceneId;
     internal uint RemoteSceneEpoch => _remoteSceneEpoch;
     internal ulong ConnectionId => _connected ? _sessionId : 0;
     internal DiverCommitDiagnostics LastDiverCommitDiagnostics => new(
@@ -1529,6 +1533,38 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeDiverVitalResult(out DiverVitalResult result) =>
         _diverVitalResults.TryDequeue(out result);
+
+    internal bool SendDiverVitalIntent(DiverVitalIntent intent) =>
+        _role == SessionRole.Client &&
+        MatchesRemoteWorld(intent.SceneId, intent.SceneEpoch) &&
+        SendReliable(Protocol.EncodeDiverVitalIntent(++_sequence, intent));
+
+    internal bool TryTakeDiverVitalIntent(out DiverVitalIntent intent)
+    {
+        while (_role == SessionRole.Host && _diverVitalIntents.TryDequeue(out intent))
+            if (MatchesLocalWorld(intent.SceneId, intent.SceneEpoch))
+                return true;
+        intent = default;
+        return false;
+    }
+
+    private void ReceiveDiverVitalIntent(uint sequence, DiverVitalIntent intent)
+    {
+        if (!MatchesLocalWorld(intent.SceneId, intent.SceneEpoch) ||
+            _receivedDiverVitalRequests.Contains(intent.RequestId))
+        {
+            AcceptReliable(sequence);
+            return;
+        }
+        if (_diverVitalIntents.Count >= MaxPendingDiverVitalResults || !AcceptReliable(sequence))
+            return;
+
+        _receivedDiverVitalRequests.Add(intent.RequestId);
+        _receivedDiverVitalRequestOrder.Enqueue(intent.RequestId);
+        if (_receivedDiverVitalRequestOrder.Count > MaxPendingDiverVitalResults)
+            _receivedDiverVitalRequests.Remove(_receivedDiverVitalRequestOrder.Dequeue());
+        _diverVitalIntents.Enqueue(intent);
+    }
 
     internal bool SendDiverWeaponIntent(DiverWeaponIntent intent) =>
         _role == SessionRole.Client &&
@@ -1806,6 +1842,11 @@ internal sealed class UdpSession : IDisposable
         while (_diverVitalResults.TryDequeue(out _))
         {
         }
+        while (_diverVitalIntents.TryDequeue(out _))
+        {
+        }
+        _receivedDiverVitalRequests.Clear();
+        _receivedDiverVitalRequestOrder.Clear();
         _pendingDiverVitalCommits.Clear();
         _deliveredDiverVitalEvents.Clear();
         _deliveredDiverVitalEventOrder.Clear();
@@ -2797,6 +2838,17 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 ReceiveDiverVitalResult(sequence, result);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiverVitalIntent)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiverVitalIntent(received.Buffer, out _, out var intent))
+            {
+                _lastReceive = now;
+                ReceiveDiverVitalIntent(sequence, intent);
             }
             return;
         }

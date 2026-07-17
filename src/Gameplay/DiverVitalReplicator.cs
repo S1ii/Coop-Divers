@@ -72,6 +72,47 @@ internal sealed class DiverVitalReplicator
         Publish(session, avatar, result, eventId, cause, _flags);
     }
 
+    internal void ApplyHostIntents(UdpSession session, RemoteAvatar avatar)
+    {
+        while (session != null && session.TryTakeDiverVitalIntent(out var intent))
+        {
+            if (!_authority.IsInitializedFor(intent.SceneId, intent.SceneEpoch))
+                continue;
+            var current = _authority.Current;
+            DiverRuntimeAuthorityResult result;
+            DiverVitalCause cause;
+            switch (intent.Kind)
+            {
+                case DiverVitalIntentKind.OxygenCapsule:
+                    result = _authority.ApplyHeal(Math.Min(intent.Amount, current.VitalMax));
+                    cause = DiverVitalCause.OxygenRestore;
+                    break;
+                case DiverVitalIntentKind.Revive:
+                    result = _authority.ApplyRevive(Math.Max(1f, current.VitalMax * 0.25f));
+                    cause = DiverVitalCause.Revive;
+                    break;
+                default:
+                    continue;
+            }
+            var eventId = NextEventId(_eventId);
+            _eventId = eventId;
+            Publish(session, avatar, result, eventId, cause, _flags);
+        }
+    }
+
+    internal bool RequestOxygenCapsule(UdpSession session, PlayerCharacter player, float ratio)
+    {
+        if (session == null || player?.BreathHandler == null || !float.IsFinite(ratio) ||
+            ratio is <= 0f or > 1f)
+            return false;
+        return SendIntent(session, DiverVitalIntentKind.OxygenCapsule,
+            player.BreathHandler.MaxHP * ratio);
+    }
+
+    internal bool RequestRevive(UdpSession session, PlayerCharacter player) =>
+        session != null && player != null && player.IsDead() &&
+        SendIntent(session, DiverVitalIntentKind.Revive, 1f);
+
     internal bool TryApplyHostDamage(
         UdpSession session,
         AttackData attack,
@@ -157,4 +198,14 @@ internal sealed class DiverVitalReplicator
     private static bool AcceptClientVital(float reported, float canonical) => reported <= canonical;
 
     private static ulong NextEventId(ulong value) => value == ulong.MaxValue ? 1 : value + 1;
+
+    private bool SendIntent(UdpSession session, DiverVitalIntentKind kind, float amount)
+    {
+        var requestId = NextEventId(_eventId);
+        if (!session.SendDiverVitalIntent(new DiverVitalIntent(
+                session.RemoteSceneId, session.RemoteSceneEpoch, requestId, kind, amount)))
+            return false;
+        _eventId = requestId;
+        return true;
+    }
 }

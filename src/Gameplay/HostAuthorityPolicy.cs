@@ -49,7 +49,8 @@ internal static class HostAuthorityPolicy
             !IsPersistentMissionMutationRoot(nameof(MissionManager.SetMissionFailed), typeof(void)) ||
             !IsPersistentMissionMutationRoot(nameof(MissionManager.ApplyMissionClear), typeof(void)) ||
             !IsPersistentMissionMutationRoot(nameof(MissionManager.FailMission), typeof(void)) ||
-            IsPersistentMissionMutationRoot(nameof(MissionManager.GetReward), typeof(Il2CppSystem.Collections.IEnumerator)))
+            IsPersistentMissionMutationRoot(nameof(MissionManager.GetReward), typeof(Il2CppSystem.Collections.IEnumerator)) ||
+            !IsMissionRewardRoot(nameof(MissionManager.GetReward), typeof(Il2CppSystem.Collections.IEnumerator)))
             throw new InvalidOperationException("Mission authority target policy failed");
         if (!AllowsHostOwnedAction(SessionRole.Host, true) ||
             AllowsHostOwnedAction(SessionRole.Client, true) ||
@@ -168,6 +169,10 @@ internal static class HostAuthorityPolicy
 
     internal static bool IsPersistentMissionMutationRoot(string name, Type returnType) =>
         returnType == typeof(void) && PersistentMissionMutationRoots.Contains(name);
+
+    internal static bool IsMissionRewardRoot(string name, Type returnType) =>
+        name == nameof(MissionManager.GetReward) &&
+        returnType == typeof(Il2CppSystem.Collections.IEnumerator);
 }
 
 [HarmonyPatch]
@@ -195,6 +200,15 @@ internal static class MissionPresentationCountPatch
 
     private static bool Prefix() =>
         ProbeBehaviour.Instance?.IsCompletingClientPresentation != true;
+}
+
+[HarmonyPatch]
+internal static class MissionRewardAuthorityPatch
+{
+    private static MethodBase TargetMethod() => AccessTools.DeclaredMethod(
+        typeof(MissionManager), nameof(MissionManager.GetReward), new[] { typeof(int) });
+
+    private static bool Prefix() => HostAuthorityPolicy.CanOwnHostAction;
 }
 
 [HarmonyPatch(typeof(FishFarm.FishFarmManager), nameof(FishFarm.FishFarmManager.Save))]

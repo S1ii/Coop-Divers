@@ -35,11 +35,45 @@ internal static class DiverGunPolicyPatch
         ProbeBehaviour.Instance?.AllowDiverGunFire(__instance) ?? true;
 }
 
+[HarmonyPatch(typeof(GunWeaponHandler), nameof(GunWeaponHandler.ReloadItem), new[] { typeof(float) })]
+internal static class DiverGunReloadPolicyPatch
+{
+    private static bool Prefix(GunWeaponHandler __instance, ref bool __result)
+    {
+        var allow = ProbeBehaviour.Instance?.AllowDiverGunReload(__instance) ?? true;
+        if (!allow)
+            __result = false;
+        return allow;
+    }
+}
+
+[HarmonyPatch(typeof(GunWeaponHandler), nameof(GunWeaponHandler.ReloadBullet), new[] { typeof(float) })]
+internal static class DiverGunReloadBulletPolicyPatch
+{
+    private static bool Prefix(GunWeaponHandler __instance) =>
+        ProbeBehaviour.Instance?.AllowDiverGunReload(__instance) ?? true;
+}
+
 [HarmonyPatch(typeof(PlayerCharacter), nameof(PlayerCharacter.OnFireSubHelper_Performed))]
 internal static class DiverSubHelperPolicyPatch
 {
     private static bool Prefix(PlayerCharacter __instance) =>
         ProbeBehaviour.Instance?.AllowDiverDeviceUse(__instance) ?? true;
+}
+
+[HarmonyPatch(typeof(PlayerCharacter), nameof(PlayerCharacter.Event_OnUseOxygenCapsule),
+    new[] { typeof(float), typeof(float) })]
+internal static class DiverOxygenCapsuleAuthorityPatch
+{
+    private static bool Prefix(PlayerCharacter __instance, float ratio) =>
+        ProbeBehaviour.Instance?.RequestDiverOxygenCapsule(__instance, ratio) ?? true;
+}
+
+[HarmonyPatch(typeof(PlayerCharacter), nameof(PlayerCharacter.OnRevive), new System.Type[0])]
+internal static class DiverReviveAuthorityPatch
+{
+    private static bool Prefix(PlayerCharacter __instance) =>
+        ProbeBehaviour.Instance?.RequestDiverRevive(__instance) ?? true;
 }
 
 [HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.AddBuff),

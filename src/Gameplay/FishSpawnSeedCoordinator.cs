@@ -388,6 +388,20 @@ internal static class ChestSpawnerSeedPatch
     }
 }
 
+[HarmonyPatch(typeof(InstanceItemSpawnHandler), nameof(InstanceItemSpawnHandler.SelectRandomOne))]
+internal static class ItemDropSelectionSeedPatch
+{
+    private static void Prefix(InstanceItemSpawnHandler __instance,
+        out FishSpawnSeedCoordinator.Scope __state) =>
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "item-drop");
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
+}
+
 [HarmonyPatch(typeof(SavedRandomActivator), nameof(SavedRandomActivator.SelectRandomOne))]
 internal static class SavedRandomActivatorSeedPatch
 {
@@ -425,4 +439,21 @@ internal static class RandomActivatorSeedPatch
 internal static class JungleProximityRandomAuthorityPatch
 {
     private static bool Prefix() => HostAuthorityPolicy.CanOwnHostAction;
+}
+
+[HarmonyPatch(typeof(JungleCreatureNest), nameof(JungleCreatureNest.RandomSpawnCreature))]
+internal static class JungleCreatureNestSeedPatch
+{
+    private static bool Prefix(JungleCreatureNest __instance,
+        out FishSpawnSeedCoordinator.Scope __state)
+    {
+        __state = FishSpawnSeedCoordinator.Begin(__instance, "jungle-creature");
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
+
+    private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
+    {
+        FishSpawnSeedCoordinator.End(__state);
+        return __exception;
+    }
 }

@@ -355,6 +355,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
             }
             else if (Role == SessionRole.Client && runtimeState.Owner == DiverOwner.Host)
                 _remoteAvatar.ApplyRuntime(runtimeState);
+        if (Role == SessionRole.Host)
+            _diverVitalReplicator?.ApplyHostIntents(_session, _remoteAvatar);
         _remoteAvatar.Update(Time.unscaledDeltaTime);
 
         if (_session != null && _session.SceneMatches(_sceneId) &&
@@ -1421,6 +1423,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
         !UnsafeWorldReplicationBlocked &&
         (_bossReplicator?.AllowClientBossMutation(Role, _session, boss) ?? true);
 
+    internal bool AllowBossFamilyMutation(MonoBehaviour boss) =>
+        !UnsafeWorldReplicationBlocked &&
+        (_bossReplicator?.AllowClientFamilyMutation(Role, _session, boss) ?? true);
+
+    internal void ObserveBossTransition(BossControllerBase boss) =>
+        _bossReplicator?.ObserveNativeTransition(Role, _session, _sceneId, boss);
+
     internal bool ObserveBossDamage(BossControllerBase boss, AttackData attack) =>
         !UnsafeWorldReplicationBlocked &&
         (_bossReplicator?.ObserveClientDamage(Role, _session, _sceneId, boss, attack) ?? true);
@@ -1781,15 +1790,54 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool AllowDiverGunFire(GunWeaponHandler gun)
     {
+        if (_diverWeaponReplicator?.ApplyingClientFire == true)
+            return true;
         if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
                 Role, _session?.Connected == true))
             return true;
-        _sessionTrace?.Write("DIVER-POLICY", "reject=gun client-only");
+        if (_diverWeaponReplicator?.RequestClientFire(_session, _player, gun) == true)
+            _sessionTrace?.Write("DIVER-WEAPON", "fire=requested");
+        else
+            _sessionTrace?.Write("DIVER-POLICY", "reject=gun not-ready");
+        return false;
+    }
+
+    internal bool AllowDiverGunReload(GunWeaponHandler gun)
+    {
+        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true))
+            return true;
+        if (_diverWeaponReplicator?.RequestClientReload(_session, _player, gun) == true)
+            _sessionTrace?.Write("DIVER-WEAPON", "reload=requested");
+        else
+            _sessionTrace?.Write("DIVER-POLICY", "reject=reload not-ready");
         return false;
     }
 
     internal bool AllowDiverDeviceUse(PlayerCharacter player) =>
         AllowDiverClientOnlyMutation(player == _player, "sub-helper");
+
+    internal bool RequestDiverOxygenCapsule(PlayerCharacter player, float ratio)
+    {
+        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true) ||
+            (_diverVitalReplicator?.ApplyingClientResult ?? false))
+            return true;
+        var requested = _diverVitalReplicator?.RequestOxygenCapsule(_session, player, ratio) == true;
+        _sessionTrace?.Write("DIVER-VITAL", requested ? "oxygen=requested" : "oxygen=not-ready");
+        return false;
+    }
+
+    internal bool RequestDiverRevive(PlayerCharacter player)
+    {
+        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true) ||
+            (_diverVitalReplicator?.ApplyingClientResult ?? false))
+            return true;
+        var requested = _diverVitalReplicator?.RequestRevive(_session, player) == true;
+        _sessionTrace?.Write("DIVER-VITAL", requested ? "revive=requested" : "revive=not-ready");
+        return false;
+    }
 
     internal bool AllowDiverBuff(BuffHandler handler) =>
         AllowDiverClientOnlyMutation(handler != null && handler == _player?.m_PlayerBuffHandler, "buff");

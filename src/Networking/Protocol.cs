@@ -63,7 +63,8 @@ internal enum PacketType : byte
     DiverRuntimeState = 57,
     DiverVitalResult = 58,
     DiverWeaponIntent = 59,
-    DiverWeaponResult = 60
+    DiverWeaponResult = 60,
+    DiverVitalIntent = 61
 }
 
 internal enum HandshakeRejectReason : byte
@@ -156,6 +157,19 @@ internal readonly record struct DiverVitalResult(
     DiverVitalEdges Edges,
     float AppliedAmount,
     DiverRuntimeState State);
+
+internal enum DiverVitalIntentKind : byte
+{
+    OxygenCapsule = 1,
+    Revive = 2
+}
+
+internal readonly record struct DiverVitalIntent(
+    uint SceneId,
+    uint SceneEpoch,
+    ulong RequestId,
+    DiverVitalIntentKind Kind,
+    float Amount);
 
 internal enum DiverWeaponAction : byte
 {
@@ -654,6 +668,7 @@ internal static class Protocol
     private const int DiverRuntimePayloadSize = 50;
     private const int DiverRuntimeStateSize = HeaderSize + DiverRuntimePayloadSize;
     private const int DiverVitalResultSize = HeaderSize + 18 + DiverRuntimePayloadSize;
+    private const int DiverVitalIntentSize = HeaderSize + 21;
     private const int DiverWeaponIntentSize = HeaderSize + 21;
     private const int DiverWeaponResultSize = HeaderSize + 19 + DiverRuntimePayloadSize;
     private const int VisualStateFixedSize = HeaderSize + 9;
@@ -953,6 +968,42 @@ internal static class Protocol
         if (!IsValidDiverVitalResult(candidate))
             return false;
         result = candidate;
+        return true;
+    }
+
+    internal static byte[] EncodeDiverVitalIntent(uint sequence, DiverVitalIntent intent)
+    {
+        if (!IsValidDiverVitalIntent(intent))
+            throw new ArgumentOutOfRangeException(nameof(intent));
+        var packet = new byte[DiverVitalIntentSize];
+        WriteHeader(packet, PacketType.DiverVitalIntent, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), intent.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), intent.SceneEpoch);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 8), intent.RequestId);
+        packet[HeaderSize + 16] = (byte)intent.Kind;
+        WriteSingle(packet.AsSpan(HeaderSize + 17), intent.Amount);
+        return packet;
+    }
+
+    internal static bool TryDecodeDiverVitalIntent(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out DiverVitalIntent intent)
+    {
+        sequence = 0;
+        intent = default;
+        if (packet.Length != DiverVitalIntentSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.DiverVitalIntent)
+            return false;
+        var candidate = new DiverVitalIntent(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 8)),
+            (DiverVitalIntentKind)packet[HeaderSize + 16],
+            ReadSingle(packet.Slice(HeaderSize + 17)));
+        if (!IsValidDiverVitalIntent(candidate))
+            return false;
+        intent = candidate;
         return true;
     }
 
@@ -3903,6 +3954,11 @@ internal static class Protocol
             ? intent.WeaponId == 0
             : intent.WeaponId > 0);
 
+    private static bool IsValidDiverVitalIntent(DiverVitalIntent intent) =>
+        intent.SceneId != 0 && intent.SceneEpoch != 0 && intent.RequestId != 0 &&
+        Enum.IsDefined(typeof(DiverVitalIntentKind), intent.Kind) &&
+        float.IsFinite(intent.Amount) && intent.Amount > 0f && intent.Amount <= 1_000_000f;
+
     private static bool IsValidDiverWeaponResult(DiverWeaponResult result)
     {
         if (result.CommitRevision == 0 || result.RequestId == 0 ||
@@ -4225,6 +4281,17 @@ internal static class Protocol
         vitalResultPacket[HeaderSize + 31] = 1;
         if (TryDecodeDiverVitalResult(vitalResultPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted nonzero dead diver vital state");
+
+        var expectedVitalIntent = new DiverVitalIntent(
+            expectedDiverRuntime.SceneId, expectedDiverRuntime.SceneEpoch,
+            0x123456789abcdef0, DiverVitalIntentKind.OxygenCapsule, 5f);
+        var vitalIntentPacket = EncodeDiverVitalIntent(49, expectedVitalIntent);
+        if (!TryDecodeDiverVitalIntent(vitalIntentPacket, out sequence, out var actualVitalIntent) ||
+            sequence != 49 || actualVitalIntent != expectedVitalIntent)
+            throw new InvalidOperationException("Diver vital intent round-trip failed");
+        vitalIntentPacket[HeaderSize + 16] = byte.MaxValue;
+        if (TryDecodeDiverVitalIntent(vitalIntentPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid diver vital intent");
 
         var expectedWeaponIntent = new DiverWeaponIntent(
             expectedDiverRuntime.SceneId, expectedDiverRuntime.SceneEpoch,

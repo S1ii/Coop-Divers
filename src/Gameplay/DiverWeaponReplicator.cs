@@ -13,6 +13,7 @@ internal sealed class DiverWeaponReplicator
     private bool _hasObservation;
     private int _observedWeaponId;
     private int _observedAmmo;
+    internal bool ApplyingClientFire { get; private set; }
 
     internal static void SelfTest()
     {
@@ -30,6 +31,7 @@ internal sealed class DiverWeaponReplicator
         _hasObservation = false;
         _observedWeaponId = 0;
         _observedAmmo = 0;
+        ApplyingClientFire = false;
     }
 
     internal void Update(
@@ -63,6 +65,26 @@ internal sealed class DiverWeaponReplicator
         while (session.TryTakeDiverWeaponResult(out var result))
             ApplyClientResult(player, result);
         ObserveClientGun(session, player);
+    }
+
+    // The host reducer authorizes the shot first; only its accepted result may
+    // enter the native weapon path on the owning client.
+    internal bool RequestClientFire(UdpSession session, PlayerCharacter player, GunWeaponHandler gun)
+    {
+        if (_role != SessionRole.Client || _pending || gun == null ||
+            !TryGetActiveOrdinaryGun(player, out var active, out var weaponId, out _, out _) ||
+            active != gun || !_hasObservation || _observedWeaponId != weaponId)
+            return false;
+        return SendIntent(session, DiverWeaponAction.Fire, weaponId);
+    }
+
+    internal bool RequestClientReload(UdpSession session, PlayerCharacter player, GunWeaponHandler gun)
+    {
+        if (_role != SessionRole.Client || _pending || gun == null ||
+            !TryGetActiveOrdinaryGun(player, out var active, out var weaponId, out _, out _) ||
+            active != gun || !_hasObservation || _observedWeaponId != weaponId)
+            return false;
+        return SendIntent(session, DiverWeaponAction.Reload, weaponId);
     }
 
     private void BeginWorld(SessionRole role, uint sceneId, uint sceneEpoch)
@@ -149,6 +171,22 @@ internal sealed class DiverWeaponReplicator
         if (result.State.WeaponId == weaponId)
         {
             var ammo = Math.Clamp(result.State.Ammo, 0, gun.m_MaxAmmo);
+            if (result.Accepted && result.Action == DiverWeaponAction.Fire)
+            {
+                try
+                {
+                    ApplyingClientFire = true;
+                    gun.FireWeapon();
+                }
+                catch
+                {
+                    // The authoritative ammo correction below still converges.
+                }
+                finally
+                {
+                    ApplyingClientFire = false;
+                }
+            }
             gun.ForceSetBulletCount(ammo);
             _hasObservation = true;
             _observedWeaponId = weaponId;
