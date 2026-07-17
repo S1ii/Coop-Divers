@@ -98,7 +98,8 @@ internal sealed class UdpSession : IDisposable
 
     private readonly ManualLogSource _log;
     private readonly ConcurrentQueue<UdpReceiveResult> _incoming = new();
-    private readonly ConcurrentQueue<FishSnapshot> _fishSnapshots = new();
+    private readonly Queue<int> _fishSnapshotOrder = new();
+    private readonly Dictionary<int, FishSnapshot> _fishSnapshots = new();
     private readonly ConcurrentQueue<FishDamageRequest> _fishDamageRequests = new();
     private readonly ConcurrentQueue<FishPickupRequest> _fishPickupRequests = new();
     private readonly ConcurrentQueue<FishPickupResult> _fishPickupResults = new();
@@ -279,6 +280,7 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Scene epoch isolation self-test failed");
 
         TestProjectileVisualQueueLimit();
+        TestFishSnapshotCoalescing();
         TestPlayerVisualCoalescing();
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
@@ -309,6 +311,18 @@ internal sealed class UdpSession : IDisposable
                 foundCoalesced = true;
         if (!foundCoalesced)
             throw new InvalidOperationException("Projectile visual coalescing self-test failed");
+    }
+
+    private static void TestFishSnapshotCoalescing()
+    {
+        var session = new UdpSession(null);
+        session.EnqueueFishSnapshot(default(FishSnapshot) with { Id = 1, Tick = 1, X = 1f });
+        session.EnqueueFishSnapshot(default(FishSnapshot) with { Id = 2, Tick = 1, X = 2f });
+        session.EnqueueFishSnapshot(default(FishSnapshot) with { Id = 1, Tick = 2, X = 3f });
+        if (!session.TryTakeFishSnapshot(out var first) || first.Id != 1 || first.Tick != 2 ||
+            first.X != 3f || !session.TryTakeFishSnapshot(out var second) || second.Id != 2 ||
+            session.TryTakeFishSnapshot(out _))
+            throw new InvalidOperationException("Fish snapshot coalescing self-test failed");
     }
 
     private static void TestSaveSnapshotAckQueueOverflow()
@@ -1018,8 +1032,30 @@ internal sealed class UdpSession : IDisposable
         return bytes;
     }
 
-    internal bool TryTakeFishSnapshot(out FishSnapshot snapshot) =>
-        _fishSnapshots.TryDequeue(out snapshot);
+    internal bool TryTakeFishSnapshot(out FishSnapshot snapshot)
+    {
+        if (_fishSnapshotOrder.Count > 0)
+        {
+            var id = _fishSnapshotOrder.Dequeue();
+            if (_fishSnapshots.Remove(id, out snapshot))
+                return true;
+        }
+        snapshot = default;
+        return false;
+    }
+
+    private void EnqueueFishSnapshot(FishSnapshot snapshot)
+    {
+        if (_fishSnapshots.ContainsKey(snapshot.Id))
+        {
+            _fishSnapshots[snapshot.Id] = snapshot;
+            return;
+        }
+        if (_fishSnapshots.Count >= 128)
+            _fishSnapshots.Remove(_fishSnapshotOrder.Dequeue());
+        _fishSnapshotOrder.Enqueue(snapshot.Id);
+        _fishSnapshots.Add(snapshot.Id, snapshot);
+    }
 
     internal void SendFishDamageRequest(FishDamageRequest request)
     {
@@ -1860,7 +1896,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 foreach (var fishSnapshot in fishSnapshots)
-                    _fishSnapshots.Enqueue(fishSnapshot);
+                    EnqueueFishSnapshot(fishSnapshot);
             }
             return;
         }
@@ -2548,9 +2584,8 @@ internal sealed class UdpSession : IDisposable
         _projectileVisualStates.Clear();
         _lastVisualSequence = 0;
         _lastProjectileVisualSequence = 0;
-        while (_fishSnapshots.TryDequeue(out _))
-        {
-        }
+        _fishSnapshotOrder.Clear();
+        _fishSnapshots.Clear();
         while (_fishDamageRequests.TryDequeue(out _))
         {
         }
@@ -2856,9 +2891,8 @@ internal sealed class UdpSession : IDisposable
             _sessionId = 0;
         while (_incoming.TryDequeue(out _))
             Interlocked.Decrement(ref _incomingCount);
-        while (_fishSnapshots.TryDequeue(out _))
-        {
-        }
+        _fishSnapshotOrder.Clear();
+        _fishSnapshots.Clear();
         _latestPlayerVisualState = default;
         _hasPlayerVisualState = false;
         _latestHostRuntimeState = default;

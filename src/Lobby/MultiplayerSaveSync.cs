@@ -16,6 +16,18 @@ namespace DaveTheDiverMP;
 
 internal static class MultiplayerSaveSync
 {
+    private enum SaveFailurePoint
+    {
+        None,
+        HostWrite,
+        GameWrite,
+        PhotoWrite,
+        PlayerWrite,
+        Verification,
+        MarkerUpdate,
+        Load
+    }
+
     private const int MpSlotIndex = 6;
     private const SaveSlotType MpSlotType = SaveSlotType.Manual;
     private const uint BundleMagic = 0x42534D44; // DMSB
@@ -73,6 +85,8 @@ internal static class MultiplayerSaveSync
     private static bool _normalSaveRestartRequired;
     [ThreadStatic]
     private static int _remoteSnapshotApplyDepth;
+    // Test-only; SelfTest always clears this before returning.
+    private static SaveFailurePoint _selfTestFailurePoint;
     private static string _status = string.Empty;
 
     internal static bool HostRemoteLoaded => _hostRemoteLoaded;
@@ -141,6 +155,7 @@ internal static class MultiplayerSaveSync
         EndRemoteSnapshotApply();
         if (IsApplyingRemoteSnapshot)
             throw new InvalidOperationException("MP save apply scope leaked after self-test");
+        SelfTestFailureInjection();
         if (!ShouldRestoreBeforeRoleChange(
                 SessionRole.Client, SessionRole.Offline, true) ||
             !ShouldRestoreBeforeRoleChange(
@@ -266,6 +281,7 @@ internal static class MultiplayerSaveSync
             return false;
         try
         {
+            ThrowIfSelfTestFailure(SaveFailurePoint.Load);
             if (save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType))
                 return true;
             _status = "Could not load MP save slot";
@@ -289,25 +305,40 @@ internal static class MultiplayerSaveSync
         {
             if (!TryBeginSlotWrite(save, string.Empty, log, out var pending))
                 return false;
-            if (!save.SaveGameDataInSlot(MpSlotIndex, true, MpSlotType))
+            var hostWritten = false;
+            var slotVerified = false;
+            var details = string.Empty;
+            var fullFingerprint = string.Empty;
+            if (!TryCompleteSlotWrite(
+                    () =>
+                    {
+                        ThrowIfSelfTestFailure(SaveFailurePoint.HostWrite);
+                        return hostWritten = save.SaveGameDataInSlot(MpSlotIndex, true, MpSlotType);
+                    },
+                    () => true,
+                    () => true,
+                    () =>
+                    {
+                        ThrowIfSelfTestFailure(SaveFailurePoint.Verification);
+                        slotVerified = TryReadSlotBundle(save, out _hostSnapshot, out details);
+                        if (slotVerified)
+                        {
+                            fullFingerprint = FullFingerprint(_hostSnapshot);
+                            pending.TargetFingerprint = fullFingerprint;
+                        }
+                        return slotVerified;
+                    },
+                    () => true,
+                    () => CommitSlotWrite(pending, fullFingerprint, log),
+                    () => RollBackSlotWrite(save, pending, log)))
             {
-                _status = "Could not write MP save slot";
-                RollBackSlotWrite(save, pending, log);
-                return false;
-            }
-            if (!TryReadSlotBundle(save, out _hostSnapshot, out var details))
-            {
-                _status = "MP save slot did not contain complete data";
-                log?.LogWarning($"MP save sync: invalid host slot after write; {details}");
-                RollBackSlotWrite(save, pending, log);
-                return false;
-            }
-            var fullFingerprint = FullFingerprint(_hostSnapshot);
-            pending.TargetFingerprint = fullFingerprint;
-            WriteAtomicText(MpSlotPendingPath, JsonSerializer.Serialize(pending));
-            if (!CommitSlotWrite(pending, fullFingerprint, log))
-            {
-                RollBackSlotWrite(save, pending, log);
+                if (!hostWritten)
+                    _status = "Could not write MP save slot";
+                else if (!slotVerified)
+                {
+                    _status = "MP save slot did not contain complete data";
+                    log?.LogWarning($"MP save sync: invalid host slot after write; {details}");
+                }
                 _hostSnapshot = Array.Empty<byte>();
                 return false;
             }
@@ -395,21 +426,48 @@ internal static class MultiplayerSaveSync
                     _clientTransferId, _clientFingerprint, false));
                 return;
             }
-            var gameSaved = save.GameDataManager.SaveSlotWithJson(
-                gameJson, MpSlotIndex, MpSlotType);
-            var photoSaved = save.PhotoDataManager.SaveSlotWithJson(
-                photoJson, MpSlotIndex, MpSlotType);
-            var playerSaved = save.PlayerDataManager.SaveSlotWithJson(
-                playerJson, MpSlotIndex, MpSlotType);
-            var verified = gameSaved && photoSaved && playerSaved &&
-                TryReadSlotBundle(save, out var written, out _) &&
-                FullFingerprint(written) == fullFingerprint;
-            if (verified)
-                _normalSaveRestartRequired = true;
-            var loaded = verified && save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
-            if (!loaded || !CommitSlotWrite(pending, fullFingerprint, log))
+            var gameSaved = false;
+            var photoSaved = false;
+            var playerSaved = false;
+            var verified = false;
+            var loaded = false;
+            var completed = TryCompleteSlotWrite(
+                () =>
+                {
+                    ThrowIfSelfTestFailure(SaveFailurePoint.GameWrite);
+                    return gameSaved = save.GameDataManager.SaveSlotWithJson(
+                        gameJson, MpSlotIndex, MpSlotType);
+                },
+                () =>
+                {
+                    ThrowIfSelfTestFailure(SaveFailurePoint.PhotoWrite);
+                    return photoSaved = save.PhotoDataManager.SaveSlotWithJson(
+                        photoJson, MpSlotIndex, MpSlotType);
+                },
+                () =>
+                {
+                    ThrowIfSelfTestFailure(SaveFailurePoint.PlayerWrite);
+                    return playerSaved = save.PlayerDataManager.SaveSlotWithJson(
+                        playerJson, MpSlotIndex, MpSlotType);
+                },
+                () =>
+                {
+                    ThrowIfSelfTestFailure(SaveFailurePoint.Verification);
+                    verified = TryReadSlotBundle(save, out var written, out _) &&
+                        FullFingerprint(written) == fullFingerprint;
+                    if (verified)
+                        _normalSaveRestartRequired = true;
+                    return verified;
+                },
+                () =>
+                {
+                    ThrowIfSelfTestFailure(SaveFailurePoint.Load);
+                    return loaded = save.LoadGameDataFromSlot(MpSlotIndex, MpSlotType);
+                },
+                () => CommitSlotWrite(pending, fullFingerprint, log),
+                () => RollBackSlotWrite(save, pending, log));
+            if (!completed)
             {
-                RollBackSlotWrite(save, pending, log);
                 RejectClientSave(session, "Could not safely load host save");
                 log?.LogWarning(
                     $"MP save sync: client transaction failed; gd={gameSaved}; " +
@@ -571,8 +629,7 @@ internal static class MultiplayerSaveSync
             if (pending == null || pending.Schema != MarkerSchema || pending.Slot != MpSlotIndex ||
                 !string.Equals(pending.TargetFingerprint, fingerprint, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("pending journal does not match marker commit");
-            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
-                CreateMarker(fingerprint, pending.PreviousFingerprint)));
+            WriteMarker(CreateMarker(fingerprint, pending.PreviousFingerprint));
             if (!TryDeleteFile(MpSlotPendingPath))
                 throw new IOException("could not remove pending journal");
             if (!TryDeleteFile(MpSlotBackupPath))
@@ -631,8 +688,7 @@ internal static class MultiplayerSaveSync
                     !TryReadSlotBundle(save, out var restored, out _) ||
                     FullFingerprint(restored) != pending.PreviousFingerprint)
                     throw new IOException("restored slot verification failed");
-                WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
-                    CreateMarker(pending.PreviousFingerprint, string.Empty)));
+                WriteMarker(CreateMarker(pending.PreviousFingerprint, string.Empty));
             }
             else
             {
@@ -673,8 +729,7 @@ internal static class MultiplayerSaveSync
                     return true;
                 try
                 {
-                    WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
-                        CreateMarker(currentFingerprint, string.Empty)));
+                    WriteMarker(CreateMarker(currentFingerprint, string.Empty));
                 }
                 catch (Exception exception)
                 {
@@ -692,8 +747,7 @@ internal static class MultiplayerSaveSync
         if (uint.TryParse(json.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture,
                 out var legacy) && legacy == Fingerprint(current))
         {
-            WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(
-                CreateMarker(currentFingerprint, string.Empty)));
+            WriteMarker(CreateMarker(currentFingerprint, string.Empty));
             log?.LogInfo("MP save sync: migrated legacy slot marker");
             return true;
         }
@@ -739,6 +793,77 @@ internal static class MultiplayerSaveSync
         var photoSaved = save.PhotoDataManager.SaveSlotWithJson(photo, MpSlotIndex, MpSlotType);
         var playerSaved = save.PlayerDataManager.SaveSlotWithJson(player, MpSlotIndex, MpSlotType);
         return gameSaved && photoSaved && playerSaved;
+    }
+
+    private static bool TryCompleteSlotWrite(
+        Func<bool> writeGame,
+        Func<bool> writePhoto,
+        Func<bool> writePlayer,
+        Func<bool> verify,
+        Func<bool> load,
+        Func<bool> updateMarker,
+        Action rollBack)
+    {
+        var completed = false;
+        try
+        {
+            completed = writeGame() && writePhoto() && writePlayer() && verify() && load() &&
+                updateMarker();
+            return completed;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (!completed)
+                rollBack();
+        }
+    }
+
+    private static void ThrowIfSelfTestFailure(SaveFailurePoint point)
+    {
+        if (_selfTestFailurePoint == point)
+        {
+            _selfTestFailurePoint = SaveFailurePoint.None;
+            throw new IOException($"self-test failure at {point}");
+        }
+    }
+
+    private static void SelfTestFailureInjection()
+    {
+        foreach (SaveFailurePoint point in Enum.GetValues(typeof(SaveFailurePoint)))
+        {
+            if (point == SaveFailurePoint.None)
+                continue;
+            var rolledBack = false;
+            _selfTestFailurePoint = point;
+            try
+            {
+                if (TryCompleteSlotWrite(
+                        () => SelfTestWriteStep(point == SaveFailurePoint.HostWrite
+                            ? SaveFailurePoint.HostWrite
+                            : SaveFailurePoint.GameWrite),
+                        () => SelfTestWriteStep(SaveFailurePoint.PhotoWrite),
+                        () => SelfTestWriteStep(SaveFailurePoint.PlayerWrite),
+                        () => SelfTestWriteStep(SaveFailurePoint.Verification),
+                        () => SelfTestWriteStep(SaveFailurePoint.Load),
+                        () => SelfTestWriteStep(SaveFailurePoint.MarkerUpdate),
+                        () => rolledBack = true) || !rolledBack)
+                    throw new InvalidOperationException($"MP save failure injection missed {point}");
+            }
+            finally
+            {
+                _selfTestFailurePoint = SaveFailurePoint.None;
+            }
+        }
+    }
+
+    private static bool SelfTestWriteStep(SaveFailurePoint point)
+    {
+        ThrowIfSelfTestFailure(point);
+        return true;
     }
 
     private static bool AnySlotFileExists(SaveSystem save)
@@ -986,6 +1111,12 @@ internal static class MultiplayerSaveSync
         if (bytes.Length == 0 || bytes.Length > MaxMetadataBytes)
             throw new InvalidDataException("metadata size is invalid");
         WriteAtomicBytes(path, bytes);
+    }
+
+    private static void WriteMarker(SlotMarker marker)
+    {
+        ThrowIfSelfTestFailure(SaveFailurePoint.MarkerUpdate);
+        WriteAtomicText(MpSlotMarkerPath, JsonSerializer.Serialize(marker));
     }
 
     private static void WriteAtomicBytes(string path, byte[] bytes)
