@@ -25,10 +25,12 @@ internal sealed class UdpSession : IDisposable
     private const int ReservedReliableControlSlots = 16;
     private const int MaxPendingDiverVitalResults = 256;
     private const int MaxPendingDiverWeaponPackets = 256;
+    private const int MaxPendingFishDamageRequests = 256;
     private const int MaxPendingFishLifecycles = 256;
     private const int MaxPendingFishActionAcks = 256;
     private const int MaxPendingFishLootGrants = 256;
     private const int MaxPendingFishLootCompletions = 256;
+    private const int MaxPendingPickupRequests = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
@@ -246,6 +248,7 @@ internal sealed class UdpSession : IDisposable
     private long _incomingCapHits;
     private long _reliableRetries;
     private long _reliableExpired;
+    private long _reliableQueueOverflows;
     private long _visualStatesCoalesced;
 
     internal UdpSession(ManualLogSource log) => _log = log;
@@ -315,10 +318,12 @@ internal sealed class UdpSession : IDisposable
         TestBulkReliableControlReserve();
         TestWorldReceiveCacheReset();
         TestSaveSnapshotAckQueueOverflow();
+        TestFishDamageRequestQueueOverflow();
         TestFishLifecycleQueueOverflow();
         TestFishActionAckQueueOverflow();
         TestFishLootGrantQueueOverflow();
         TestFishLootCompleteQueueOverflow();
+        TestPickupRequestQueueOverflow();
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
@@ -402,8 +407,23 @@ internal sealed class UdpSession : IDisposable
             session._saveSnapshotAcks.Enqueue(default);
         session.QueueSaveSnapshotAck(default);
         if (session._connected || !session._saveSnapshotAcks.IsEmpty ||
-            session._peerLostReason != "save snapshot acknowledgement receive queue overflow")
+            session._peerLostReason != "save snapshot acknowledgement receive queue overflow" ||
+            Interlocked.Read(ref session._reliableQueueOverflows) != 1)
             throw new InvalidOperationException("Save snapshot acknowledgement overflow self-test failed");
+    }
+
+    private static void TestFishDamageRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingFishDamageRequests; index++)
+            session._fishDamageRequests.Enqueue(default);
+        session.QueueFishDamageRequest(default);
+        if (session._connected || !session._fishDamageRequests.IsEmpty)
+            throw new InvalidOperationException("Fish damage request queue overflow self-test failed");
     }
 
     private static void TestBulkReliableControlReserve()
@@ -482,6 +502,20 @@ internal sealed class UdpSession : IDisposable
         session.QueueFishLootComplete(default);
         if (session._connected || !session._fishLootCompletions.IsEmpty)
             throw new InvalidOperationException("Fish loot completion queue overflow self-test failed");
+    }
+
+    private static void TestPickupRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingPickupRequests; index++)
+            session._pickupRequests.Enqueue(default);
+        session.QueuePickupRequest(default);
+        if (session._connected || !session._pickupRequests.IsEmpty)
+            throw new InvalidOperationException("Pickup request queue overflow self-test failed");
     }
 
     private static void TestWorldReceiveCacheReset()
@@ -2063,6 +2097,7 @@ internal sealed class UdpSession : IDisposable
                 $"capHits={Interlocked.Exchange(ref _incomingCapHits, 0)}, " +
                 $"retries={Interlocked.Exchange(ref _reliableRetries, 0)}, " +
                 $"expired={Interlocked.Exchange(ref _reliableExpired, 0)}, " +
+                $"queueOverflows={Interlocked.Exchange(ref _reliableQueueOverflows, 0)}, " +
                 $"visualCoalesced={Interlocked.Exchange(ref _visualStatesCoalesced, 0)}");
             _sentBytes = 0;
             _receivedBytes = 0;
@@ -2431,9 +2466,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) && request.SceneId == _localSceneId &&
                     request.SceneEpoch == _localSceneEpoch)
-                {
-                    _fishDamageRequests.Enqueue(request);
-                }
+                    QueueFishDamageRequest(request);
             }
             return;
         }
@@ -2526,7 +2559,7 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence) &&
                     MatchesLocalWorld(request.SceneId, request.SceneEpoch))
-                    _pickupRequests.Enqueue(request);
+                    QueuePickupRequest(request);
             }
             return;
         }
@@ -3342,6 +3375,16 @@ internal sealed class UdpSession : IDisposable
         FailReliableDelivery("fish action request receive queue overflow");
     }
 
+    private void QueueFishDamageRequest(FishDamageRequest request)
+    {
+        if (HasDecodedQueueCapacity(_fishDamageRequests.Count, MaxPendingFishDamageRequests))
+        {
+            _fishDamageRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("fish damage request receive queue overflow");
+    }
+
     private void QueueFishLifecycle(FishLifecycle state)
     {
         if (HasDecodedQueueCapacity(_fishLifecycles.Count, MaxPendingFishLifecycles))
@@ -3380,6 +3423,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("fish loot completion receive queue overflow");
+    }
+
+    private void QueuePickupRequest(PickupRequest request)
+    {
+        if (HasDecodedQueueCapacity(_pickupRequests.Count, MaxPendingPickupRequests))
+        {
+            _pickupRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("pickup request receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
@@ -3455,6 +3508,8 @@ internal sealed class UdpSession : IDisposable
 
     private void FailReliableDelivery(string reason)
     {
+        if (reason.EndsWith(" receive queue overflow", System.StringComparison.Ordinal))
+            Interlocked.Increment(ref _reliableQueueOverflows);
         SignalPeerLoss(reason);
         ResetPeerState();
         if (_role == SessionRole.Host)
@@ -3621,6 +3676,7 @@ internal sealed class UdpSession : IDisposable
         Interlocked.Exchange(ref _incomingCapHits, 0);
         Interlocked.Exchange(ref _reliableRetries, 0);
         Interlocked.Exchange(ref _reliableExpired, 0);
+        Interlocked.Exchange(ref _reliableQueueOverflows, 0);
         Interlocked.Exchange(ref _visualStatesCoalesced, 0);
         _pendingReliable.Clear();
         _reliableBacklog.Clear();
