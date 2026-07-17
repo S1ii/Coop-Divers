@@ -58,6 +58,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingMissionRosters = 256;
     private const int MaxPendingDiveResultStates = 256;
     private const int MaxPendingTravelStates = 256;
+    private const int MaxPendingSushiResultStates = 256;
     private const int MaxFishHookPoses = 128;
 
     private sealed class ReliableReceiveWindow
@@ -359,6 +360,7 @@ internal sealed class UdpSession : IDisposable
         TestMissionRosterQueueOverflow();
         TestDiveResultStateQueueOverflow();
         TestTravelStateQueueOverflow();
+        TestSushiResultStateQueueOverflow();
         TestDiveReadyQueueOverflow();
         TestDiveExitRequestQueueOverflow();
         TestTravelReadyQueueOverflow();
@@ -1107,6 +1109,21 @@ internal sealed class UdpSession : IDisposable
         if (session._connected || !session._travelStates.IsEmpty ||
             session._peerLostReason != "travel state receive queue overflow")
             throw new InvalidOperationException("Travel state queue overflow self-test failed");
+    }
+
+    private static void TestSushiResultStateQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Client,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingSushiResultStates; index++)
+            session._sushiResultStates.Enqueue(default);
+        session.QueueSushiResultState(default);
+        if (session._connected || !session._sushiResultStates.IsEmpty ||
+            session._peerLostReason != "sushi result receive queue overflow")
+            throw new InvalidOperationException("Sushi result queue overflow self-test failed");
     }
 
     private static void TestTravelReadyQueueOverflow()
@@ -3155,7 +3172,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _sushiResultStates.Enqueue(state);
+                    QueueSushiResultState(state);
             }
             return;
         }
@@ -3856,6 +3873,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("travel state receive queue overflow");
+    }
+
+    private void QueueSushiResultState(SushiResultState state)
+    {
+        if (HasDecodedQueueCapacity(_sushiResultStates.Count, MaxPendingSushiResultStates))
+        {
+            _sushiResultStates.Enqueue(state);
+            return;
+        }
+        FailReliableDelivery("sushi result receive queue overflow");
     }
 
     private void QueueMissionState(MissionState state)
