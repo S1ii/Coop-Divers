@@ -76,7 +76,7 @@ internal sealed class IngredientsReplicator
             return;
         }
 
-        if (!_wasConnected && role == SessionRole.Client)
+        if (ShouldRequestInitialClientSnapshot(role, connected, _wasConnected))
             RequestClientSnapshot(session, now);
         _wasConnected = true;
 
@@ -87,6 +87,19 @@ internal sealed class IngredientsReplicator
     }
 
     internal void Clear() => ResetForRole(SessionRole.Offline);
+
+    internal static void SelfTest()
+    {
+        if (!ShouldRequestInitialClientSnapshot(SessionRole.Client, true, false) ||
+            ShouldRequestInitialClientSnapshot(SessionRole.Client, true, true) ||
+            ShouldRequestInitialClientSnapshot(SessionRole.Client, false, false) ||
+            ShouldRequestInitialClientSnapshot(SessionRole.Host, true, false))
+            throw new InvalidOperationException("Ingredients initial snapshot self-test failed");
+    }
+
+    private static bool ShouldRequestInitialClientSnapshot(
+        SessionRole role, bool connected, bool wasConnected) =>
+        role == SessionRole.Client && connected && !wasConnected;
 
     private void ResetForRole(SessionRole role)
     {

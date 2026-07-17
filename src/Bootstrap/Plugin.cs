@@ -42,6 +42,7 @@ public sealed class Plugin : BasePlugin
         PickupReplicator.SelfTest();
         RemoteCatchLedger.SelfTest();
         RemoteAvatar.SelfTest();
+        IngredientsReplicator.SelfTest();
         ManagerEventReplicator.SelfTest();
         NpcInteractionCoordinator.SelfTest();
         ProjectileVisualReplicator.SelfTest();

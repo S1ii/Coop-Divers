@@ -416,6 +416,10 @@ internal sealed class ManagerEventReplicator
             LaneOf(ManagerDomain.MainSushi) == LaneOf(ManagerDomain.SushiMenu) ||
             LaneOf(ManagerDomain.SushiMenu) == LaneOf(ManagerDomain.SushiWasabi) ||
             LaneOf(ManagerDomain.SushiWasabi) == LaneOf(ManagerDomain.SushiTable) ||
+            !ShouldPrimeSushiRuntimeSnapshot(SessionRole.Host, true, false) ||
+            ShouldPrimeSushiRuntimeSnapshot(SessionRole.Host, true, true) ||
+            ShouldPrimeSushiRuntimeSnapshot(SessionRole.Client, true, false) ||
+            ShouldPrimeSushiRuntimeSnapshot(SessionRole.Host, false, false) ||
             LaneOf(ManagerDomain.Story) == LaneOf(ManagerDomain.Day) ||
             DecideRestore(false, SessionRole.Offline, false, 0) != RestoreDecision.None ||
             DecideRestore(true, SessionRole.Offline, false, 1) != RestoreDecision.Retry ||
@@ -541,11 +545,14 @@ internal sealed class ManagerEventReplicator
         }
         if (!_wasConnected)
         {
-            _hostMenuSlots.Clear();
-            Array.Fill(_hostWasabi, -1);
+            if (ShouldPrimeSushiRuntimeSnapshot(role, connected, _wasConnected))
+            {
+                _hostMenuSlots.Clear();
+                Array.Fill(_hostWasabi, -1);
+                _nextSushiScan = 0f;
+            }
             Array.Fill(_hostWallet, -1);
             _hostUnlocks.Clear();
-            _nextSushiScan = 0f;
             _nextProgressionScan = 0f;
             _nextDayScan = 0f;
             _nextStoryScan = 0f;
@@ -640,6 +647,10 @@ internal sealed class ManagerEventReplicator
             }
         }
     }
+
+    private static bool ShouldPrimeSushiRuntimeSnapshot(
+        SessionRole role, bool connected, bool wasConnected) =>
+        role == SessionRole.Host && connected && !wasConnected;
 
     internal bool Intercept(
         SessionRole role,
