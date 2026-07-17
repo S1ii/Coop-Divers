@@ -18,6 +18,11 @@ internal enum SessionRole
 
 internal sealed class UdpSession : IDisposable
 {
+    private const int MaxIncomingDatagrams = 1024;
+    private const int MaxDatagramsPerUpdate = 128;
+    private const int MaxReliableAttempts = 12;
+    private const float ReliableExpirySeconds = 15f;
+
     private sealed class ReliableReceiveWindow
     {
         private const int Size = 1024;
@@ -74,8 +79,16 @@ internal sealed class UdpSession : IDisposable
     private sealed class PendingReliable
     {
         internal byte[] Packet;
+        internal float FirstSend;
         internal float NextSend;
         internal float RetryDelay;
+        internal int Attempts;
+    }
+
+    private sealed class QueuedReliable
+    {
+        internal byte[] Packet;
+        internal float EnqueuedAt;
     }
 
     private readonly ManualLogSource _log;
@@ -93,11 +106,13 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<FishLootGrant> _fishLootGrants = new();
     private readonly ConcurrentQueue<FishLootComplete> _fishLootCompletions = new();
     private readonly ConcurrentQueue<FishHookPose> _fishHookPoses = new();
-    private readonly ConcurrentQueue<PlayerVisualState> _playerVisualStates = new();
+    private PlayerVisualState _latestPlayerVisualState;
+    private bool _hasPlayerVisualState;
     private readonly Queue<int> _projectileVisualOrder = new();
     private readonly Dictionary<int, ProjectileVisualState> _projectileVisualStates = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
-    private readonly ConcurrentQueue<PickupRemoved> _pickupRequests = new();
+    private readonly ConcurrentQueue<PickupRequest> _pickupRequests = new();
+    private readonly ConcurrentQueue<PickupResult> _pickupResults = new();
     private readonly ConcurrentQueue<SceneTransitionCommand> _sceneTransitions = new();
     private readonly ConcurrentQueue<SceneSeed> _sceneSeeds = new();
     private readonly ConcurrentQueue<CargoState> _cargoStates = new();
@@ -129,7 +144,7 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<NpcInteraction> _npcInteractions = new();
     private readonly CancellationTokenSource _stop = new();
     private readonly Dictionary<uint, PendingReliable> _pendingReliable = new();
-    private readonly Queue<byte[]> _reliableBacklog = new();
+    private readonly Queue<QueuedReliable> _reliableBacklog = new();
     private readonly ReliableReceiveWindow _receivedReliable = new();
     private UdpClient _udp;
     private IPEndPoint _remote;
@@ -172,6 +187,12 @@ internal sealed class UdpSession : IDisposable
     private int _sentPackets;
     private int _receivedPackets;
     private float _nextTrafficLog;
+    private int _incomingCount;
+    private long _incomingDropped;
+    private long _incomingCapHits;
+    private long _reliableRetries;
+    private long _reliableExpired;
+    private long _visualStatesCoalesced;
 
     internal UdpSession(ManualLogSource log) => _log = log;
 
@@ -200,7 +221,27 @@ internal sealed class UdpSession : IDisposable
             IsFishDirectionAllowed(SessionRole.Client, PacketType.FishHookPose))
             throw new InvalidOperationException("Fish message direction self-test failed");
 
+        if (!ShouldAcceptIncoming(MaxIncomingDatagrams - 1) ||
+            ShouldAcceptIncoming(MaxIncomingDatagrams) ||
+            DatagramsToProcess(0) != 0 ||
+            DatagramsToProcess(MaxDatagramsPerUpdate + 1) != MaxDatagramsPerUpdate)
+            throw new InvalidOperationException("Incoming datagram cap self-test failed");
+        if (ShouldExpireReliable(MaxReliableAttempts - 1, 1f, 2f) ||
+            !ShouldExpireReliable(MaxReliableAttempts, 1f, 2f) ||
+            !ShouldExpireReliable(1, 1f, 1f + ReliableExpirySeconds) ||
+            ShouldExpireReliable(1, 2f, 1f))
+            throw new InvalidOperationException("Reliable expiry policy self-test failed");
+        if (ShouldExpireQueuedReliable(0f, 100f) ||
+            ShouldExpireQueuedReliable(2f, 1f) ||
+            !ShouldExpireQueuedReliable(1f, 1f + ReliableExpirySeconds))
+            throw new InvalidOperationException("Reliable backlog expiry self-test failed");
+        if (!WorldMatches(true, true, 11, 11, 8, 11, 8) ||
+            WorldMatches(true, true, 11, 11, 8, 11, 7) ||
+            WorldMatches(true, true, 11, 12, 8, 11, 8))
+            throw new InvalidOperationException("Scene epoch isolation self-test failed");
+
         TestProjectileVisualQueueLimit();
+        TestPlayerVisualCoalescing();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -224,6 +265,16 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Projectile visual coalescing self-test failed");
     }
 
+    private static void TestPlayerVisualCoalescing()
+    {
+        var session = new UdpSession(null);
+        session.EnqueuePlayerVisualState(default(PlayerVisualState) with { SceneId = 1 });
+        session.EnqueuePlayerVisualState(default(PlayerVisualState) with { SceneId = 2 });
+        if (!session.TryTakePlayerVisualState(out var state) || state.SceneId != 2 ||
+            session.TryTakePlayerVisualState(out _))
+            throw new InvalidOperationException("Player visual coalescing self-test failed");
+    }
+
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
@@ -245,6 +296,7 @@ internal sealed class UdpSession : IDisposable
 
     internal void SetLocalScene(uint sceneId)
     {
+        PrepareLocalWorldChange();
         _localSceneId = sceneId;
         _localSceneEpoch = _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
         if (_connected)
@@ -264,7 +316,7 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendPlayerVisualState(PlayerVisualState state)
     {
-        if (!_connected || !SceneMatches(state.SceneId) ||
+        if (!MatchesLocalWorld(state.SceneId, state.SceneEpoch) ||
             (_hasSentVisualState && _now < _lastVisualSend + 1f &&
              SameVisualState(_lastSentVisualState, state)))
             return;
@@ -274,12 +326,26 @@ internal sealed class UdpSession : IDisposable
         _hasSentVisualState = true;
     }
 
-    internal bool TryTakePlayerVisualState(out PlayerVisualState state) =>
-        _playerVisualStates.TryDequeue(out state);
+    internal bool TryTakePlayerVisualState(out PlayerVisualState state)
+    {
+        state = _latestPlayerVisualState;
+        if (!_hasPlayerVisualState)
+            return false;
+        _hasPlayerVisualState = false;
+        return true;
+    }
+
+    private void EnqueuePlayerVisualState(PlayerVisualState state)
+    {
+        if (_hasPlayerVisualState)
+            Interlocked.Increment(ref _visualStatesCoalesced);
+        _latestPlayerVisualState = state;
+        _hasPlayerVisualState = true;
+    }
 
     internal void SendProjectileVisualState(ProjectileVisualState state)
     {
-        if (_connected && SceneMatches(state.SceneId))
+        if (MatchesLocalWorld(state.SceneId, state.SceneEpoch))
             Send(Protocol.EncodeProjectileVisualState(++_sequence, state));
     }
 
@@ -454,7 +520,7 @@ internal sealed class UdpSession : IDisposable
 
     internal bool SendPickupRemoved(PickupRemoved removed)
     {
-        if (_role is (SessionRole.Host or SessionRole.Client) && SceneMatches(removed.SceneId))
+        if (_role == SessionRole.Host && MatchesLocalWorld(removed.SceneId, removed.SceneEpoch))
             return SendReliable(Protocol.EncodePickupRemoved(++_sequence, removed));
         return false;
     }
@@ -462,14 +528,25 @@ internal sealed class UdpSession : IDisposable
     internal bool TryTakePickupRemoved(out PickupRemoved removed) =>
         _pickupRemovals.TryDequeue(out removed);
 
-    internal void SendPickupRequest(PickupRemoved request)
+    internal bool SendPickupRequest(PickupRequest request)
     {
-        if (_role == SessionRole.Client && SceneMatches(request.SceneId))
-            SendReliable(Protocol.EncodePickupRequest(++_sequence, request));
+        if (_role == SessionRole.Client && MatchesRemoteWorld(request.SceneId, request.SceneEpoch))
+            return SendReliable(Protocol.EncodePickupRequest(++_sequence, request));
+        return false;
     }
 
-    internal bool TryTakePickupRequest(out PickupRemoved request) =>
+    internal bool TryTakePickupRequest(out PickupRequest request) =>
         _pickupRequests.TryDequeue(out request);
+
+    internal bool SendPickupResult(PickupResult result)
+    {
+        if (_role == SessionRole.Host && MatchesLocalWorld(result.SceneId, result.SceneEpoch))
+            return SendReliable(Protocol.EncodePickupResult(++_sequence, result));
+        return false;
+    }
+
+    internal bool TryTakePickupResult(out PickupResult result) =>
+        _pickupResults.TryDequeue(out result);
 
     internal void SendSceneTransition(SceneTransitionCommand command)
     {
@@ -689,7 +766,7 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendBossDamageRequest(BossDamageRequest request)
     {
-        if (_role == SessionRole.Client && _connected)
+        if (_role == SessionRole.Client && MatchesRemoteWorld(request.SceneId, request.SceneEpoch))
             SendReliable(Protocol.EncodeBossDamageRequest(++_sequence, request));
     }
 
@@ -698,7 +775,7 @@ internal sealed class UdpSession : IDisposable
 
     internal void SendBossState(BossState state)
     {
-        if (_role == SessionRole.Host && _connected)
+        if (_role == SessionRole.Host && MatchesLocalWorld(state.SceneId, state.SceneEpoch))
             Send(Protocol.EncodeBossState(++_sequence, state));
     }
 
@@ -812,8 +889,16 @@ internal sealed class UdpSession : IDisposable
         if (_udp == null)
             return;
 
-        while (_incoming.TryDequeue(out var received))
+        var processed = 0;
+        var processLimit = DatagramsToProcess(Volatile.Read(ref _incomingCount));
+        while (processed < processLimit && _incoming.TryDequeue(out var received))
+        {
+            Interlocked.Decrement(ref _incomingCount);
             Handle(received, now);
+            processed++;
+        }
+        if (processed == MaxDatagramsPerUpdate && Volatile.Read(ref _incomingCount) > 0)
+            Interlocked.Increment(ref _incomingCapHits);
 
         FlushReliableBacklog();
         RetryReliable(now);
@@ -826,7 +911,12 @@ internal sealed class UdpSession : IDisposable
             _log.LogDebug(
                 $"Network traffic: tx={_sentBytes / 10f:F0} B/s ({_sentPackets / 10f:F1} pps), " +
                 $"rx={_receivedBytes / 10f:F0} B/s ({_receivedPackets / 10f:F1} pps), " +
-                $"reliable={_pendingReliable.Count}, backlog={_reliableBacklog.Count}");
+                $"reliable={_pendingReliable.Count}, backlog={_reliableBacklog.Count}, " +
+                $"raw={Volatile.Read(ref _incomingCount)}, drops={Interlocked.Exchange(ref _incomingDropped, 0)}, " +
+                $"capHits={Interlocked.Exchange(ref _incomingCapHits, 0)}, " +
+                $"retries={Interlocked.Exchange(ref _reliableRetries, 0)}, " +
+                $"expired={Interlocked.Exchange(ref _reliableExpired, 0)}, " +
+                $"visualCoalesced={Interlocked.Exchange(ref _visualStatesCoalesced, 0)}");
             _sentBytes = 0;
             _receivedBytes = 0;
             _sentPackets = 0;
@@ -860,7 +950,20 @@ internal sealed class UdpSession : IDisposable
             {
                 try
                 {
-                    _incoming.Enqueue(await _udp.ReceiveAsync(_stop.Token));
+                    var received = await _udp.ReceiveAsync(_stop.Token);
+                    if (received.Buffer.Length > Protocol.MaxDatagramSize)
+                    {
+                        Interlocked.Increment(ref _incomingDropped);
+                        continue;
+                    }
+                    var queuedBefore = Interlocked.Increment(ref _incomingCount) - 1;
+                    if (!ShouldAcceptIncoming(queuedBefore))
+                    {
+                        Interlocked.Decrement(ref _incomingCount);
+                        Interlocked.Increment(ref _incomingDropped);
+                        continue;
+                    }
+                    _incoming.Enqueue(received);
                 }
                 catch (SocketException exception) when (
                     exception.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionRefused)
@@ -945,11 +1048,12 @@ internal sealed class UdpSession : IDisposable
         if (type == PacketType.PlayerVisualState)
         {
             if (_connected && Protocol.TryDecodePlayerVisualState(received.Buffer, out _, out var state) &&
+                MatchesRemoteWorld(state.SceneId, state.SceneEpoch) &&
                 IsNewer(sequence, _lastVisualSequence))
             {
                 _lastVisualSequence = sequence;
                 _lastReceive = now;
-                _playerVisualStates.Enqueue(state);
+                EnqueuePlayerVisualState(state);
             }
             return;
         }
@@ -957,6 +1061,7 @@ internal sealed class UdpSession : IDisposable
         if (type == PacketType.ProjectileVisualState)
         {
             if (_connected && Protocol.TryDecodeProjectileVisualState(received.Buffer, out _, out var state) &&
+                MatchesRemoteWorld(state.SceneId, state.SceneEpoch) &&
                 IsNewer(sequence, _lastProjectileVisualSequence))
             {
                 _lastProjectileVisualSequence = sequence;
@@ -978,9 +1083,7 @@ internal sealed class UdpSession : IDisposable
                     _lastSceneSequence = sceneSequence;
                     if (!_hasRemoteScene || _remoteSceneId != sceneId)
                         _log.LogInfo($"Network: peer scene {sceneId:X8}");
-                    _remoteSceneId = sceneId;
-                    _remoteSceneEpoch = sceneEpoch;
-                    _hasRemoteScene = true;
+                    SetRemoteWorld(sceneId, sceneEpoch);
                 }
             }
             return;
@@ -1184,14 +1287,13 @@ internal sealed class UdpSession : IDisposable
 
         if (type == PacketType.PickupRemoved)
         {
-            if (_connected && _role is (SessionRole.Host or SessionRole.Client) &&
+            if (_connected && _role == SessionRole.Client &&
                 Protocol.TryDecodePickupRemoved(received.Buffer, out _, out var removed))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
-                {
+                if (AcceptReliable(sequence) &&
+                    MatchesRemoteWorld(removed.SceneId, removed.SceneEpoch))
                     _pickupRemovals.Enqueue(removed);
-                }
             }
             return;
         }
@@ -1202,10 +1304,22 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodePickupRequest(received.Buffer, out _, out var request))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
-                {
+                if (AcceptReliable(sequence) &&
+                    MatchesLocalWorld(request.SceneId, request.SceneEpoch))
                     _pickupRequests.Enqueue(request);
-                }
+            }
+            return;
+        }
+
+        if (type == PacketType.PickupResult)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodePickupResult(received.Buffer, out _, out var result))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence) &&
+                    MatchesRemoteWorld(result.SceneId, result.SceneEpoch))
+                    _pickupResults.Enqueue(result);
             }
             return;
         }
@@ -1488,7 +1602,8 @@ internal sealed class UdpSession : IDisposable
                 Protocol.TryDecodeBossDamageRequest(received.Buffer, out _, out var request))
             {
                 _lastReceive = now;
-                if (AcceptReliable(sequence))
+                if (AcceptReliable(sequence) &&
+                    MatchesLocalWorld(request.SceneId, request.SceneEpoch))
                     _bossDamageRequests.Enqueue(request);
             }
             return;
@@ -1497,7 +1612,8 @@ internal sealed class UdpSession : IDisposable
         if (type == PacketType.BossState)
         {
             if (_connected && _role == SessionRole.Client &&
-                Protocol.TryDecodeBossState(received.Buffer, out _, out var state))
+                Protocol.TryDecodeBossState(received.Buffer, out _, out var state) &&
+                MatchesRemoteWorld(state.SceneId, state.SceneEpoch))
             {
                 _lastReceive = now;
                 _bossStates.Enqueue(state);
@@ -1604,8 +1720,134 @@ internal sealed class UdpSession : IDisposable
             Send(Protocol.EncodeSceneState(++_sequence, _localSceneId, _localSceneEpoch));
     }
 
-    private void AdvanceLocalSceneEpoch() =>
+    private void AdvanceLocalSceneEpoch()
+    {
+        PrepareLocalWorldChange();
         _localSceneEpoch = _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
+    }
+
+    private void PrepareLocalWorldChange()
+    {
+        _lastSentSnapshot = default;
+        _lastSentVisualState = default;
+        _hasSentSnapshot = false;
+        _hasSentVisualState = false;
+        _hasRemoteScene = false;
+        ClearRemoteWorldState();
+        ClearLocalWorldRequests();
+    }
+
+    private bool MatchesLocalWorld(uint sceneId, uint sceneEpoch) =>
+        WorldMatches(_connected, _hasRemoteScene, _localSceneId, _remoteSceneId,
+            _localSceneEpoch, sceneId, sceneEpoch);
+
+    private bool MatchesRemoteWorld(uint sceneId, uint sceneEpoch) =>
+        WorldMatches(_connected, _hasRemoteScene, _localSceneId, _remoteSceneId,
+            _remoteSceneEpoch, sceneId, sceneEpoch);
+
+    private static bool WorldMatches(
+        bool connected,
+        bool hasRemoteScene,
+        uint localSceneId,
+        uint remoteSceneId,
+        uint expectedEpoch,
+        uint sceneId,
+        uint sceneEpoch) =>
+        connected && hasRemoteScene && sceneId != 0 && sceneEpoch != 0 &&
+        sceneId == localSceneId && sceneId == remoteSceneId && sceneEpoch == expectedEpoch;
+
+    private void SetRemoteWorld(uint sceneId, uint sceneEpoch)
+    {
+        if (!_hasRemoteScene || _remoteSceneId != sceneId || _remoteSceneEpoch != sceneEpoch)
+            ClearRemoteWorldState();
+        _remoteSceneId = sceneId;
+        _remoteSceneEpoch = sceneEpoch;
+        _hasRemoteScene = true;
+    }
+
+    private void ClearRemoteWorldState()
+    {
+        _snapshot = default;
+        _hasSnapshot = false;
+        _hasRemotePlayerState = false;
+        _lastSnapshotReceive = 0f;
+        _latestPlayerVisualState = default;
+        _hasPlayerVisualState = false;
+        _projectileVisualOrder.Clear();
+        _projectileVisualStates.Clear();
+        _lastVisualSequence = 0;
+        _lastProjectileVisualSequence = 0;
+        while (_fishSnapshots.TryDequeue(out _))
+        {
+        }
+        while (_fishDamageRequests.TryDequeue(out _))
+        {
+        }
+        while (_fishPickupRequests.TryDequeue(out _))
+        {
+        }
+        while (_fishPickupResults.TryDequeue(out _))
+        {
+        }
+        while (_fishRemovals.TryDequeue(out _))
+        {
+        }
+        while (_fishManifests.TryDequeue(out _))
+        {
+        }
+        while (_fishManifestStates.TryDequeue(out _))
+        {
+        }
+        while (_fishLifecycles.TryDequeue(out _))
+        {
+        }
+        while (_fishActionRequests.TryDequeue(out _))
+        {
+        }
+        while (_fishActionAcks.TryDequeue(out _))
+        {
+        }
+        while (_fishLootGrants.TryDequeue(out _))
+        {
+        }
+        while (_fishLootCompletions.TryDequeue(out _))
+        {
+        }
+        while (_fishHookPoses.TryDequeue(out _))
+        {
+        }
+        while (_pickupRemovals.TryDequeue(out _))
+        {
+        }
+        while (_pickupRequests.TryDequeue(out _))
+        {
+        }
+        while (_pickupResults.TryDequeue(out _))
+        {
+        }
+        while (_bossDamageRequests.TryDequeue(out _))
+        {
+        }
+        while (_bossStates.TryDequeue(out _))
+        {
+        }
+        while (_npcInteractions.TryDequeue(out _))
+        {
+        }
+    }
+
+    private void ClearLocalWorldRequests()
+    {
+        while (_pickupRequests.TryDequeue(out _))
+        {
+        }
+        while (_pickupResults.TryDequeue(out _))
+        {
+        }
+        while (_bossDamageRequests.TryDequeue(out _))
+        {
+        }
+    }
 
     private void Send(byte[] packet)
     {
@@ -1635,7 +1877,11 @@ internal sealed class UdpSession : IDisposable
                 _log.LogWarning("Network reliable backlog is full");
                 return false;
             }
-            _reliableBacklog.Enqueue(packet);
+            _reliableBacklog.Enqueue(new QueuedReliable
+            {
+                Packet = packet,
+                EnqueuedAt = _now
+            });
             return true;
         }
         TrackReliable(packet, sequence);
@@ -1647,9 +1893,15 @@ internal sealed class UdpSession : IDisposable
         while (_connected && _pendingReliable.Count < 256 &&
                _reliableBacklog.Count > 0)
         {
-            var packet = _reliableBacklog.Dequeue();
-            if (Protocol.TryDecode(packet, out _, out var sequence))
-                TrackReliable(packet, sequence);
+            var queued = _reliableBacklog.Peek();
+            if (ShouldExpireQueuedReliable(queued.EnqueuedAt, _now))
+            {
+                FailReliableDelivery("reliable backlog expired");
+                return;
+            }
+            _reliableBacklog.Dequeue();
+            if (Protocol.TryDecode(queued.Packet, out _, out var sequence))
+                TrackReliable(queued.Packet, sequence);
         }
     }
 
@@ -1658,8 +1910,10 @@ internal sealed class UdpSession : IDisposable
         _pendingReliable[sequence] = new PendingReliable
         {
             Packet = packet,
+            FirstSend = _now,
             NextSend = _now + 0.1f,
-            RetryDelay = 0.1f
+            RetryDelay = 0.1f,
+            Attempts = 1
         };
         Send(packet);
     }
@@ -1668,14 +1922,29 @@ internal sealed class UdpSession : IDisposable
     {
         if (!_connected)
             return;
-        foreach (var pending in _pendingReliable.Values)
+        List<uint> expired = null;
+        foreach (var pair in _pendingReliable)
         {
+            var pending = pair.Value;
+            if (ShouldExpireReliable(pending.Attempts, pending.FirstSend, now))
+            {
+                (expired ??= new List<uint>()).Add(pair.Key);
+                continue;
+            }
             if (now < pending.NextSend)
                 continue;
             Send(pending.Packet);
+            pending.Attempts++;
+            Interlocked.Increment(ref _reliableRetries);
             pending.RetryDelay = Math.Min(1f, pending.RetryDelay * 2f);
             pending.NextSend = now + pending.RetryDelay;
         }
+        if (expired == null)
+            return;
+        foreach (var sequence in expired)
+            if (_pendingReliable.Remove(sequence))
+                Interlocked.Increment(ref _reliableExpired);
+        FailReliableDelivery("reliable delivery expired");
     }
 
     private bool AcceptReliable(uint sequence)
@@ -1686,6 +1955,27 @@ internal sealed class UdpSession : IDisposable
 
     private static bool IsNewer(uint sequence, uint previous) =>
         unchecked((int)(sequence - previous)) > 0;
+
+    private static bool ShouldAcceptIncoming(int queued) => queued < MaxIncomingDatagrams;
+
+    private static int DatagramsToProcess(int queued) =>
+        Math.Clamp(queued, 0, MaxDatagramsPerUpdate);
+
+    private static bool ShouldExpireReliable(int attempts, float firstSend, float now) =>
+        attempts >= MaxReliableAttempts ||
+        now >= firstSend && now - firstSend >= ReliableExpirySeconds;
+
+    private static bool ShouldExpireQueuedReliable(float enqueuedAt, float now) =>
+        enqueuedAt > 0f && now >= enqueuedAt && now - enqueuedAt >= ReliableExpirySeconds;
+
+    private void FailReliableDelivery(string reason)
+    {
+        SignalPeerLoss(reason);
+        ResetPeerState();
+        if (_role == SessionRole.Host)
+            _remote = null;
+        _log.LogWarning($"Network: {reason}; peer session reset");
+    }
 
     private static bool IsFishDirectionAllowed(SessionRole receiver, PacketType type) =>
         receiver == SessionRole.Client && type is PacketType.FishLifecycle or
@@ -1710,7 +2000,7 @@ internal sealed class UdpSession : IDisposable
 
     private static bool SameVisualState(PlayerVisualState left, PlayerVisualState right)
     {
-        if (left.SceneId != right.SceneId)
+        if (left.SceneId != right.SceneId || left.SceneEpoch != right.SceneEpoch)
             return false;
         var leftSprites = left.Sprites ?? Array.Empty<VisualSprite>();
         var rightSprites = right.Sprites ?? Array.Empty<VisualSprite>();
@@ -1738,12 +2028,13 @@ internal sealed class UdpSession : IDisposable
         _lastSceneSequence = 0;
         if (_role == SessionRole.Host)
             _sessionId = 0;
+        while (_incoming.TryDequeue(out _))
+            Interlocked.Decrement(ref _incomingCount);
         while (_fishSnapshots.TryDequeue(out _))
         {
         }
-        while (_playerVisualStates.TryDequeue(out _))
-        {
-        }
+        _latestPlayerVisualState = default;
+        _hasPlayerVisualState = false;
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         while (_fishDamageRequests.TryDequeue(out _))
@@ -1818,6 +2109,11 @@ internal sealed class UdpSession : IDisposable
         _sentPackets = 0;
         _receivedPackets = 0;
         _nextTrafficLog = 0f;
+        Interlocked.Exchange(ref _incomingDropped, 0);
+        Interlocked.Exchange(ref _incomingCapHits, 0);
+        Interlocked.Exchange(ref _reliableRetries, 0);
+        Interlocked.Exchange(ref _reliableExpired, 0);
+        Interlocked.Exchange(ref _visualStatesCoalesced, 0);
         _pendingReliable.Clear();
         _reliableBacklog.Clear();
         _receivedReliable.Clear();

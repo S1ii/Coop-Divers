@@ -32,6 +32,9 @@ internal sealed class BossReplicator
     private float _nextSend;
     private uint _tick;
     private bool _applyingClientState;
+    private uint _activeSceneId;
+    private uint _activeSceneEpoch;
+    private SessionRole _activeRole;
 
     internal BossReplicator(ManualLogSource log) => _log = log;
 
@@ -44,6 +47,17 @@ internal sealed class BossReplicator
     {
         if (session == null || !session.Connected || !session.SceneMatches(sceneId))
             return;
+
+        var activeEpoch = role == SessionRole.Host
+            ? session.LocalSceneEpoch
+            : session.RemoteSceneEpoch;
+        if (_activeSceneId != sceneId || _activeSceneEpoch != activeEpoch || _activeRole != role)
+        {
+            Clear();
+            _activeSceneId = sceneId;
+            _activeSceneEpoch = activeEpoch;
+            _activeRole = role;
+        }
 
         if (role == SessionRole.Host)
         {
@@ -66,7 +80,8 @@ internal sealed class BossReplicator
             return;
         while (session.TryTakeBossState(out var state))
         {
-            if (state.SceneId != sceneId)
+            if (state.SceneId != sceneId ||
+                state.SceneEpoch != session.RemoteSceneEpoch)
                 continue;
             if (_pendingClientStates.TryGetValue(state.BossId, out var pending) &&
                 !IsNewer(state.Tick, pending.Tick))
@@ -101,7 +116,8 @@ internal sealed class BossReplicator
                 continue;
             if (hp < target.AuthoritativeHp)
                 session.SendBossDamageRequest(new BossDamageRequest(
-                    sceneId, pair.Key, Math.Clamp(target.AuthoritativeHp - hp, 1, 10_000),
+                    sceneId, session.RemoteSceneEpoch, pair.Key,
+                    Math.Clamp(target.AuthoritativeHp - hp, 1, 10_000),
                     0, (int)AttackType.Player_All));
             return false;
         }
@@ -134,6 +150,9 @@ internal sealed class BossReplicator
         _nextScan = 0f;
         _nextSend = 0f;
         _tick = 0;
+        _activeSceneId = 0;
+        _activeSceneEpoch = 0;
+        _activeRole = SessionRole.Offline;
     }
 
     private void ScanHost(uint sceneId)
@@ -180,7 +199,8 @@ internal sealed class BossReplicator
         float now,
         BossDamageRequest request)
     {
-        if (request.SceneId != sceneId || !_hostBosses.TryGetValue(request.BossId, out var boss) ||
+        if (request.SceneId != sceneId || request.SceneEpoch != session.LocalSceneEpoch ||
+            !_hostBosses.TryGetValue(request.BossId, out var boss) ||
             boss == null || !FishReplicator.IsPlayerAttack((AttackType)request.AttackType) ||
             !session.TryGetFreshRemotePlayerSnapshot(now, 0.75f, out var player) ||
             player.SceneId != sceneId || !InRange(boss.transform.position, player, 3600f))
@@ -226,7 +246,8 @@ internal sealed class BossReplicator
                 animationTime = Mathf.Repeat(animation.normalizedTime, 1f);
             }
             var state = new BossState(
-                sceneId, _tick, pair.Key, Math.Max(0, boss.fishID), hp, maxHp,
+                sceneId, session.LocalSceneEpoch, _tick, pair.Key,
+                Math.Max(0, boss.fishID), hp, maxHp,
                 position.x, position.y, position.z,
                 animationHash, animationTime,
                 hp == 0 || boss.IsDeadBoss() ? (byte)1 : (byte)0);
@@ -273,6 +294,7 @@ internal sealed class BossReplicator
     }
 
     private static bool Same(BossState left, BossState right) =>
+        left.SceneId == right.SceneId && left.SceneEpoch == right.SceneEpoch &&
         left.BossId == right.BossId && left.FishId == right.FishId &&
         left.CurrentHp == right.CurrentHp && left.MaxHp == right.MaxHp && left.Flags == right.Flags &&
         left.AnimationHash == right.AnimationHash &&

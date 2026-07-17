@@ -38,6 +38,7 @@ internal sealed class ProjectileVisualReplicator
     private Material _ropeMaterial;
     private float _nextSend;
     private bool _resourcesScanned;
+    private uint _remoteSceneEpoch;
 
     internal static void SelfTest()
     {
@@ -79,6 +80,12 @@ internal sealed class ProjectileVisualReplicator
         if (session == null)
             return;
 
+        if (_remoteSceneEpoch != session.RemoteSceneEpoch)
+        {
+            ClearRemote();
+            _remoteSceneEpoch = session.RemoteSceneEpoch;
+        }
+
         if (session.SceneMatches(sceneId))
         {
             if (now >= _nextSend)
@@ -87,7 +94,9 @@ internal sealed class ProjectileVisualReplicator
                 _staleIds.Clear();
                 foreach (var pair in _local)
                 {
-                    if (!TryCapture(sceneId, pair.Key, pair.Value, out var state))
+                    if (!TryCapture(
+                            sceneId, session.LocalSceneEpoch,
+                            pair.Key, pair.Value, out var state))
                     {
                         _staleIds.Add(pair.Key);
                         continue;
@@ -100,7 +109,8 @@ internal sealed class ProjectileVisualReplicator
 
             while (session.TryTakeProjectileVisualState(out var state))
             {
-                if (state.SceneId == sceneId)
+                if (state.SceneId == sceneId &&
+                    state.SceneEpoch == session.RemoteSceneEpoch)
                     Apply(state, now);
             }
         }
@@ -123,6 +133,15 @@ internal sealed class ProjectileVisualReplicator
         _local.Clear();
         _nextSend = 0f;
         _staleIds.Clear();
+        ClearRemote();
+        _remoteSceneEpoch = 0;
+        if (_ropeMaterial != null)
+            UnityEngine.Object.Destroy(_ropeMaterial);
+        _ropeMaterial = null;
+    }
+
+    private void ClearRemote()
+    {
         foreach (var remote in _remote.Values)
             if (remote.Root != null)
                 UnityEngine.Object.Destroy(remote.Root);
@@ -133,9 +152,6 @@ internal sealed class ProjectileVisualReplicator
             if (draining != null)
                 UnityEngine.Object.Destroy(draining);
         }
-        if (_ropeMaterial != null)
-            UnityEngine.Object.Destroy(_ropeMaterial);
-        _ropeMaterial = null;
     }
 
     private void Apply(ProjectileVisualState state, float now)
@@ -407,6 +423,7 @@ internal sealed class ProjectileVisualReplicator
 
     private static bool TryCapture(
         uint sceneId,
+        uint sceneEpoch,
         int id,
         Component projectile,
         out ProjectileVisualState state)
@@ -437,7 +454,7 @@ internal sealed class ProjectileVisualReplicator
             }
         }
         state = new ProjectileVisualState(
-            sceneId, id, Protocol.SceneId(renderer.sprite.name),
+            sceneId, sceneEpoch, id, Protocol.SceneId(renderer.sprite.name),
             renderer.transform.position.x, renderer.transform.position.y, renderer.transform.position.z,
             visual.Rotation, visual.ScaleX, visual.ScaleY,
             renderer.sortingLayerID, renderer.sortingOrder, visual.Flipped,

@@ -190,7 +190,8 @@ internal sealed class RemoteAvatar : IDisposable
         return null;
     }
 
-    internal static PlayerVisualState CaptureVisualState(uint sceneId, Component player)
+    internal static PlayerVisualState CaptureVisualState(
+        uint sceneId, uint sceneEpoch, Component player)
     {
         var sprites = new List<VisualSprite>();
         var root = player.transform;
@@ -217,7 +218,7 @@ internal sealed class RemoteAvatar : IDisposable
             if (sprites.Count == Protocol.MaxVisualSprites)
                 break;
         }
-        return new PlayerVisualState(sceneId, sprites.ToArray());
+        return new PlayerVisualState(sceneId, sceneEpoch, sprites.ToArray());
     }
 
     internal static VisibleTransform CaptureVisibleTransform(SpriteRenderer renderer)

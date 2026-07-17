@@ -58,7 +58,8 @@ internal enum PacketType : byte
     FishLootComplete = 52,
     FishHookPose = 53,
     SaveSnapshotChunk = 54,
-    SaveSnapshotAck = 55
+    SaveSnapshotAck = 55,
+    PickupResult = 56
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -88,10 +89,14 @@ internal readonly record struct VisualSprite(
     bool FlipX,
     bool FlipY);
 
-internal readonly record struct PlayerVisualState(uint SceneId, VisualSprite[] Sprites);
+internal readonly record struct PlayerVisualState(
+    uint SceneId,
+    uint SceneEpoch,
+    VisualSprite[] Sprites);
 
 internal readonly record struct ProjectileVisualState(
     uint SceneId,
+    uint SceneEpoch,
     int Id,
     uint SpriteId,
     float X,
@@ -300,8 +305,42 @@ internal readonly record struct SaveSnapshotAck(
 
 internal readonly record struct PickupRemoved(
     uint SceneId,
+    uint SceneEpoch,
     uint WorldId,
     int ItemId);
+
+internal readonly record struct PickupRequest(
+    ulong RequestId,
+    uint SceneId,
+    uint SceneEpoch,
+    uint WorldId,
+    int ItemId,
+    uint KnownRevision,
+    float ExpectedX,
+    float ExpectedY);
+
+internal enum PickupRejectReason : byte
+{
+    None,
+    SceneMismatch,
+    StalePose,
+    MissingEntity,
+    ItemMismatch,
+    StaleRevision,
+    OutOfRange,
+    AlreadyClaimed,
+    InternalError
+}
+
+internal readonly record struct PickupResult(
+    ulong RequestId,
+    uint SceneId,
+    uint SceneEpoch,
+    uint WorldId,
+    int ItemId,
+    uint Revision,
+    bool Accepted,
+    PickupRejectReason RejectReason);
 
 internal readonly record struct SceneTransitionCommand(
     string SceneName,
@@ -422,12 +461,14 @@ internal readonly record struct WorldFlagRequest(string Key, bool Value);
 internal readonly record struct WorldFlagState(uint Revision, string Key, bool Value);
 internal readonly record struct BossDamageRequest(
     uint SceneId,
+    uint SceneEpoch,
     uint BossId,
     int Damage,
     int Element,
     int AttackType);
 internal readonly record struct BossState(
     uint SceneId,
+    uint SceneEpoch,
     uint Tick,
     uint BossId,
     int FishId,
@@ -482,16 +523,16 @@ internal static class Protocol
     private const byte Version = 42;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
-    private const int VisualStateFixedSize = HeaderSize + 5;
+    private const int VisualStateFixedSize = HeaderSize + 9;
     private const int VisualSpriteSize = 38;
-    private const int ProjectileVisualStateSize = HeaderSize + 70;
+    private const int ProjectileVisualStateSize = HeaderSize + 74;
     internal const int MaxVisualSprites = 16;
     private const int FishSnapshotBatchFixedSize = HeaderSize + 13;
     private const int FishSnapshotCompactEntrySize = 26;
     private const int FishSnapshotFullEntrySize = 38;
     private const int FishDamageRequestSize = HeaderSize + 28;
-    private const int BossDamageRequestSize = HeaderSize + 20;
-    private const int BossStateSize = HeaderSize + 45;
+    private const int BossDamageRequestSize = HeaderSize + 24;
+    private const int BossStateSize = HeaderSize + 49;
     private const int ManagerEventSize = HeaderSize + 22;
     private const int SushiResultStateSize = HeaderSize + 28;
     private const int FishPickupRequestSize = HeaderSize + 16;
@@ -509,7 +550,9 @@ internal static class Protocol
     private const int FishHookPoseFullSize = FishHookPoseFixedSize + 24;
     private const int SaveSnapshotChunkFixedSize = HeaderSize + 22;
     private const int SaveSnapshotAckSize = HeaderSize + 13;
-    private const int PickupRemovedSize = HeaderSize + 12;
+    private const int PickupRemovedSize = HeaderSize + 16;
+    private const int PickupRequestSize = HeaderSize + 36;
+    private const int PickupResultSize = HeaderSize + 30;
     private const int IngredientsSyncRequestSize = HeaderSize + 8;
     private const int IngredientsSnapshotChunkFixedSize = HeaderSize + 26;
     private const int IngredientsDeltaFixedSize = HeaderSize + 18;
@@ -657,12 +700,13 @@ internal static class Protocol
     internal static byte[] EncodePlayerVisualState(uint sequence, PlayerVisualState state)
     {
         var sprites = state.Sprites ?? Array.Empty<VisualSprite>();
-        if (state.SceneId == 0 || sprites.Length > MaxVisualSprites)
+        if (state.SceneId == 0 || state.SceneEpoch == 0 || sprites.Length > MaxVisualSprites)
             throw new ArgumentOutOfRangeException(nameof(state));
         var packet = new byte[VisualStateFixedSize + sprites.Length * VisualSpriteSize];
         WriteHeader(packet, PacketType.PlayerVisualState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
-        packet[HeaderSize + 4] = (byte)sprites.Length;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        packet[HeaderSize + 8] = (byte)sprites.Length;
         for (var index = 0; index < sprites.Length; index++)
         {
             var sprite = sprites[index];
@@ -694,11 +738,12 @@ internal static class Protocol
         if (packet.Length < VisualStateFixedSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.PlayerVisualState)
             return false;
-        var count = packet[HeaderSize + 4];
+        var count = packet[HeaderSize + 8];
         if (count > MaxVisualSprites || packet.Length != VisualStateFixedSize + count * VisualSpriteSize)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        if (sceneId == 0)
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        if (sceneId == 0 || sceneEpoch == 0)
             return false;
         var sprites = new VisualSprite[count];
         for (var index = 0; index < count; index++)
@@ -722,7 +767,7 @@ internal static class Protocol
                 return false;
             sprites[index] = sprite;
         }
-        state = new PlayerVisualState(sceneId, sprites);
+        state = new PlayerVisualState(sceneId, sceneEpoch, sprites);
         return true;
     }
 
@@ -733,24 +778,25 @@ internal static class Protocol
         var packet = new byte[ProjectileVisualStateSize];
         WriteHeader(packet, PacketType.ProjectileVisualState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Id);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.SpriteId);
-        WriteSingle(packet.AsSpan(HeaderSize + 12), state.X);
-        WriteSingle(packet.AsSpan(HeaderSize + 16), state.Y);
-        WriteSingle(packet.AsSpan(HeaderSize + 20), state.Z);
-        WriteSingle(packet.AsSpan(HeaderSize + 24), state.Rotation);
-        WriteSingle(packet.AsSpan(HeaderSize + 28), state.ScaleX);
-        WriteSingle(packet.AsSpan(HeaderSize + 32), state.ScaleY);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 36), state.SortingLayerId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 40), state.SortingOrder);
-        packet[HeaderSize + 44] = state.Flipped ? (byte)1 : (byte)0;
-        packet[HeaderSize + 45] = state.HasRope ? (byte)1 : (byte)0;
-        WriteSingle(packet.AsSpan(HeaderSize + 46), state.RopeStartX);
-        WriteSingle(packet.AsSpan(HeaderSize + 50), state.RopeStartY);
-        WriteSingle(packet.AsSpan(HeaderSize + 54), state.RopeStartZ);
-        WriteSingle(packet.AsSpan(HeaderSize + 58), state.RopeEndX);
-        WriteSingle(packet.AsSpan(HeaderSize + 62), state.RopeEndY);
-        WriteSingle(packet.AsSpan(HeaderSize + 66), state.RopeEndZ);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Id);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.SpriteId);
+        WriteSingle(packet.AsSpan(HeaderSize + 16), state.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 20), state.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 24), state.Z);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), state.Rotation);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), state.ScaleX);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), state.ScaleY);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 40), state.SortingLayerId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 44), state.SortingOrder);
+        packet[HeaderSize + 48] = state.Flipped ? (byte)1 : (byte)0;
+        packet[HeaderSize + 49] = state.HasRope ? (byte)1 : (byte)0;
+        WriteSingle(packet.AsSpan(HeaderSize + 50), state.RopeStartX);
+        WriteSingle(packet.AsSpan(HeaderSize + 54), state.RopeStartY);
+        WriteSingle(packet.AsSpan(HeaderSize + 58), state.RopeStartZ);
+        WriteSingle(packet.AsSpan(HeaderSize + 62), state.RopeEndX);
+        WriteSingle(packet.AsSpan(HeaderSize + 66), state.RopeEndY);
+        WriteSingle(packet.AsSpan(HeaderSize + 70), state.RopeEndZ);
         return packet;
     }
 
@@ -763,28 +809,29 @@ internal static class Protocol
         state = default;
         if (packet.Length != ProjectileVisualStateSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.ProjectileVisualState ||
-            packet[HeaderSize + 44] > 1 || packet[HeaderSize + 45] > 1)
+            packet[HeaderSize + 48] > 1 || packet[HeaderSize + 49] > 1)
             return false;
         var candidate = new ProjectileVisualState(
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 4)),
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
-            ReadSingle(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
             ReadSingle(packet.Slice(HeaderSize + 16)),
             ReadSingle(packet.Slice(HeaderSize + 20)),
             ReadSingle(packet.Slice(HeaderSize + 24)),
             ReadSingle(packet.Slice(HeaderSize + 28)),
             ReadSingle(packet.Slice(HeaderSize + 32)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 36)),
+            ReadSingle(packet.Slice(HeaderSize + 36)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 40)),
-            packet[HeaderSize + 44] != 0,
-            packet[HeaderSize + 45] != 0,
-            ReadSingle(packet.Slice(HeaderSize + 46)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 44)),
+            packet[HeaderSize + 48] != 0,
+            packet[HeaderSize + 49] != 0,
             ReadSingle(packet.Slice(HeaderSize + 50)),
             ReadSingle(packet.Slice(HeaderSize + 54)),
             ReadSingle(packet.Slice(HeaderSize + 58)),
             ReadSingle(packet.Slice(HeaderSize + 62)),
-            ReadSingle(packet.Slice(HeaderSize + 66)));
+            ReadSingle(packet.Slice(HeaderSize + 66)),
+            ReadSingle(packet.Slice(HeaderSize + 70)));
         if (!IsValidProjectileVisualState(candidate))
             return false;
         state = candidate;
@@ -1197,17 +1244,18 @@ internal static class Protocol
 
     internal static byte[] EncodeBossDamageRequest(uint sequence, BossDamageRequest request)
     {
-        if (request.SceneId == 0 || request.BossId == 0 ||
+        if (request.SceneId == 0 || request.SceneEpoch == 0 || request.BossId == 0 ||
             request.Damage is < 1 or > 10_000 || request.Element is < 0 or > 32 ||
             request.AttackType is < 0 or > 64)
             throw new ArgumentOutOfRangeException(nameof(request));
         var packet = new byte[BossDamageRequestSize];
         WriteHeader(packet, PacketType.BossDamageRequest, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), request.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.BossId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.Damage);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Element);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.AttackType);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), request.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.BossId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.Damage);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.Element);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.AttackType);
         return packet;
     }
 
@@ -1222,14 +1270,15 @@ internal static class Protocol
             !TryDecode(packet, out var type, out sequence) || type != PacketType.BossDamageRequest)
             return false;
         var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
-        var bossId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
-        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
-        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
-        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
-        if (sceneId == 0 || bossId == 0 || damage is < 1 or > 10_000 ||
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var bossId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var damage = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
+        var element = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16));
+        var attackType = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20));
+        if (sceneId == 0 || sceneEpoch == 0 || bossId == 0 || damage is < 1 or > 10_000 ||
             element is < 0 or > 32 || attackType is < 0 or > 64)
             return false;
-        request = new BossDamageRequest(sceneId, bossId, damage, element, attackType);
+        request = new BossDamageRequest(sceneId, sceneEpoch, bossId, damage, element, attackType);
         return true;
     }
 
@@ -1240,17 +1289,18 @@ internal static class Protocol
         var packet = new byte[BossStateSize];
         WriteHeader(packet, PacketType.BossState, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), state.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.Tick);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.BossId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.FishId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), state.CurrentHp);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), state.MaxHp);
-        WriteSingle(packet.AsSpan(HeaderSize + 24), state.X);
-        WriteSingle(packet.AsSpan(HeaderSize + 28), state.Y);
-        WriteSingle(packet.AsSpan(HeaderSize + 32), state.Z);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 36), state.AnimationHash);
-        WriteSingle(packet.AsSpan(HeaderSize + 40), state.AnimationTime);
-        packet[HeaderSize + 44] = state.Flags;
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), state.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Tick);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), state.BossId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 16), state.FishId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), state.CurrentHp);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 24), state.MaxHp);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), state.X);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), state.Y);
+        WriteSingle(packet.AsSpan(HeaderSize + 36), state.Z);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 40), state.AnimationHash);
+        WriteSingle(packet.AsSpan(HeaderSize + 44), state.AnimationTime);
+        packet[HeaderSize + 48] = state.Flags;
         return packet;
     }
 
@@ -1268,15 +1318,16 @@ internal static class Protocol
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 16)),
             BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
-            ReadSingle(packet.Slice(HeaderSize + 24)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 24)),
             ReadSingle(packet.Slice(HeaderSize + 28)),
             ReadSingle(packet.Slice(HeaderSize + 32)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 36)),
-            ReadSingle(packet.Slice(HeaderSize + 40)),
-            packet[HeaderSize + 44]);
+            ReadSingle(packet.Slice(HeaderSize + 36)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 40)),
+            ReadSingle(packet.Slice(HeaderSize + 44)),
+            packet[HeaderSize + 48]);
         if (!IsValidBossState(state))
         {
             state = default;
@@ -1286,7 +1337,8 @@ internal static class Protocol
     }
 
     private static bool IsValidBossState(BossState state) =>
-        state.SceneId != 0 && state.Tick != 0 && state.BossId != 0 && state.FishId >= 0 &&
+        state.SceneId != 0 && state.SceneEpoch != 0 && state.Tick != 0 &&
+        state.BossId != 0 && state.FishId >= 0 &&
         state.CurrentHp >= 0 && state.MaxHp is > 0 and <= 1_000_000_000 &&
         state.CurrentHp <= state.MaxHp && float.IsFinite(state.X) && float.IsFinite(state.Y) &&
         float.IsFinite(state.Z) && MathF.Abs(state.X) <= 1_000_000f &&
@@ -2302,11 +2354,15 @@ internal static class Protocol
 
     internal static byte[] EncodePickupRemoved(uint sequence, PickupRemoved removed)
     {
+        if (removed.SceneId == 0 || removed.SceneEpoch == 0 ||
+            removed.WorldId == 0 || removed.ItemId <= 0)
+            throw new ArgumentOutOfRangeException(nameof(removed));
         var packet = new byte[PickupRemovedSize];
         WriteHeader(packet, PacketType.PickupRemoved, sequence);
         BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), removed.SceneId);
-        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.WorldId);
-        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), removed.ItemId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), removed.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), removed.WorldId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 12), removed.ItemId);
         return packet;
     }
 
@@ -2320,34 +2376,98 @@ internal static class Protocol
         if (packet.Length != PickupRemovedSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.PickupRemoved)
             return false;
-        removed = new PickupRemoved(
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)));
+        var sceneId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize));
+        var sceneEpoch = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4));
+        var worldId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8));
+        var itemId = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 12));
+        if (sceneId == 0 || sceneEpoch == 0 || worldId == 0 || itemId <= 0)
+            return false;
+        removed = new PickupRemoved(sceneId, sceneEpoch, worldId, itemId);
         return true;
     }
 
-    internal static byte[] EncodePickupRequest(uint sequence, PickupRemoved request)
+    internal static byte[] EncodePickupRequest(uint sequence, PickupRequest request)
     {
-        var packet = EncodePickupRemoved(sequence, request);
-        packet[5] = (byte)PacketType.PickupRequest;
+        if (!IsValidPickupRequest(request))
+            throw new ArgumentOutOfRangeException(nameof(request));
+        var packet = new byte[PickupRequestSize];
+        WriteHeader(packet, PacketType.PickupRequest, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), request.RequestId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), request.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), request.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), request.WorldId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), request.ItemId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 24), request.KnownRevision);
+        WriteSingle(packet.AsSpan(HeaderSize + 28), request.ExpectedX);
+        WriteSingle(packet.AsSpan(HeaderSize + 32), request.ExpectedY);
         return packet;
     }
 
     internal static bool TryDecodePickupRequest(
         ReadOnlySpan<byte> packet,
         out uint sequence,
-        out PickupRemoved request)
+        out PickupRequest request)
     {
         sequence = 0;
         request = default;
-        if (packet.Length != PickupRemovedSize ||
+        if (packet.Length != PickupRequestSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.PickupRequest)
             return false;
-        request = new PickupRemoved(
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
-            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8)));
+        var candidate = new PickupRequest(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 24)),
+            ReadSingle(packet.Slice(HeaderSize + 28)),
+            ReadSingle(packet.Slice(HeaderSize + 32)));
+        if (!IsValidPickupRequest(candidate))
+            return false;
+        request = candidate;
+        return true;
+    }
+
+    internal static byte[] EncodePickupResult(uint sequence, PickupResult result)
+    {
+        if (!IsValidPickupResult(result))
+            throw new ArgumentOutOfRangeException(nameof(result));
+        var packet = new byte[PickupResultSize];
+        WriteHeader(packet, PacketType.PickupResult, sequence);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize), result.RequestId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 8), result.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 12), result.SceneEpoch);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 16), result.WorldId);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 20), result.ItemId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 24), result.Revision);
+        packet[HeaderSize + 28] = result.Accepted ? (byte)1 : (byte)0;
+        packet[HeaderSize + 29] = (byte)result.RejectReason;
+        return packet;
+    }
+
+    internal static bool TryDecodePickupResult(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out PickupResult result)
+    {
+        sequence = 0;
+        result = default;
+        if (packet.Length != PickupResultSize ||
+            !TryDecode(packet, out var type, out sequence) || type != PacketType.PickupResult ||
+            packet[HeaderSize + 28] > 1)
+            return false;
+        var candidate = new PickupResult(
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 8)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 12)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 16)),
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 20)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 24)),
+            packet[HeaderSize + 28] != 0,
+            (PickupRejectReason)packet[HeaderSize + 29]);
+        if (!IsValidPickupResult(candidate))
+            return false;
+        result = candidate;
         return true;
     }
 
@@ -3239,7 +3359,7 @@ internal static class Protocol
         sprite.ScaleY is > 0f and <= 100f;
 
     private static bool IsValidProjectileVisualState(ProjectileVisualState state) =>
-        state.SceneId != 0 && state.Id != 0 && state.SpriteId != 0 &&
+        state.SceneId != 0 && state.SceneEpoch != 0 && state.Id != 0 && state.SpriteId != 0 &&
         float.IsFinite(state.X) && float.IsFinite(state.Y) && float.IsFinite(state.Z) &&
         float.IsFinite(state.Rotation) && float.IsFinite(state.ScaleX) &&
         float.IsFinite(state.ScaleY) && MathF.Abs(state.X) <= 1_000_000f &&
@@ -3255,6 +3375,21 @@ internal static class Protocol
             MathF.Abs(state.RopeEndX) <= 1_000_000f &&
             MathF.Abs(state.RopeEndY) <= 1_000_000f &&
             MathF.Abs(state.RopeEndZ) <= 1_000_000f);
+
+    private static bool IsValidPickupRequest(PickupRequest request) =>
+        request.RequestId != 0 && request.SceneId != 0 && request.SceneEpoch != 0 &&
+        request.WorldId != 0 && request.ItemId > 0 && request.KnownRevision != 0 &&
+        float.IsFinite(request.ExpectedX) && float.IsFinite(request.ExpectedY) &&
+        MathF.Abs(request.ExpectedX) <= 1_000_000f &&
+        MathF.Abs(request.ExpectedY) <= 1_000_000f;
+
+    private static bool IsValidPickupResult(PickupResult result) =>
+        result.RequestId != 0 && result.SceneId != 0 && result.SceneEpoch != 0 &&
+        result.WorldId != 0 && result.ItemId > 0 && result.Revision != 0 &&
+        result.RejectReason is >= PickupRejectReason.None and <= PickupRejectReason.InternalError &&
+        (result.Accepted
+            ? result.RejectReason == PickupRejectReason.None
+            : result.RejectReason != PickupRejectReason.None);
 
     private static bool IsValidLoot(int itemId, int count, int bonusGrade, int liftType) =>
         itemId > 0 && count is > 0 and <= 9_999 && bonusGrade is >= 0 and <= 100 &&
@@ -3594,30 +3729,38 @@ internal static class Protocol
         if (TryDecodeFishLootComplete(lootCompletePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid fish loot completion");
 
-        var expectedBossDamage = new BossDamageRequest(fishSceneId, 0x11223344, 37, 2, 4);
+        var expectedBossDamage = new BossDamageRequest(fishSceneId, 7, 0x11223344, 37, 2, 4);
         var bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
         if (!TryDecodeBossDamageRequest(bossDamagePacket, out sequence, out var actualBossDamage) ||
             sequence != 46 || actualBossDamage != expectedBossDamage)
             throw new InvalidOperationException("Boss damage request round-trip failed");
-        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 4), 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 8), 0);
         if (TryDecodeBossDamageRequest(bossDamagePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted an invalid boss ID");
+        bossDamagePacket = EncodeBossDamageRequest(46, expectedBossDamage);
+        BinaryPrimitives.WriteUInt32LittleEndian(bossDamagePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeBossDamageRequest(bossDamagePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted boss damage without scene epoch");
 
         var expectedBossState = new BossState(
-            fishSceneId, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f,
+            fishSceneId, 7, 9, 0x11223344, 2801, 740, 1000, 2.5f, -4f, 0f,
             0x12345678, 0.25f, 0);
         var bossStatePacket = EncodeBossState(46, expectedBossState);
         if (!TryDecodeBossState(bossStatePacket, out sequence, out var actualBossState) ||
             sequence != 46 || actualBossState != expectedBossState)
             throw new InvalidOperationException("Boss state round-trip failed");
-        BinaryPrimitives.WriteInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 16), 1001);
+        BinaryPrimitives.WriteInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 20), 1001);
         if (TryDecodeBossState(bossStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted boss HP above maximum");
         bossStatePacket = EncodeBossState(46, expectedBossState);
         BinaryPrimitives.WriteInt32LittleEndian(
-            bossStatePacket.AsSpan(HeaderSize + 40), unchecked((int)0x7fc00000));
+            bossStatePacket.AsSpan(HeaderSize + 44), unchecked((int)0x7fc00000));
         if (TryDecodeBossState(bossStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid boss animation time");
+        bossStatePacket = EncodeBossState(46, expectedBossState);
+        BinaryPrimitives.WriteUInt32LittleEndian(bossStatePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeBossState(bossStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted boss state without scene epoch");
 
         var expectedManagerEvent = new ManagerEvent(
             3, 0, 1234, 3, 4, 1, 0x12345678);
@@ -3854,15 +3997,53 @@ internal static class Protocol
         if (TryDecodeFishManifestState(manifestStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted fish manifest state without scene epoch");
 
-        var expectedPickup = new PickupRemoved(SceneId("A02_01_01"), 0xCAFEBABE, 1001);
+        var expectedPickup = new PickupRemoved(SceneId("A02_01_01"), 7, 0xCAFEBABE, 1001);
         var pickupPacket = EncodePickupRemoved(50, expectedPickup);
         if (!TryDecodePickupRemoved(pickupPacket, out sequence, out var actualPickup) ||
             sequence != 50 || actualPickup != expectedPickup)
             throw new InvalidOperationException("Pickup removal round-trip failed");
-        var pickupRequest = EncodePickupRequest(50, expectedPickup);
-        if (!TryDecodePickupRequest(pickupRequest, out sequence, out actualPickup) ||
-            sequence != 50 || actualPickup != expectedPickup)
+        var expectedPickupRequest = new PickupRequest(
+            0x0102030405060708, SceneId("A02_01_01"), 7, 0xCAFEBABE, 1001, 3,
+            12.5f, -4.25f);
+        var pickupRequest = EncodePickupRequest(51, expectedPickupRequest);
+        if (!TryDecodePickupRequest(pickupRequest, out sequence, out var actualPickupRequest) ||
+            sequence != 51 || actualPickupRequest != expectedPickupRequest)
             throw new InvalidOperationException("Pickup request round-trip failed");
+        BinaryPrimitives.WriteUInt64LittleEndian(pickupRequest.AsSpan(HeaderSize), 0);
+        if (TryDecodePickupRequest(pickupRequest, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup request without request ID");
+        pickupRequest = EncodePickupRequest(51, expectedPickupRequest);
+        BinaryPrimitives.WriteUInt32LittleEndian(pickupRequest.AsSpan(HeaderSize + 24), 0);
+        if (TryDecodePickupRequest(pickupRequest, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup request without revision");
+
+        var acceptedPickup = new PickupResult(
+            expectedPickupRequest.RequestId, expectedPickupRequest.SceneId,
+            expectedPickupRequest.SceneEpoch, expectedPickupRequest.WorldId,
+            expectedPickupRequest.ItemId, 4, true, PickupRejectReason.None);
+        var pickupResult = EncodePickupResult(52, acceptedPickup);
+        if (!TryDecodePickupResult(pickupResult, out sequence, out var actualPickupResult) ||
+            sequence != 52 || actualPickupResult != acceptedPickup)
+            throw new InvalidOperationException("Accepted pickup result round-trip failed");
+        BinaryPrimitives.WriteUInt32LittleEndian(pickupResult.AsSpan(HeaderSize + 24), 0);
+        if (TryDecodePickupResult(pickupResult, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup result without revision");
+
+        var rejectedPickup = acceptedPickup with
+        {
+            Accepted = false,
+            RejectReason = PickupRejectReason.OutOfRange
+        };
+        pickupResult = EncodePickupResult(53, rejectedPickup);
+        if (!TryDecodePickupResult(pickupResult, out sequence, out actualPickupResult) ||
+            sequence != 53 || actualPickupResult != rejectedPickup)
+            throw new InvalidOperationException("Rejected pickup result round-trip failed");
+        pickupResult[HeaderSize + 29] = (byte)PickupRejectReason.None;
+        if (TryDecodePickupResult(pickupResult, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup rejection without reason");
+        BinaryPrimitives.WriteUInt32LittleEndian(pickupPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodePickupRemoved(pickupPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted pickup without scene epoch");
 
         var expectedTransition = new SceneTransitionCommand(
             "A02_02_01", 3, 0x8155, SceneId("A02_02_01"), 4567);
@@ -4106,19 +4287,25 @@ internal static class Protocol
 
         var expectedVisualState = new PlayerVisualState(
             SceneId("A02_01_01"),
+            3,
             new[] { new VisualSprite(SceneId("Dave_Swim_0042"), 0.25f, -0.5f, 0f, 90f,
                 1f, 1.25f, 7, 12, true, false) });
         var visualStatePacket = EncodePlayerVisualState(44, expectedVisualState);
         if (!TryDecodePlayerVisualState(visualStatePacket, out sequence, out var actualVisualState) ||
             sequence != 44 || actualVisualState.SceneId != expectedVisualState.SceneId ||
+            actualVisualState.SceneEpoch != expectedVisualState.SceneEpoch ||
             actualVisualState.Sprites.Length != 1 || actualVisualState.Sprites[0] != expectedVisualState.Sprites[0])
             throw new InvalidOperationException("Player visual state round-trip failed");
         visualStatePacket[^1] = 2;
         if (TryDecodePlayerVisualState(visualStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid visual sprite flags");
+        visualStatePacket = EncodePlayerVisualState(44, expectedVisualState);
+        BinaryPrimitives.WriteUInt32LittleEndian(visualStatePacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodePlayerVisualState(visualStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted player visuals without scene epoch");
 
         var expectedProjectileVisual = new ProjectileVisualState(
-            SceneId("A02_01_01"), 31, SceneId("Harpoon"), 1.25f, -2.5f, 0f, 45f,
+            SceneId("A02_01_01"), 3, 31, SceneId("Harpoon"), 1.25f, -2.5f, 0f, 45f,
             1f, -1f, 7, 14, false, true, 0f, 0f, 0f, 1.25f, -2.5f, 0f);
         var projectileVisualPacket = EncodeProjectileVisualState(45, expectedProjectileVisual);
         if (!TryDecodeProjectileVisualState(projectileVisualPacket, out sequence, out var actualProjectileVisual) ||
@@ -4126,6 +4313,9 @@ internal static class Protocol
             throw new InvalidOperationException("Projectile visual round-trip failed");
         if (IsValidProjectileVisualState(expectedProjectileVisual with { ScaleY = 0f }))
             throw new InvalidOperationException("Protocol accepted zero projectile visual scale");
+        BinaryPrimitives.WriteUInt32LittleEndian(projectileVisualPacket.AsSpan(HeaderSize + 4), 0);
+        if (TryDecodeProjectileVisualState(projectileVisualPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted projectile visuals without scene epoch");
         WriteSingle(snapshotPacket.AsSpan(HeaderSize + 16), float.NaN);
         if (TryDecodeSnapshot(snapshotPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid movement data");

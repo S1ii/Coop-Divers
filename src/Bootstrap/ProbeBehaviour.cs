@@ -252,7 +252,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
         while (_session != null && _session.TryTakePlayerVisualState(out var visualState))
         {
-            if (_session.SceneMatches(_sceneId) && visualState.SceneId == _sceneId)
+            if (_session.SceneMatches(_sceneId) && visualState.SceneId == _sceneId &&
+                visualState.SceneEpoch == _session.RemoteSceneEpoch)
                 _remoteAvatar.ApplyVisual(visualState, _session.RemoteName);
         }
         _remoteAvatar.Update(Time.unscaledDeltaTime);
@@ -305,7 +306,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (_session != null && visualPlayer != null && _session.SceneMatches(_sceneId) &&
             Time.realtimeSinceStartup >= _nextVisual)
         {
-            _session.SendPlayerVisualState(RemoteAvatar.CaptureVisualState(_sceneId, visualPlayer));
+            _session.SendPlayerVisualState(RemoteAvatar.CaptureVisualState(
+                _sceneId, _session.LocalSceneEpoch, visualPlayer));
             _nextVisual = Time.realtimeSinceStartup + 0.1f;
         }
 
@@ -707,7 +709,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void OnPickupDestroyed(PickupInstanceItem item)
     {
         if (Role is SessionRole.Host or SessionRole.Client)
-            _pickupReplicator?.OnDestroyed(_session, _sceneId, item);
+            _pickupReplicator?.OnDestroyed(Role, _session, _sceneId, item);
     }
 
     internal void RegisterProjectile(Component projectile) =>
@@ -1061,13 +1063,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _remoteCatchLedger?.ClearCompleted();
     }
 
-    internal bool OnPickupInteract(PickupInstanceItem item)
+    internal bool OnPickupInteract(PickupInstanceItem item, BaseCharacter character)
     {
         if (Role != SessionRole.Client)
             return true;
-        _remoteCatchLedger?.BeginClientPickupSource(
-            _sceneId, PickupReplicator.WorldId(_sceneId, item));
-        return _pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false;
+        if (!(_pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false))
+            character?.SuccessInteraction();
+        return false;
     }
 
     internal void EndClientLootSource() => _remoteCatchLedger?.EndClientLootSource();
