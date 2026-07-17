@@ -224,7 +224,7 @@ internal static class MultiplayerSaveSync
             return;
 
         while (!_hostRemoteLoaded && _hostNextChunk < ChunkCount(_hostSnapshot.Length) &&
-               session.ReliableCapacityRemaining > 0)
+               session.ReliableBulkCapacityRemaining > 0)
         {
             var offset = _hostNextChunk * Protocol.MaxSaveSnapshotChunkBytes;
             var count = Math.Min(Protocol.MaxSaveSnapshotChunkBytes, _hostSnapshot.Length - offset);
