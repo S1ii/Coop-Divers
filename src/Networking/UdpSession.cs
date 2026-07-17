@@ -1379,6 +1379,9 @@ internal sealed class UdpSession : IDisposable
         return !string.IsNullOrEmpty(reason);
     }
 
+    internal void FailReliableDeliveryFromDomain(string reason) =>
+        FailReliableDelivery(reason);
+
     internal void SetLocalScene(uint sceneId)
     {
         PrepareLocalWorldChange();
@@ -4098,7 +4101,7 @@ internal sealed class UdpSession : IDisposable
     {
         SignalPeerLoss(reason);
         ResetPeerState();
-        if (reason.EndsWith(" receive queue overflow", System.StringComparison.Ordinal))
+        if (reason.EndsWith(" queue overflow", System.StringComparison.Ordinal))
             Interlocked.Increment(ref _reliableQueueOverflows);
         if (_role == SessionRole.Host)
             _remote = null;

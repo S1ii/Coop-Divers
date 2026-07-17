@@ -88,6 +88,7 @@ internal sealed class ManagerEventReplicator
 {
     private const int MaxTimelineGeneration = 0x3fffffff;
     private const int RewardActionBase = (int)ManagerAction.RewardFirst;
+    private const int MaxPendingManagerEvents = 256;
 
     private enum RestoreDecision
     {
@@ -275,6 +276,32 @@ internal sealed class ManagerEventReplicator
 
     internal static void SelfTest()
     {
+        if (!HasManagerEventCapacity(MaxPendingManagerEvents - 1) ||
+            HasManagerEventCapacity(MaxPendingManagerEvents))
+            throw new InvalidOperationException("Manager event queue capacity self-test failed");
+
+        var outboundOverflow = new ManagerEventReplicator(null);
+        var outboundSession = new UdpSession(null);
+        for (var index = 0; index < MaxPendingManagerEvents; index++)
+            outboundOverflow._outboundEvents.Enqueue(default);
+        if (outboundOverflow.TryQueueOutbound(outboundSession, default) ||
+            outboundOverflow._outboundEvents.Count != 0)
+            throw new InvalidOperationException("Manager outbound queue overflow self-test failed");
+
+        var pendingOverflow = new ManagerEventReplicator(null);
+        var pendingSession = new UdpSession(null);
+        for (var revision = 1; revision <= MaxPendingManagerEvents; revision++)
+            if (!pendingOverflow.TryQueuePendingHostEvent(
+                    pendingSession, ManagerDomain.Story,
+                    new ManagerEvent((uint)revision, 0, 0, (byte)ManagerDomain.Story, 0, 0, 0)))
+                throw new InvalidOperationException("Manager pending queue setup self-test failed");
+        if (pendingOverflow.TryQueuePendingHostEvent(
+                pendingSession, ManagerDomain.Story,
+                new ManagerEvent(unchecked((uint)MaxPendingManagerEvents + 1u), 0, 0,
+                    (byte)ManagerDomain.Story, 0, 0, 0)) ||
+            pendingOverflow._pendingHostEvents.Count != 0)
+            throw new InvalidOperationException("Manager pending queue overflow self-test failed");
+
         var callbackReplicator = new ManagerEventReplicator(null);
         var scenarioCancels = 0;
         callbackReplicator._pendingClientScenarioStart = new PendingScenarioStart
@@ -552,9 +579,8 @@ internal sealed class ManagerEventReplicator
                     _hostClockOffset = unchecked(CurrentTick() - state.HostTick);
                     _hasHostClockOffset = true;
                 }
-                if (!_pendingHostEvents.TryGetValue(lane, out var pending))
-                    _pendingHostEvents[lane] = pending = new SortedDictionary<uint, ManagerEvent>();
-                pending[state.Revision] = state;
+                if (!TryQueuePendingHostEvent(session, lane, state))
+                    return;
             }
         }
         if (role == SessionRole.Client)
@@ -593,7 +619,7 @@ internal sealed class ManagerEventReplicator
         }
         if (role == SessionRole.Client && domain == ManagerDomain.Dialogue)
         {
-            _outboundEvents.Enqueue(new ManagerEvent(
+            TryQueueOutbound(session, new ManagerEvent(
                 0, 0, CurrentTick(), (byte)domain, (byte)action, value, context));
             FlushOutbound(session);
         }
@@ -620,7 +646,7 @@ internal sealed class ManagerEventReplicator
             return true;
         if (value < 0 && type is >= GoodsType.gold and <= GoodsType.fakePoint)
         {
-            _outboundEvents.Enqueue(new ManagerEvent(
+            TryQueueOutbound(session, new ManagerEvent(
                 0, 0, CurrentTick(), (byte)ManagerDomain.Progression,
                 (byte)ManagerAction.Wallet, (int)type, value));
             FlushOutbound(session);
@@ -675,7 +701,7 @@ internal sealed class ManagerEventReplicator
     private void QueueClientRequest(
         UdpSession session, ManagerDomain domain, ManagerAction action, int value, int context)
     {
-        _outboundEvents.Enqueue(new ManagerEvent(
+        TryQueueOutbound(session, new ManagerEvent(
             0, _sceneId, CurrentTick(), (byte)domain, (byte)action, value, context));
         FlushOutbound(session);
     }
@@ -913,7 +939,7 @@ internal sealed class ManagerEventReplicator
         }
         if (role == SessionRole.Client)
         {
-            _outboundEvents.Enqueue(new ManagerEvent(
+            TryQueueOutbound(session, new ManagerEvent(
                 0, 0, CurrentTick(), (byte)ManagerDomain.Dialogue,
                 (byte)ManagerAction.PhoneAnswered, tid, 0));
             FlushOutbound(session);
@@ -1506,13 +1532,50 @@ internal sealed class ManagerEventReplicator
         var lane = LaneOf(domain);
         var revision = NextRevision(GetRevision(_hostRevisions, lane));
         _hostRevisions[lane] = revision;
-        _outboundEvents.Enqueue(new ManagerEvent(
+        TryQueueOutbound(session, new ManagerEvent(
             revision,
             IsGlobal(domain) ? 0 : _sceneId,
             CurrentTick(),
             (byte)domain, (byte)action, value, context, invocation));
         FlushOutbound(session);
     }
+
+    private bool TryQueueOutbound(UdpSession session, ManagerEvent state)
+    {
+        if (_outboundEvents.Count >= MaxPendingManagerEvents)
+        {
+            _outboundEvents.Clear();
+            session?.FailReliableDeliveryFromDomain("manager event outbound queue overflow");
+            return false;
+        }
+        _outboundEvents.Enqueue(state);
+        return true;
+    }
+
+    private bool TryQueuePendingHostEvent(
+        UdpSession session,
+        ManagerDomain lane,
+        ManagerEvent state)
+    {
+        if (!_pendingHostEvents.TryGetValue(lane, out var pending))
+            _pendingHostEvents[lane] = pending = new SortedDictionary<uint, ManagerEvent>();
+        if (pending.ContainsKey(state.Revision))
+        {
+            pending[state.Revision] = state;
+            return true;
+        }
+        if (pending.Count >= MaxPendingManagerEvents)
+        {
+            _pendingHostEvents.Clear();
+            session?.FailReliableDeliveryFromDomain("manager event pending queue overflow");
+            return false;
+        }
+        pending[state.Revision] = state;
+        return true;
+    }
+
+    private static bool HasManagerEventCapacity(int queued) =>
+        queued < MaxPendingManagerEvents;
 
     private void FlushOutbound(UdpSession session)
     {
