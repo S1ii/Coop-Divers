@@ -20,7 +20,13 @@ internal static class HostAuthorityPolicy
         nameof(MissionManager.SetMissionFailed),
         nameof(MissionManager.SetMissoinInProgress),
         nameof(MissionManager.SetMissoinStateFail),
-        nameof(MissionManager.RevertToStartVIPMission)
+        nameof(MissionManager.RevertToStartVIPMission),
+        nameof(MissionManager.ApplyMissionClear),
+        nameof(MissionManager.ProcessFailByType),
+        nameof(MissionManager.ProcessMissionFailWeatherChanged),
+        nameof(MissionManager.ProcessMissionFailJungleTimeSectionChanged),
+        nameof(MissionManager.FailMission),
+        nameof(MissionManager.FailMissionByStartType)
     };
 
     internal static void SelfTest()
@@ -41,8 +47,8 @@ internal static class HostAuthorityPolicy
                     $"remoteApply={remoteApply} presentation={presentation}");
         if (!IsPersistentMissionMutationRoot(nameof(MissionManager.ClearMission), typeof(void)) ||
             !IsPersistentMissionMutationRoot(nameof(MissionManager.SetMissionFailed), typeof(void)) ||
-            IsPersistentMissionMutationRoot(nameof(MissionManager.ApplyMissionClear), typeof(void)) ||
-            IsPersistentMissionMutationRoot(nameof(MissionManager.FailMission), typeof(void)) ||
+            !IsPersistentMissionMutationRoot(nameof(MissionManager.ApplyMissionClear), typeof(void)) ||
+            !IsPersistentMissionMutationRoot(nameof(MissionManager.FailMission), typeof(void)) ||
             IsPersistentMissionMutationRoot(nameof(MissionManager.GetReward), typeof(Il2CppSystem.Collections.IEnumerator)))
             throw new InvalidOperationException("Mission authority target policy failed");
         if (!AllowsHostOwnedAction(SessionRole.Host, true) ||

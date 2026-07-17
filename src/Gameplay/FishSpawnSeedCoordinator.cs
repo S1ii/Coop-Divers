@@ -61,6 +61,10 @@ internal static class FishSpawnSeedCoordinator
         ActivateStagedScene(current.SceneId);
         if (HasActiveSeed(current))
             throw new InvalidOperationException("Stale fish seed remained active");
+        StageLocalScene(previous);
+        if (!TryGetPreparedEpoch(previous.SceneId, out var preparedEpoch) ||
+            preparedEpoch != previous.SceneEpoch)
+            throw new InvalidOperationException("Preload fish seed staging failed");
         Clear();
     }
 
@@ -102,6 +106,16 @@ internal static class FishSpawnSeedCoordinator
 
     internal static void StageRemoteScene(SceneSeed seed)
     {
+        StageScene(seed);
+    }
+
+    internal static void StageLocalScene(SceneSeed seed)
+    {
+        StageScene(seed);
+    }
+
+    private static void StageScene(SceneSeed seed)
+    {
         SetSeed(seed);
         if (seed.SceneId == 0 || seed.SceneEpoch == 0 ||
             StagedSceneEpochs.TryGetValue(seed.SceneId, out var current) &&
@@ -115,6 +129,8 @@ internal static class FishSpawnSeedCoordinator
         if (sceneId == 0 || sceneEpoch == 0)
             return;
         ActiveSceneEpochs[sceneId] = sceneEpoch;
+        if (StagedSceneEpochs.TryGetValue(sceneId, out var stagedEpoch) && stagedEpoch == sceneEpoch)
+            StagedSceneEpochs.Remove(sceneId);
     }
 
     internal static void ActivateStagedScene(uint sceneId)
@@ -144,7 +160,7 @@ internal static class FishSpawnSeedCoordinator
         if (source == null)
             return default;
         var sceneId = Protocol.SceneId(source.gameObject.scene.name);
-        if (!ActiveSceneEpochs.TryGetValue(sceneId, out var sceneEpoch) ||
+        if (!TryGetPreparedEpoch(sceneId, out var sceneEpoch) ||
             !SceneSeeds.TryGetValue((sceneId, sceneEpoch), out var sceneSeed))
             return default;
 
@@ -214,6 +230,13 @@ internal static class FishSpawnSeedCoordinator
         ActiveSceneEpochs.TryGetValue(seed.SceneId, out var sceneEpoch) &&
         sceneEpoch == seed.SceneEpoch && HasSeed(seed);
 
+    private static bool TryGetPreparedEpoch(uint sceneId, out uint sceneEpoch) =>
+        ActiveSceneEpochs.TryGetValue(sceneId, out sceneEpoch) ||
+        StagedSceneEpochs.TryGetValue(sceneId, out sceneEpoch);
+
+    internal static bool AllowUnseededScope(FishSpawnSeedCoordinator.Scope scope) =>
+        scope.Active || ProbeBehaviour.Instance?.IsOnlineSession != true;
+
     private static bool IsNewer(uint value, uint previous) =>
         value != previous && unchecked((int)(value - previous)) > 0;
 
@@ -238,8 +261,11 @@ internal static class FishAllocatorSpawnSeedPatch
         FishSpawnSeedCoordinator.DeclaredFamilyRoots(
             typeof(FishAllocator), nameof(FishAllocator.Spawn), Type.EmptyTypes);
 
-    private static void Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance);
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(
         Exception __exception,
@@ -257,8 +283,11 @@ internal static class FishAllocatorSpawnForceSeedPatch
         FishSpawnSeedCoordinator.DeclaredFamilyRoots(
             typeof(FishAllocator), nameof(FishAllocator.Spawn), new[] { typeof(bool) });
 
-    private static void Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(FishAllocator __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance);
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(
         Exception __exception,
@@ -306,8 +335,11 @@ internal static class FishBushSpawnSeedPatch
         FishSpawnSeedCoordinator.DeclaredFamilyRoots(
             typeof(FishBushAllocator), nameof(FishBushAllocator.TrySpawnFish), new[] { typeof(bool) });
 
-    private static void Prefix(FishBushAllocator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(FishBushAllocator __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance?.fishAllocator, "fish-bush");
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
     {
@@ -323,8 +355,11 @@ internal static class PickupSpawnerSeedPatch
         FishSpawnSeedCoordinator.DeclaredFamilyRoots(
             typeof(SpawnerPickupItem), nameof(SpawnerPickupItem.Start), Type.EmptyTypes);
 
-    private static void Prefix(SpawnerPickupItem __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(SpawnerPickupItem __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance, "pickup", __instance?.UniqueID);
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
     {
@@ -340,8 +375,11 @@ internal static class ChestSpawnerSeedPatch
         FishSpawnSeedCoordinator.DeclaredFamilyRoots(
             typeof(SpawnerChestItem), nameof(SpawnerChestItem.Start), Type.EmptyTypes);
 
-    private static void Prefix(SpawnerChestItem __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(SpawnerChestItem __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance, "chest", __instance?.UniqueID);
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
     {
@@ -353,8 +391,11 @@ internal static class ChestSpawnerSeedPatch
 [HarmonyPatch(typeof(SavedRandomActivator), nameof(SavedRandomActivator.SelectRandomOne))]
 internal static class SavedRandomActivatorSeedPatch
 {
-    private static void Prefix(SavedRandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(SavedRandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance, "saved-random", __instance?.UniqueID);
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
     {
@@ -366,8 +407,11 @@ internal static class SavedRandomActivatorSeedPatch
 [HarmonyPatch(typeof(RandomActivator), nameof(RandomActivator.Awake))]
 internal static class RandomActivatorSeedPatch
 {
-    private static void Prefix(RandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state) =>
+    private static bool Prefix(RandomActivator __instance, out FishSpawnSeedCoordinator.Scope __state)
+    {
         __state = FishSpawnSeedCoordinator.Begin(__instance, "random-activator");
+        return FishSpawnSeedCoordinator.AllowUnseededScope(__state);
+    }
 
     private static Exception Finalizer(Exception __exception, FishSpawnSeedCoordinator.Scope __state)
     {

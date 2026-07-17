@@ -29,7 +29,7 @@ internal static class DiverEquipmentPolicy
 }
 
 [HarmonyPatch(typeof(GunWeaponHandler), nameof(GunWeaponHandler.FireWeapon))]
-internal static class DiverMetaGunPolicyPatch
+internal static class DiverGunPolicyPatch
 {
     private static bool Prefix(GunWeaponHandler __instance) =>
         ProbeBehaviour.Instance?.AllowDiverGunFire(__instance) ?? true;
@@ -44,7 +44,40 @@ internal static class DiverSubHelperPolicyPatch
 
 [HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.AddBuff),
     new[] { typeof(int), typeof(ICaster), typeof(bool) })]
-internal static class DiverBuffPolicyPatch
+internal static class DiverBuffIntPolicyPatch
+{
+    private static bool Prefix(BuffHandler __instance) =>
+        ProbeBehaviour.Instance?.AllowDiverBuff(__instance) ?? true;
+}
+
+[HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.AddBuff),
+    new[] { typeof(BuffDebuffEffectData), typeof(ICaster), typeof(bool),
+        typeof(Il2CppSystem.Nullable<UnityEngine.Vector3>), typeof(bool) })]
+internal static class DiverBuffDataPolicyPatch
+{
+    private static bool Prefix(BuffHandler __instance) =>
+        ProbeBehaviour.Instance?.AllowDiverBuff(__instance) ?? true;
+}
+
+[HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.AddBuff),
+    new[] { typeof(Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<int>), typeof(bool) })]
+internal static class DiverBuffArrayPolicyPatch
+{
+    private static bool Prefix(BuffHandler __instance) =>
+        ProbeBehaviour.Instance?.AllowDiverBuff(__instance) ?? true;
+}
+
+[HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.SafeAddBuff),
+    new[] { typeof(int), typeof(ICaster), typeof(bool) })]
+internal static class DiverBuffSafePolicyPatch
+{
+    private static bool Prefix(BuffHandler __instance) =>
+        ProbeBehaviour.Instance?.AllowDiverBuff(__instance) ?? true;
+}
+
+[HarmonyPatch(typeof(BuffHandler), nameof(BuffHandler.AddBuff),
+    new[] { typeof(string), typeof(ICaster), typeof(bool) })]
+internal static class DiverBuffStringPolicyPatch
 {
     private static bool Prefix(BuffHandler __instance) =>
         ProbeBehaviour.Instance?.AllowDiverBuff(__instance) ?? true;

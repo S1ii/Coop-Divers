@@ -352,6 +352,7 @@ internal sealed class SceneReplicator
         Set(ref options, 8, firstFindSceneManagerInActiveScene);
         var seed = FishSpawnSeedCoordinator.GetOrCreate(
             Protocol.SceneId(sceneName), session.NextLocalSceneEpoch);
+        FishSpawnSeedCoordinator.StageLocalScene(seed);
         session.SendSceneTransition(new SceneTransitionCommand(
             sceneName, (int)transitionType, options, seed.SceneId, seed.SceneEpoch, seed.Seed));
     }
@@ -362,6 +363,7 @@ internal sealed class SceneReplicator
             return;
         var seed = FishSpawnSeedCoordinator.GetOrCreate(
             Protocol.SceneId(sceneName), session.LocalSceneEpoch);
+        FishSpawnSeedCoordinator.StageLocalScene(seed);
         session.SendSceneTransition(new SceneTransitionCommand(
             sceneName, (int)SceneTransitionType.FadeOutIn, NativeDefaults,
             seed.SceneId, seed.SceneEpoch, seed.Seed));

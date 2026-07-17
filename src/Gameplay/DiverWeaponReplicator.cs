@@ -4,14 +4,6 @@ namespace DaveTheDiverMP;
 
 internal sealed class DiverWeaponReplicator
 {
-    private enum AmmoChange : byte
-    {
-        None,
-        Fire,
-        Reload,
-        Unsupported
-    }
-
     private readonly DiverWeaponAuthority _authority = new();
     private SessionRole _role;
     private uint _sceneId;
@@ -24,11 +16,7 @@ internal sealed class DiverWeaponReplicator
 
     internal static void SelfTest()
     {
-        if (ClassifyAmmoChange(4, 4) != AmmoChange.None ||
-            ClassifyAmmoChange(4, 3) != AmmoChange.Fire ||
-            ClassifyAmmoChange(3, 4) != AmmoChange.Reload ||
-            ClassifyAmmoChange(4, 2) != AmmoChange.Unsupported ||
-            NextRequestId(0) != 1 || NextRequestId(ulong.MaxValue) != 1)
+        if (NextRequestId(0) != 1 || NextRequestId(ulong.MaxValue) != 1)
             throw new InvalidOperationException("Diver weapon observation self-test failed");
     }
 
@@ -195,20 +183,8 @@ internal sealed class DiverWeaponReplicator
             }
             return;
         }
-        var change = ClassifyAmmoChange(_observedAmmo, ammo);
-        if (change == AmmoChange.Unsupported)
-        {
+        if (ammo != _observedAmmo)
             gun.ForceSetBulletCount(_observedAmmo);
-            return;
-        }
-        var action = change switch
-        {
-            AmmoChange.Fire => DiverWeaponAction.Fire,
-            AmmoChange.Reload => DiverWeaponAction.Reload,
-            _ => default
-        };
-        if (change != AmmoChange.None && SendIntent(session, action, weaponId))
-            _observedAmmo = ammo;
     }
 
     private bool SendIntent(UdpSession session, DiverWeaponAction action, int weaponId)
@@ -274,11 +250,6 @@ internal sealed class DiverWeaponReplicator
             return false;
         }
     }
-
-    private static AmmoChange ClassifyAmmoChange(int previous, int current) =>
-        current == previous ? AmmoChange.None :
-        current == previous - 1 ? AmmoChange.Fire :
-        current > previous ? AmmoChange.Reload : AmmoChange.Unsupported;
 
     private static ulong NextRequestId(ulong requestId) =>
         requestId == ulong.MaxValue ? 1 : requestId + 1;

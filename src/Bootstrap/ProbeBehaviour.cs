@@ -651,6 +651,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void OnUnitySceneLoaded(Scene scene, LoadSceneMode mode)
     {
+        if (Role == SessionRole.Host && _session != null && !string.IsNullOrWhiteSpace(scene.name) &&
+            scene.name != "Empty")
+        {
+            var sceneId = Protocol.SceneId(scene.name);
+            FishSpawnSeedCoordinator.StageLocalScene(
+                FishSpawnSeedCoordinator.GetOrCreate(sceneId, _session.NextLocalSceneEpoch));
+        }
         _loadedGameplayScenes.OnSceneLoaded(scene, mode);
         UpdateUnsafeWorldReplicationGate();
     }
@@ -911,6 +918,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal string TitleLanAddress => LobbyInput.FindLanAddress();
     internal bool IsApplyingRemoteMission => _remoteMissionApplyDepth > 0;
     internal bool IsCompletingClientPresentation => _clientPresentationLifecycleDepth > 0;
+    internal bool IsOnlineSession => _session?.Connected == true;
     internal bool IsApplyingNpcGrant => _npcInteractionCoordinator?.IsApplyingGrant == true;
     internal bool HasActiveNpcLease => _npcInteractionCoordinator?.HasActiveLease == true;
 
@@ -1773,10 +1781,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool AllowDiverGunFire(GunWeaponHandler gun)
     {
-        if (!IsSharedActionScene() || !DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true) || gun?.CurrentMetaGunSlot == null)
+        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
+                Role, _session?.Connected == true))
             return true;
-        _sessionTrace?.Write("DIVER-POLICY", "reject=meta-gun client-only");
+        _sessionTrace?.Write("DIVER-POLICY", "reject=gun client-only");
         return false;
     }
 

@@ -210,7 +210,9 @@ internal sealed class RemoteAvatar : IDisposable
                     breath.MaxHP is <= 0f or > 1_000_000f ||
                     breath.HP < 0f || breath.HP > breath.MaxHP)
                     return false;
-                fields |= DiverRuntimeFields.Oxygen;
+                // Dave exposes one native breath value for both displayed vitality
+                // fields, so publish it twice rather than leave HP absent.
+                fields |= DiverRuntimeFields.Health | DiverRuntimeFields.Oxygen;
                 maxOxygen = breath.MaxHP;
                 oxygen = breath.HP;
                 if (breath.IsOxygenDepleting)
@@ -252,7 +254,7 @@ internal sealed class RemoteAvatar : IDisposable
 
             state = new DiverRuntimeState(
                 sceneId, sceneEpoch, revision, owner, player.IsDead(), fields, flags,
-                0f, 0f, oxygen, maxOxygen, cargoWeight, weaponId, ammo, maxAmmo);
+                oxygen, maxOxygen, oxygen, maxOxygen, cargoWeight, weaponId, ammo, maxAmmo);
             return true;
         }
         catch

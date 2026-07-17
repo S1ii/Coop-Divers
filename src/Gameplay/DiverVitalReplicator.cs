@@ -3,8 +3,8 @@ using UnityEngine;
 
 namespace DaveTheDiverMP;
 
-// Host keeps the client's oxygen/health canonical.  The game exposes one native
-// breath value for both, so this deliberately uses that single source of truth.
+// The host owns the client's oxygen/health.  The game exposes one native breath
+// value for both, so this deliberately uses that single source of truth.
 internal sealed class DiverVitalReplicator
 {
     private readonly DiverRuntimeAuthority _authority = new();
@@ -16,6 +16,7 @@ internal sealed class DiverVitalReplicator
     {
         if (CauseFor(0f, true) != DiverVitalCause.OxygenDepleted ||
             CauseFor(1f, false) != DiverVitalCause.Damage ||
+            !AcceptClientVital(4f, 5f) || AcceptClientVital(6f, 5f) ||
             NextEventId(ulong.MaxValue) != 1)
             throw new InvalidOperationException("Diver vital bridge self-test failed");
     }
@@ -38,13 +39,20 @@ internal sealed class DiverVitalReplicator
             _authority.Initialize(state.SceneId, state.SceneEpoch, state.Revision,
                 state.Oxygen, state.MaxOxygen);
             avatar?.ApplyRuntime(state);
-            _flags = state.Flags;
+            _flags = state.Flags & ~DiverRuntimeFlags.Invulnerable;
             return;
         }
 
-        _flags = state.Flags;
+        // Runtime snapshots are observation-only.  In particular, a client cannot
+        // grant itself immunity, heal, or revive by changing its local breath value.
+        _flags = state.Flags & ~DiverRuntimeFlags.Invulnerable;
 
         var current = _authority.Current;
+        if (!AcceptClientVital(state.Oxygen, current.Oxygen))
+        {
+            avatar?.ApplyRuntime(current.ToRuntimeState(_flags));
+            return;
+        }
         var eventId = NextEventId(_eventId);
         _eventId = eventId;
         DiverRuntimeAuthorityResult result;
@@ -54,13 +62,6 @@ internal sealed class DiverVitalReplicator
             result = _authority.ApplyDamage(eventId, current.Oxygen - state.Oxygen,
                 (state.Flags & DiverRuntimeFlags.Invulnerable) != 0);
             cause = CauseFor(state.Oxygen, result.Died);
-        }
-        else if (state.Oxygen > current.Oxygen)
-        {
-            result = current.IsDead
-                ? _authority.ApplyRevive(state.Oxygen)
-                : _authority.ApplyHeal(state.Oxygen - current.Oxygen);
-            cause = current.IsDead ? DiverVitalCause.Revive : DiverVitalCause.OxygenRestore;
         }
         else
         {
@@ -152,6 +153,8 @@ internal sealed class DiverVitalReplicator
 
     private static DiverVitalCause CauseFor(float oxygen, bool died) =>
         died || oxygen == 0f ? DiverVitalCause.OxygenDepleted : DiverVitalCause.Damage;
+
+    private static bool AcceptClientVital(float reported, float canonical) => reported <= canonical;
 
     private static ulong NextEventId(ulong value) => value == ulong.MaxValue ? 1 : value + 1;
 }
