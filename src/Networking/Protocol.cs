@@ -61,7 +61,9 @@ internal enum PacketType : byte
     SaveSnapshotAck = 55,
     PickupResult = 56,
     DiverRuntimeState = 57,
-    DiverVitalResult = 58
+    DiverVitalResult = 58,
+    DiverWeaponIntent = 59,
+    DiverWeaponResult = 60
 }
 
 internal readonly record struct PlayerSnapshot(
@@ -119,7 +121,8 @@ internal readonly record struct DiverRuntimeState(
     float MaxOxygen,
     float CargoWeight,
     int WeaponId,
-    int Ammo);
+    int Ammo,
+    int MaxAmmo = 0);
 
 internal enum DiverVitalCause : byte
 {
@@ -146,6 +149,43 @@ internal readonly record struct DiverVitalResult(
     DiverVitalCause Cause,
     DiverVitalEdges Edges,
     float AppliedAmount,
+    DiverRuntimeState State);
+
+internal enum DiverWeaponAction : byte
+{
+    Equip = 1,
+    Fire = 2,
+    Reload = 3,
+    Unequip = 4
+}
+
+internal enum DiverWeaponRejectReason : byte
+{
+    None = 0,
+    SceneMismatch = 1,
+    StaleRequest = 2,
+    InvalidWeapon = 3,
+    InvalidState = 4,
+    NoAmmo = 5,
+    ReloadNotNeeded = 6,
+    Dead = 7,
+    Unsupported = 8
+}
+
+internal readonly record struct DiverWeaponIntent(
+    uint SceneId,
+    uint SceneEpoch,
+    ulong RequestId,
+    DiverWeaponAction Action,
+    int WeaponId);
+
+internal readonly record struct DiverWeaponResult(
+    uint CommitRevision,
+    ulong RequestId,
+    DiverWeaponAction Action,
+    bool Accepted,
+    DiverWeaponRejectReason RejectReason,
+    int AppliedRounds,
     DiverRuntimeState State);
 
 internal readonly record struct VisualSprite(
@@ -592,12 +632,14 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 44;
+    private const byte Version = 45;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
-    private const int DiverRuntimePayloadSize = 46;
+    private const int DiverRuntimePayloadSize = 50;
     private const int DiverRuntimeStateSize = HeaderSize + DiverRuntimePayloadSize;
     private const int DiverVitalResultSize = HeaderSize + 18 + DiverRuntimePayloadSize;
+    private const int DiverWeaponIntentSize = HeaderSize + 21;
+    private const int DiverWeaponResultSize = HeaderSize + 19 + DiverRuntimePayloadSize;
     private const int VisualStateFixedSize = HeaderSize + 9;
     private const int VisualSpriteSize = 38;
     private const int ProjectileVisualStateSize = HeaderSize + 74;
@@ -829,6 +871,85 @@ internal static class Protocol
             ReadSingle(packet.Slice(HeaderSize + 14)),
             state);
         if (!IsValidDiverVitalResult(candidate))
+            return false;
+        result = candidate;
+        return true;
+    }
+
+    internal static byte[] EncodeDiverWeaponIntent(uint sequence, DiverWeaponIntent intent)
+    {
+        if (!IsValidDiverWeaponIntent(intent))
+            throw new ArgumentOutOfRangeException(nameof(intent));
+        var packet = new byte[DiverWeaponIntentSize];
+        WriteHeader(packet, PacketType.DiverWeaponIntent, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), intent.SceneId);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize + 4), intent.SceneEpoch);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 8), intent.RequestId);
+        packet[HeaderSize + 16] = (byte)intent.Action;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 17), intent.WeaponId);
+        return packet;
+    }
+
+    internal static bool TryDecodeDiverWeaponIntent(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out DiverWeaponIntent intent)
+    {
+        sequence = 0;
+        intent = default;
+        if (packet.Length != DiverWeaponIntentSize ||
+            !TryDecode(packet, out var type, out sequence) ||
+            type != PacketType.DiverWeaponIntent)
+            return false;
+        var candidate = new DiverWeaponIntent(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 8)),
+            (DiverWeaponAction)packet[HeaderSize + 16],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 17)));
+        if (!IsValidDiverWeaponIntent(candidate))
+            return false;
+        intent = candidate;
+        return true;
+    }
+
+    internal static byte[] EncodeDiverWeaponResult(uint sequence, DiverWeaponResult result)
+    {
+        if (!IsValidDiverWeaponResult(result))
+            throw new ArgumentOutOfRangeException(nameof(result));
+        var packet = new byte[DiverWeaponResultSize];
+        WriteHeader(packet, PacketType.DiverWeaponResult, sequence);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(HeaderSize), result.CommitRevision);
+        BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 4), result.RequestId);
+        packet[HeaderSize + 12] = (byte)result.Action;
+        packet[HeaderSize + 13] = result.Accepted ? (byte)1 : (byte)0;
+        packet[HeaderSize + 14] = (byte)result.RejectReason;
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 15), result.AppliedRounds);
+        WriteDiverRuntimePayload(packet.AsSpan(HeaderSize + 19), result.State);
+        return packet;
+    }
+
+    internal static bool TryDecodeDiverWeaponResult(
+        ReadOnlySpan<byte> packet,
+        out uint sequence,
+        out DiverWeaponResult result)
+    {
+        sequence = 0;
+        result = default;
+        if (packet.Length != DiverWeaponResultSize || packet[HeaderSize + 13] > 1 ||
+            !TryDecode(packet, out var type, out sequence) ||
+            type != PacketType.DiverWeaponResult ||
+            !TryReadDiverRuntimePayload(packet.Slice(HeaderSize + 19), out var state))
+            return false;
+        var candidate = new DiverWeaponResult(
+            BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize)),
+            BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 4)),
+            (DiverWeaponAction)packet[HeaderSize + 12],
+            packet[HeaderSize + 13] != 0,
+            (DiverWeaponRejectReason)packet[HeaderSize + 14],
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 15)),
+            state);
+        if (!IsValidDiverWeaponResult(candidate))
             return false;
         result = candidate;
         return true;
@@ -3529,6 +3650,7 @@ internal static class Protocol
         WriteSingle(payload.Slice(34), state.CargoWeight);
         BinaryPrimitives.WriteInt32LittleEndian(payload.Slice(38), state.WeaponId);
         BinaryPrimitives.WriteInt32LittleEndian(payload.Slice(42), state.Ammo);
+        BinaryPrimitives.WriteInt32LittleEndian(payload.Slice(46), state.MaxAmmo);
     }
 
     private static bool TryReadDiverRuntimePayload(
@@ -3552,7 +3674,8 @@ internal static class Protocol
             ReadSingle(payload.Slice(30)),
             ReadSingle(payload.Slice(34)),
             BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(38)),
-            BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(42)));
+            BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(42)),
+            BinaryPrimitives.ReadInt32LittleEndian(payload.Slice(46)));
         if (!IsValidDiverRuntimeState(candidate))
             return false;
         state = candidate;
@@ -3601,8 +3724,9 @@ internal static class Protocol
 
         var hasAmmo = (state.Fields & DiverRuntimeFields.Ammo) != 0;
         return hasAmmo
-            ? hasWeapon && state.Ammo is >= 0 and <= 1_000_000
-            : state.Ammo == 0;
+            ? hasWeapon && state.MaxAmmo is > 0 and <= 1_000_000 &&
+              state.Ammo >= 0 && state.Ammo <= state.MaxAmmo
+            : state.Ammo == 0 && state.MaxAmmo == 0;
     }
 
     private static bool IsValidRuntimeValuePair(float current, float maximum) =>
@@ -3641,6 +3765,47 @@ internal static class Protocol
             DiverVitalCause.Revive =>
                 result.AppliedAmount > 0f && result.Edges == DiverVitalEdges.Revived &&
                 !state.IsDead,
+            _ => false
+        };
+    }
+
+    private static bool IsValidDiverWeaponIntent(DiverWeaponIntent intent) =>
+        intent.SceneId != 0 && intent.SceneEpoch != 0 && intent.RequestId != 0 &&
+        Enum.IsDefined(typeof(DiverWeaponAction), intent.Action) &&
+        (intent.Action == DiverWeaponAction.Unequip
+            ? intent.WeaponId == 0
+            : intent.WeaponId > 0);
+
+    private static bool IsValidDiverWeaponResult(DiverWeaponResult result)
+    {
+        if (result.CommitRevision == 0 || result.RequestId == 0 ||
+            !Enum.IsDefined(typeof(DiverWeaponAction), result.Action) ||
+            !Enum.IsDefined(typeof(DiverWeaponRejectReason), result.RejectReason) ||
+            result.Accepted != (result.RejectReason == DiverWeaponRejectReason.None) ||
+            !IsValidDiverRuntimeState(result.State) || result.State.Owner != DiverOwner.Client)
+            return false;
+
+        var weaponFields = result.State.Fields &
+            (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo);
+        var equipped = weaponFields ==
+            (DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo);
+        var unequipped = weaponFields == DiverRuntimeFields.None;
+        if (!equipped && !unequipped)
+            return false;
+
+        if (result.Accepted &&
+            (result.Action == DiverWeaponAction.Unequip ? !unequipped : !equipped))
+            return false;
+        if (!result.Accepted)
+            return result.AppliedRounds == 0;
+
+        return result.Action switch
+        {
+            DiverWeaponAction.Fire or DiverWeaponAction.Reload =>
+                result.AppliedRounds > 0 &&
+                result.AppliedRounds <= result.State.MaxAmmo,
+            DiverWeaponAction.Equip or DiverWeaponAction.Unequip =>
+                result.AppliedRounds == 0,
             _ => false
         };
     }
@@ -3814,7 +3979,7 @@ internal static class Protocol
             DiverRuntimeFields.Health | DiverRuntimeFields.Oxygen |
             DiverRuntimeFields.Cargo | DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo,
             DiverRuntimeFlags.OxygenDepleting,
-            80f, 100f, 45f, 120f, 17.5f, 2101, 8);
+            80f, 100f, 45f, 120f, 17.5f, 2101, 8, 12);
         var diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
         if (!TryDecodeDiverRuntimeState(
                 diverRuntimePacket, out sequence, out var actualDiverRuntime) ||
@@ -3857,6 +4022,18 @@ internal static class Protocol
         WriteSingle(diverRuntimePacket.AsSpan(HeaderSize + 34), 0f);
         if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted cargo flag without cargo state");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 46), expectedDiverRuntime.Ammo - 1);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted ammo above diver max ammo");
+        diverRuntimePacket = EncodeDiverRuntimeState(47, expectedDiverRuntime);
+        BinaryPrimitives.WriteUInt16LittleEndian(
+            diverRuntimePacket.AsSpan(HeaderSize + 14),
+            (ushort)(expectedDiverRuntime.Fields & ~DiverRuntimeFields.Ammo));
+        BinaryPrimitives.WriteInt32LittleEndian(diverRuntimePacket.AsSpan(HeaderSize + 42), 0);
+        if (TryDecodeDiverRuntimeState(diverRuntimePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted max ammo without ammo state");
 
         var vitalState = expectedDiverRuntime with
         {
@@ -3893,6 +4070,81 @@ internal static class Protocol
         vitalResultPacket[HeaderSize + 31] = 1;
         if (TryDecodeDiverVitalResult(vitalResultPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted nonzero dead diver vital state");
+
+        var expectedWeaponIntent = new DiverWeaponIntent(
+            expectedDiverRuntime.SceneId, expectedDiverRuntime.SceneEpoch,
+            0x123456789abcdef0, DiverWeaponAction.Fire, expectedDiverRuntime.WeaponId);
+        var weaponIntentPacket = EncodeDiverWeaponIntent(49, expectedWeaponIntent);
+        if (!TryDecodeDiverWeaponIntent(
+                weaponIntentPacket, out sequence, out var actualWeaponIntent) ||
+            sequence != 49 || actualWeaponIntent != expectedWeaponIntent)
+            throw new InvalidOperationException("Diver weapon intent round-trip failed");
+        if (TryDecodeDiverWeaponIntent(
+                weaponIntentPacket.AsSpan(0, weaponIntentPacket.Length - 1), out _, out _))
+            throw new InvalidOperationException("Protocol accepted truncated diver weapon intent");
+        weaponIntentPacket[HeaderSize + 16] = byte.MaxValue;
+        if (TryDecodeDiverWeaponIntent(weaponIntentPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid diver weapon action");
+        weaponIntentPacket = EncodeDiverWeaponIntent(49, expectedWeaponIntent);
+        weaponIntentPacket[HeaderSize + 16] = (byte)DiverWeaponAction.Unequip;
+        if (TryDecodeDiverWeaponIntent(weaponIntentPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted weapon ID on unequip intent");
+
+        var weaponState = expectedDiverRuntime with
+        {
+            Owner = DiverOwner.Client,
+            Revision = 4,
+            Ammo = 7
+        };
+        var expectedWeaponResult = new DiverWeaponResult(
+            6, expectedWeaponIntent.RequestId, DiverWeaponAction.Fire, true,
+            DiverWeaponRejectReason.None, 1, weaponState);
+        var weaponResultPacket = EncodeDiverWeaponResult(50, expectedWeaponResult);
+        if (!TryDecodeDiverWeaponResult(
+                weaponResultPacket, out sequence, out var actualWeaponResult) ||
+            sequence != 50 || actualWeaponResult != expectedWeaponResult)
+            throw new InvalidOperationException("Diver weapon result round-trip failed");
+        if (TryDecodeDiverWeaponResult(
+                weaponResultPacket.AsSpan(0, weaponResultPacket.Length - 1), out _, out _))
+            throw new InvalidOperationException("Protocol accepted truncated diver weapon result");
+        weaponResultPacket[HeaderSize + 13] = 2;
+        if (TryDecodeDiverWeaponResult(weaponResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid weapon acceptance flag");
+        weaponResultPacket = EncodeDiverWeaponResult(50, expectedWeaponResult);
+        weaponResultPacket[HeaderSize + 14] = (byte)DiverWeaponRejectReason.NoAmmo;
+        if (TryDecodeDiverWeaponResult(weaponResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted rejection reason on accepted weapon result");
+        weaponResultPacket = EncodeDiverWeaponResult(50, expectedWeaponResult);
+        weaponResultPacket[HeaderSize + 12] = (byte)DiverWeaponAction.Unequip;
+        if (TryDecodeDiverWeaponResult(weaponResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted equipped state after accepted unequip");
+        weaponResultPacket = EncodeDiverWeaponResult(50, expectedWeaponResult);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            weaponResultPacket.AsSpan(HeaderSize + 19 + 46), 0);
+        if (TryDecodeDiverWeaponResult(weaponResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted weapon result without max ammo");
+        weaponResultPacket = EncodeDiverWeaponResult(50, expectedWeaponResult);
+        weaponResultPacket[HeaderSize + 13] = 0;
+        weaponResultPacket[HeaderSize + 14] = (byte)DiverWeaponRejectReason.NoAmmo;
+        if (TryDecodeDiverWeaponResult(weaponResultPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted applied rounds on rejected weapon result");
+
+        var unequippedState = weaponState with
+        {
+            Fields = weaponState.Fields &
+                ~(DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo),
+            WeaponId = 0,
+            Ammo = 0,
+            MaxAmmo = 0
+        };
+        var unequipResult = new DiverWeaponResult(
+            7, expectedWeaponIntent.RequestId + 1, DiverWeaponAction.Unequip, true,
+            DiverWeaponRejectReason.None, 0, unequippedState);
+        weaponResultPacket = EncodeDiverWeaponResult(51, unequipResult);
+        if (!TryDecodeDiverWeaponResult(
+                weaponResultPacket, out sequence, out actualWeaponResult) ||
+            sequence != 51 || actualWeaponResult != unequipResult)
+            throw new InvalidOperationException("Diver weapon unequip result round-trip failed");
 
         var expectedInteraction = new NpcInteraction(
             0x123456789abcdef0, SceneId("DR_Lobby"), 4, 0x10203040, 7,

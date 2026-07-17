@@ -63,6 +63,9 @@ internal sealed class RemoteAvatar : IDisposable
     private bool _initialized;
     private bool _hasVisualState;
     private bool _isRemoteDead;
+    private int _remoteWeaponId;
+    private int _remoteAmmo;
+    private int _remoteMaxAmmo;
     private RemoteDiverHitbox _hitbox;
 
     internal Transform Transform => _gameObject?.transform;
@@ -159,7 +162,22 @@ internal sealed class RemoteAvatar : IDisposable
 
     internal void ApplyRuntime(DiverRuntimeState state)
     {
-        _isRemoteDead = state.IsDead;
+        if ((state.Fields & (DiverRuntimeFields.Health | DiverRuntimeFields.Oxygen)) != 0)
+            _isRemoteDead = state.IsDead;
+        if ((state.Fields & DiverRuntimeFields.Weapon) != 0)
+            _remoteWeaponId = state.WeaponId;
+        else
+            _remoteWeaponId = 0;
+        if ((state.Fields & DiverRuntimeFields.Ammo) != 0)
+        {
+            _remoteAmmo = state.Ammo;
+            _remoteMaxAmmo = state.MaxAmmo;
+        }
+        else
+        {
+            _remoteAmmo = 0;
+            _remoteMaxAmmo = 0;
+        }
         if (_isRemoteDead)
             _hitbox?.Disarm();
         ApplyTint();
@@ -219,9 +237,27 @@ internal sealed class RemoteAvatar : IDisposable
             if (player.IsImmuneDamage)
                 flags |= DiverRuntimeFlags.Invulnerable;
 
+            var weaponId = 0;
+            var ammo = 0;
+            var maxAmmo = 0;
+            var inventory = player.CurrentInstanceItemInventory;
+            var gun = inventory?.gunHandler;
+            if (gun != null && gun.IsEnabled)
+            {
+                var spec = gun.GunSpec;
+                if (spec == null || spec.TID <= 0)
+                    return false;
+                ammo = gun.GetAmmo();
+                maxAmmo = gun.m_MaxAmmo;
+                if (maxAmmo is <= 0 or > 1_000_000 || ammo < 0 || ammo > maxAmmo)
+                    return false;
+                weaponId = spec.TID;
+                fields |= DiverRuntimeFields.Weapon | DiverRuntimeFields.Ammo;
+            }
+
             state = new DiverRuntimeState(
                 sceneId, sceneEpoch, revision, DiverOwner.Host, player.IsDead(), fields, flags,
-                0f, 0f, oxygen, maxOxygen, cargoWeight, 0, 0);
+                0f, 0f, oxygen, maxOxygen, cargoWeight, weaponId, ammo, maxAmmo);
             return true;
         }
         catch

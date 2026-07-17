@@ -23,6 +23,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxReliableAttempts = 12;
     private const float ReliableExpirySeconds = 15f;
     private const int MaxPendingDiverVitalResults = 256;
+    private const int MaxPendingDiverWeaponPackets = 256;
 
     private sealed class ReliableReceiveWindow
     {
@@ -121,6 +122,15 @@ internal sealed class UdpSession : IDisposable
     private readonly HashSet<ulong> _deliveredDiverVitalEvents = new();
     private readonly Queue<ulong> _deliveredDiverVitalEventOrder = new();
     private uint _nextDiverVitalCommitRevision = 2;
+    private readonly ConcurrentQueue<DiverWeaponIntent> _diverWeaponIntents = new();
+    private readonly HashSet<ulong> _receivedDiverWeaponRequests = new();
+    private readonly Queue<ulong> _receivedDiverWeaponRequestOrder = new();
+    private readonly ConcurrentQueue<DiverWeaponResult> _diverWeaponResults = new();
+    private readonly Dictionary<uint, DiverWeaponResult> _pendingWorldDiverWeaponResults = new();
+    private readonly Dictionary<uint, DiverWeaponResult> _pendingDiverWeaponCommits = new();
+    private readonly HashSet<ulong> _deliveredDiverWeaponRequests = new();
+    private readonly Queue<ulong> _deliveredDiverWeaponRequestOrder = new();
+    private uint _nextDiverWeaponCommitRevision = 2;
     private readonly Queue<int> _projectileVisualOrder = new();
     private readonly Dictionary<int, ProjectileVisualState> _projectileVisualStates = new();
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
@@ -257,6 +267,7 @@ internal sealed class UdpSession : IDisposable
         TestPlayerVisualCoalescing();
         TestDiverRuntimeCoalescing();
         TestDiverVitalOrdering();
+        TestDiverWeaponOrdering();
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -379,6 +390,65 @@ internal sealed class UdpSession : IDisposable
             throw new InvalidOperationException("Diver vital future-world delivery self-test failed");
     }
 
+    private static void TestDiverWeaponOrdering()
+    {
+        static UdpSession ClientSession(uint remoteEpoch = 20) => new(null)
+        {
+            _connected = true,
+            _role = SessionRole.Client,
+            _localSceneId = 10,
+            _remoteSceneId = 10,
+            _remoteSceneEpoch = remoteEpoch,
+            _hasRemoteScene = true
+        };
+        static DiverWeaponResult Result(uint commit, ulong requestId, uint stateRevision,
+            uint sceneEpoch = 20) =>
+            new(commit, requestId, DiverWeaponAction.Fire, true,
+                DiverWeaponRejectReason.None, 1,
+                default(DiverRuntimeState) with
+                {
+                    Owner = DiverOwner.Client,
+                    SceneId = 10,
+                    SceneEpoch = sceneEpoch,
+                    Revision = stateRevision
+                });
+
+        var session = ClientSession();
+        session.EnqueueOrderedDiverWeaponResult(Result(3, 3, 3));
+        session.EnqueueOrderedDiverWeaponResult(Result(2, 2, 2));
+        if (!session.TryTakeDiverWeaponResult(out var second) || second.CommitRevision != 2 ||
+            !session.TryTakeDiverWeaponResult(out var third) || third.CommitRevision != 3)
+            throw new InvalidOperationException("Diver weapon reorder self-test failed");
+
+        session.EnqueueOrderedDiverWeaponResult(Result(4, 2, 4));
+        session.EnqueueOrderedDiverWeaponResult(Result(5, 5, 5));
+        if (!session.TryTakeDiverWeaponResult(out var fifth) || fifth.CommitRevision != 5 ||
+            session.TryTakeDiverWeaponResult(out _))
+            throw new InvalidOperationException("Diver weapon duplicate self-test failed");
+
+        session._lastClientRuntimeRevision = 6;
+        session.EnqueueOrderedDiverWeaponResult(Result(6, 6, 5));
+        if (session.TryTakeDiverWeaponResult(out _))
+            throw new InvalidOperationException("Diver weapon stale result self-test failed");
+
+        var queuedSnapshot = ClientSession();
+        queuedSnapshot.EnqueueDiverRuntimeState(Result(2, 8, 2).State with { Revision = 1 });
+        queuedSnapshot.EnqueueOrderedDiverWeaponResult(Result(2, 8, 2));
+        if (queuedSnapshot.TryTakeDiverRuntimeState(out _) ||
+            !queuedSnapshot.TryTakeDiverWeaponResult(out _))
+            throw new InvalidOperationException("Diver weapon stale snapshot self-test failed");
+
+        var future = ClientSession(19);
+        future.ReceiveDiverWeaponResult(100, Result(2, 7, 2));
+        if (future.TryTakeDiverWeaponResult(out _) ||
+            future._pendingWorldDiverWeaponResults.Count != 1)
+            throw new InvalidOperationException("Diver weapon future-world buffering self-test failed");
+        future.SetRemoteWorld(10, 20);
+        if (!future.TryTakeDiverWeaponResult(out var deliveredFuture) ||
+            deliveredFuture.RequestId != 7 || future._pendingWorldDiverWeaponResults.Count != 0)
+            throw new InvalidOperationException("Diver weapon future-world delivery self-test failed");
+    }
+
     internal bool Connected => _connected;
     internal bool IsRunning => _udp != null && !_receiveFailed;
     internal string RemoteName => _remoteName;
@@ -445,6 +515,183 @@ internal sealed class UdpSession : IDisposable
 
     internal bool TryTakeDiverVitalResult(out DiverVitalResult result) =>
         _diverVitalResults.TryDequeue(out result);
+
+    internal bool SendDiverWeaponIntent(DiverWeaponIntent intent) =>
+        _role == SessionRole.Client &&
+        MatchesRemoteWorld(intent.SceneId, intent.SceneEpoch) &&
+        SendReliable(Protocol.EncodeDiverWeaponIntent(++_sequence, intent));
+
+    internal bool TryTakeDiverWeaponIntent(out DiverWeaponIntent intent)
+    {
+        while (_role == SessionRole.Host && _diverWeaponIntents.TryDequeue(out intent))
+            if (MatchesLocalWorld(intent.SceneId, intent.SceneEpoch))
+                return true;
+        intent = default;
+        return false;
+    }
+
+    internal bool SendDiverWeaponResult(DiverWeaponResult result) =>
+        _role == SessionRole.Host &&
+        MatchesLocalWorld(result.State.SceneId, result.State.SceneEpoch) &&
+        SendReliable(Protocol.EncodeDiverWeaponResult(++_sequence, result));
+
+    internal bool TryTakeDiverWeaponResult(out DiverWeaponResult result)
+    {
+        while (_role == SessionRole.Client && _diverWeaponResults.TryDequeue(out result))
+            if (MatchesRemoteWorld(result.State.SceneId, result.State.SceneEpoch))
+                return true;
+        result = default;
+        return false;
+    }
+
+    private void ReceiveDiverWeaponIntent(uint sequence, DiverWeaponIntent intent)
+    {
+        if (!MatchesLocalWorld(intent.SceneId, intent.SceneEpoch))
+        {
+            AcceptReliable(sequence);
+            return;
+        }
+        if (_receivedDiverWeaponRequests.Contains(intent.RequestId))
+        {
+            AcceptReliable(sequence);
+            return;
+        }
+        if (_diverWeaponIntents.Count >= MaxPendingDiverWeaponPackets)
+            return;
+        if (!AcceptReliable(sequence))
+            return;
+
+        _receivedDiverWeaponRequests.Add(intent.RequestId);
+        _receivedDiverWeaponRequestOrder.Enqueue(intent.RequestId);
+        if (_receivedDiverWeaponRequestOrder.Count > MaxPendingDiverWeaponPackets)
+            _receivedDiverWeaponRequests.Remove(_receivedDiverWeaponRequestOrder.Dequeue());
+        _diverWeaponIntents.Enqueue(intent);
+    }
+
+    private void ReceiveDiverWeaponResult(uint sequence, DiverWeaponResult result)
+    {
+        if (!MatchesRemoteWorld(result.State.SceneId, result.State.SceneEpoch))
+        {
+            if (_pendingWorldDiverWeaponResults.ContainsKey(sequence))
+            {
+                AcceptReliable(sequence);
+                return;
+            }
+            if (_pendingWorldDiverWeaponResults.Count >= MaxPendingDiverWeaponPackets)
+                return;
+            if (AcceptReliable(sequence))
+                _pendingWorldDiverWeaponResults[sequence] = result;
+            return;
+        }
+        if (!DiverWeaponCommitWithinWindow(result.CommitRevision))
+        {
+            FailReliableDelivery("diver weapon commit gap exceeds receive window");
+            return;
+        }
+        if (AcceptReliable(sequence))
+            EnqueueOrderedDiverWeaponResult(result);
+    }
+
+    private void EnqueueOrderedDiverWeaponResult(DiverWeaponResult result)
+    {
+        if (!DiverWeaponCommitWithinWindow(result.CommitRevision))
+        {
+            FailReliableDelivery("diver weapon commit gap exceeds receive window");
+            return;
+        }
+        if (result.CommitRevision == _nextDiverWeaponCommitRevision)
+        {
+            DeliverDiverWeaponResult(result);
+            while (_pendingDiverWeaponCommits.Remove(
+                       _nextDiverWeaponCommitRevision, out var pending))
+                DeliverDiverWeaponResult(pending);
+            return;
+        }
+
+        var distance = unchecked(result.CommitRevision - _nextDiverWeaponCommitRevision);
+        if (IsNewer(result.CommitRevision, _nextDiverWeaponCommitRevision) &&
+            distance <= MaxPendingDiverWeaponPackets)
+            _pendingDiverWeaponCommits.TryAdd(result.CommitRevision, result);
+    }
+
+    private void DeliverDiverWeaponResult(DiverWeaponResult result)
+    {
+        _nextDiverWeaponCommitRevision = NextRevision(_nextDiverWeaponCommitRevision);
+        if (result.State.Revision != _lastClientRuntimeRevision &&
+            !IsNewer(result.State.Revision, _lastClientRuntimeRevision))
+            return;
+        if (!_deliveredDiverWeaponRequests.Add(result.RequestId))
+            return;
+
+        _deliveredDiverWeaponRequestOrder.Enqueue(result.RequestId);
+        if (_deliveredDiverWeaponRequestOrder.Count > MaxPendingDiverWeaponPackets)
+            _deliveredDiverWeaponRequests.Remove(_deliveredDiverWeaponRequestOrder.Dequeue());
+        if (IsNewer(result.State.Revision, _lastClientRuntimeRevision))
+            _lastClientRuntimeRevision = result.State.Revision;
+        if (_hasClientRuntimeState &&
+            !IsNewer(_latestClientRuntimeState.Revision, result.State.Revision))
+        {
+            _latestClientRuntimeState = default;
+            _hasClientRuntimeState = false;
+        }
+        while (_diverWeaponResults.Count >= MaxPendingDiverWeaponPackets &&
+               _diverWeaponResults.TryDequeue(out _))
+        {
+        }
+        _diverWeaponResults.Enqueue(result);
+    }
+
+    private bool DiverWeaponCommitWithinWindow(uint commitRevision)
+    {
+        if (commitRevision == _nextDiverWeaponCommitRevision ||
+            !IsNewer(commitRevision, _nextDiverWeaponCommitRevision))
+            return true;
+        return unchecked(commitRevision - _nextDiverWeaponCommitRevision) <=
+            MaxPendingDiverWeaponPackets;
+    }
+
+    private void DrainPendingWorldDiverWeaponResults()
+    {
+        if (_pendingWorldDiverWeaponResults.Count == 0)
+            return;
+        var ready = new List<uint>();
+        foreach (var pair in _pendingWorldDiverWeaponResults)
+            if (MatchesRemoteWorld(pair.Value.State.SceneId, pair.Value.State.SceneEpoch))
+                ready.Add(pair.Key);
+        foreach (var sequence in ready)
+            if (_pendingWorldDiverWeaponResults.Remove(sequence, out var result))
+                EnqueueOrderedDiverWeaponResult(result);
+    }
+
+    private void PrunePendingWorldDiverWeaponResults(uint localSceneId)
+    {
+        var stale = new List<uint>();
+        foreach (var pair in _pendingWorldDiverWeaponResults)
+            if (pair.Value.State.SceneId != localSceneId ||
+                _hasRemoteScene && pair.Value.State.SceneId == _remoteSceneId &&
+                IsNewer(_remoteSceneEpoch, pair.Value.State.SceneEpoch))
+                stale.Add(pair.Key);
+        foreach (var sequence in stale)
+            _pendingWorldDiverWeaponResults.Remove(sequence);
+    }
+
+    private void ResetDiverWeaponState(bool clearPendingWorld)
+    {
+        while (_diverWeaponIntents.TryDequeue(out _))
+        {
+        }
+        _receivedDiverWeaponRequests.Clear();
+        _receivedDiverWeaponRequestOrder.Clear();
+        while (_diverWeaponResults.TryDequeue(out _))
+        {
+        }
+        _pendingDiverWeaponCommits.Clear();
+        _deliveredDiverWeaponRequests.Clear();
+        _deliveredDiverWeaponRequestOrder.Clear();
+        _nextDiverWeaponCommitRevision = 2;
+        if (clearPendingWorld)
+            _pendingWorldDiverWeaponResults.Clear();
+    }
 
     private void ReceiveDiverVitalResult(uint sequence, DiverVitalResult result)
     {
@@ -1353,6 +1600,28 @@ internal sealed class UdpSession : IDisposable
             return;
         }
 
+        if (type == PacketType.DiverWeaponIntent)
+        {
+            if (_connected && _role == SessionRole.Host &&
+                Protocol.TryDecodeDiverWeaponIntent(received.Buffer, out _, out var intent))
+            {
+                _lastReceive = now;
+                ReceiveDiverWeaponIntent(sequence, intent);
+            }
+            return;
+        }
+
+        if (type == PacketType.DiverWeaponResult)
+        {
+            if (_connected && _role == SessionRole.Client &&
+                Protocol.TryDecodeDiverWeaponResult(received.Buffer, out _, out var result))
+            {
+                _lastReceive = now;
+                ReceiveDiverWeaponResult(sequence, result);
+            }
+            return;
+        }
+
         if (type == PacketType.ProjectileVisualState)
         {
             if (_connected && Protocol.TryDecodeProjectileVisualState(received.Buffer, out _, out var state) &&
@@ -2060,6 +2329,8 @@ internal sealed class UdpSession : IDisposable
         _hasRemoteScene = true;
         PrunePendingWorldDiverVitalResults(_localSceneId);
         DrainPendingWorldDiverVitalResults();
+        PrunePendingWorldDiverWeaponResults(_localSceneId);
+        DrainPendingWorldDiverWeaponResults();
     }
 
     private void ClearRemoteWorldState()
@@ -2077,6 +2348,7 @@ internal sealed class UdpSession : IDisposable
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
         ResetDiverVitalReceiveState(false);
+        ResetDiverWeaponState(false);
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         _lastVisualSequence = 0;
@@ -2349,6 +2621,7 @@ internal sealed class UdpSession : IDisposable
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
         ResetDiverVitalReceiveState(true);
+        ResetDiverWeaponState(true);
         _projectileVisualOrder.Clear();
         _projectileVisualStates.Clear();
         while (_fishDamageRequests.TryDequeue(out _))

@@ -28,6 +28,7 @@ internal sealed class BossReplicator
     private readonly Dictionary<uint, BossState> _lastHostStates = new();
     private readonly Dictionary<uint, float> _lastHostKeyframes = new();
     private readonly Dictionary<uint, BossState> _pendingClientStates = new();
+    private readonly HashSet<uint> _unsupportedClientDamage = new();
     private float _nextScan;
     private float _nextSend;
     private uint _tick;
@@ -67,7 +68,7 @@ internal sealed class BossReplicator
                 ScanHost(sceneId);
             }
             while (session.TryTakeBossDamageRequest(out var request))
-                ApplyHostDamage(session, sceneId, now, request);
+                RejectUnsupportedHostDamage(session, sceneId, request);
             if (now >= _nextSend)
             {
                 _nextSend = now + 0.1f;
@@ -147,6 +148,7 @@ internal sealed class BossReplicator
         _lastHostStates.Clear();
         _lastHostKeyframes.Clear();
         _pendingClientStates.Clear();
+        _unsupportedClientDamage.Clear();
         _nextScan = 0f;
         _nextSend = 0f;
         _tick = 0;
@@ -193,34 +195,19 @@ internal sealed class BossReplicator
         }
     }
 
-    private void ApplyHostDamage(
+    private void RejectUnsupportedHostDamage(
         UdpSession session,
         uint sceneId,
-        float now,
         BossDamageRequest request)
     {
         if (request.SceneId != sceneId || request.SceneEpoch != session.LocalSceneEpoch ||
             !_hostBosses.TryGetValue(request.BossId, out var boss) ||
-            boss == null || !FishReplicator.IsPlayerAttack((AttackType)request.AttackType) ||
-            !session.TryGetFreshRemotePlayerSnapshot(now, 0.75f, out var player) ||
-            player.SceneId != sceneId || !InRange(boss.transform.position, player, 3600f))
+            boss == null || !FishReplicator.IsPlayerAttack((AttackType)request.AttackType))
             return;
-
-        try
-        {
-            var current = Math.Max(0, boss.CurrentBossHP);
-            if (current == 0 || boss.IsDeadBoss())
-                return;
-            var next = Math.Max(0, current - request.Damage);
-            boss.CurrentBossHP = next;
-            if (next == 0)
-                boss.OnDie();
-            _nextSend = 0f;
-        }
-        catch (Exception exception)
-        {
-            _log.LogWarning($"Network boss damage apply failed: {exception.Message}");
-        }
+        if (_unsupportedClientDamage.Add(request.BossId))
+            _log.LogWarning(
+                $"Network boss damage rejected until a native family adapter exists: " +
+                $"{boss.GetType().Name}; id={request.BossId:X8}");
     }
 
     private void SendHostStates(UdpSession session, uint sceneId, float now)
@@ -316,13 +303,6 @@ internal sealed class BossReplicator
     {
         var difference = MathF.Abs(left - right);
         return MathF.Min(difference, 1f - difference);
-    }
-
-    private static bool InRange(Vector3 boss, PlayerSnapshot player, float maxSquaredDistance)
-    {
-        var dx = boss.x - player.X;
-        var dy = boss.y - player.Y;
-        return dx * dx + dy * dy <= maxSquaredDistance;
     }
 
     private static bool IsNewer(uint value, uint previous) =>
