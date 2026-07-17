@@ -266,6 +266,10 @@ internal sealed class FishReplicator
     private readonly List<FishAllocator> _allocatorScratch = new();
     private readonly Dictionary<FishAISystem, FishAllocator> _allocatorByFishScratch = new();
     private readonly Dictionary<string, FishAllocator> _clientAllocatorByUidScratch = new();
+    private readonly Dictionary<FishAllocator, string> _allocatorUidsScratch = new();
+    private readonly HashSet<string> _ambiguousAllocatorUidsScratch = new(StringComparer.Ordinal);
+    private readonly HashSet<FishAISystem> _ambiguousHostFishScratch = new();
+    private readonly HashSet<string> _reportedAmbiguousAllocatorUids = new(StringComparer.Ordinal);
     private readonly Dictionary<(string AllocatorUid, int FishDataTID), List<FishAISystem>>
         _availableClientFishScratch = new();
     private readonly List<FishAISystem> _staleFishScratch = new();
@@ -322,6 +326,7 @@ internal sealed class FishReplicator
 
     internal static void SelfTest()
     {
+        TestUniqueAllocatorUids();
         var patchFlags = System.Reflection.BindingFlags.NonPublic |
             System.Reflection.BindingFlags.Static;
         var ordered = new List<TimedSample>();
@@ -637,6 +642,22 @@ internal sealed class FishReplicator
             ShouldSuppressPendingClientFishLootPolicy(false, true, false, true, true) ||
             ShouldSuppressPendingClientFishLootPolicy(false, false, true, true, true))
             throw new InvalidOperationException("Pending client fish loot policy failed");
+    }
+
+    private static void TestUniqueAllocatorUids()
+    {
+        var unique = new Dictionary<string, object>(StringComparer.Ordinal);
+        var duplicates = new HashSet<string>(StringComparer.Ordinal);
+        var first = new object();
+        var second = new object();
+        AddUniqueAllocatorUid(unique, duplicates, "allocator-a", first);
+        AddUniqueAllocatorUid(unique, duplicates, "allocator-b", second);
+        AddUniqueAllocatorUid(unique, duplicates, "allocator-a", new object());
+        AddUniqueAllocatorUid(unique, duplicates, "allocator-a", new object());
+        AddUniqueAllocatorUid(unique, duplicates, " ", new object());
+        if (unique.Count != 1 || !unique.TryGetValue("allocator-b", out var owner) ||
+            !ReferenceEquals(owner, second) || !duplicates.SetEquals(new[] { "allocator-a" }))
+            throw new InvalidOperationException("Fish allocator unique-ID policy failed");
     }
 
     internal void Update(
@@ -1262,6 +1283,7 @@ internal sealed class FishReplicator
         _hostIdsByFish.Clear();
         _hostInfoById.Clear();
         _hostRemovedFish.Clear();
+        _reportedAmbiguousAllocatorUids.Clear();
         _pendingClientActions.Clear();
         _pendingClientActionByFish.Clear();
         _queuedClientActions.Clear();
@@ -1539,18 +1561,33 @@ internal sealed class FishReplicator
                 _allocatorScratch.Add(allocator);
         }
 
-        _allocatorByFishScratch.Clear();
+        _allocatorUidsScratch.Clear();
+        _ambiguousAllocatorUidsScratch.Clear();
+        var uniqueAllocators = new Dictionary<string, FishAllocator>(StringComparer.Ordinal);
         foreach (var allocator in _allocatorScratch)
         {
+            var uid = GetNetworkAllocatorUid(allocator);
+            _allocatorUidsScratch.Add(allocator, uid);
+            AddUniqueAllocatorUid(uniqueAllocators, _ambiguousAllocatorUidsScratch, uid, allocator);
+        }
+        foreach (var uid in _ambiguousAllocatorUidsScratch)
+            ReportAmbiguousAllocatorUid(uid);
+
+        _allocatorByFishScratch.Clear();
+        _ambiguousHostFishScratch.Clear();
+        foreach (var allocator in _allocatorScratch)
+        {
+            var uid = _allocatorUidsScratch[allocator];
             var fishs = allocator.GetInstancedFishs;
             if (fishs == null)
                 continue;
             foreach (var fish in fishs)
-            {
                 if (fish != null && ManifestEntryEligible(fish.IsFishCaptured) &&
                     !_hostRemovedFish.Contains(fish))
-                    _allocatorByFishScratch.TryAdd(fish, allocator);
-            }
+                    if (_ambiguousAllocatorUidsScratch.Contains(uid))
+                        _ambiguousHostFishScratch.Add(fish);
+                    else
+                        _allocatorByFishScratch.TryAdd(fish, allocator);
         }
 
         var topologyChanged = false;
@@ -1558,7 +1595,7 @@ internal sealed class FishReplicator
         foreach (var pair in _hostIdsByFish)
         {
             var id = pair.Value;
-            if (pair.Key == null)
+            if (pair.Key == null || _ambiguousHostFishScratch.Contains(pair.Key))
                 _staleFishScratch.Add(pair.Key);
             else if (_allocatorByFishScratch.ContainsKey(pair.Key))
             {
@@ -1576,6 +1613,8 @@ internal sealed class FishReplicator
         }
         foreach (var fish in _staleFishScratch)
         {
+            if (fish != null && _ambiguousHostFishScratch.Contains(fish))
+                _hostRemovedFish.Add(fish);
             var id = _hostIdsByFish[fish];
             SendHostDespawn(session, sceneId, id);
             RemoveHostFish(id);
@@ -2963,10 +3002,12 @@ internal sealed class FishReplicator
 
     private bool RetryPendingClientManifests(float now)
     {
-        if (_pendingClientManifests.Count == 0 || !ManifestRetryDue(now, _nextClientBind))
+        if (!ManifestRetryDue(now, _nextClientBind))
             return false;
         _nextClientBind = now + 0.1f;
         IndexAvailableClientFish(_appliedClientSceneId);
+        if (_pendingClientManifests.Count == 0)
+            return false;
         _manifestScratch.Clear();
         _manifestScratch.AddRange(_pendingClientManifests.Values);
         foreach (var manifest in _manifestScratch)
@@ -3855,6 +3896,8 @@ internal sealed class FishReplicator
     private void IndexAvailableClientFish(uint sceneId)
     {
         _clientAllocatorByUidScratch.Clear();
+        _allocatorUidsScratch.Clear();
+        _ambiguousAllocatorUidsScratch.Clear();
         foreach (var fish in _availableClientFishScratch.Values)
             fish.Clear();
         foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
@@ -3863,9 +3906,24 @@ internal sealed class FishReplicator
             if (allocator == null)
                 continue;
             var uid = GetNetworkAllocatorUid(allocator);
-            if (string.IsNullOrEmpty(uid))
+            _allocatorUidsScratch[allocator] = uid;
+            AddUniqueAllocatorUid(
+                _clientAllocatorByUidScratch, _ambiguousAllocatorUidsScratch, uid, allocator);
+        }
+        foreach (var uid in _ambiguousAllocatorUidsScratch)
+            ReportAmbiguousAllocatorUid(uid);
+        _idScratch.Clear();
+        foreach (var pair in _targets)
+            if (_ambiguousAllocatorUidsScratch.Contains(pair.Value.AllocatorUid))
+                _idScratch.Add(pair.Key);
+        foreach (var id in _idScratch)
+            RemoveClientTarget(id, false);
+        foreach (var pair in _allocatorUidsScratch)
+        {
+            var allocator = pair.Key;
+            var uid = pair.Value;
+            if (_ambiguousAllocatorUidsScratch.Contains(uid))
                 continue;
-            _clientAllocatorByUidScratch.TryAdd(uid, allocator);
             var fishs = allocator.GetInstancedFishs;
             if (fishs == null)
                 continue;
@@ -4172,6 +4230,31 @@ internal sealed class FishReplicator
         {
         }
         return $"A{WorldObjectId.For(allocator):X8}";
+    }
+
+    private void ReportAmbiguousAllocatorUid(string uid)
+    {
+        if (!_reportedAmbiguousAllocatorUids.Add(uid))
+            return;
+        _log.LogWarning($"Network fish replication disabled for duplicate allocator UID: {uid}");
+        _trace?.Write("FISH-ID-COLLISION", $"allocator={uid}");
+    }
+
+    private static void AddUniqueAllocatorUid<T>(
+        IDictionary<string, T> unique,
+        ISet<string> duplicates,
+        string uid,
+        T value)
+    {
+        if (string.IsNullOrWhiteSpace(uid) || duplicates.Contains(uid))
+            return;
+        if (unique.ContainsKey(uid))
+        {
+            unique.Remove(uid);
+            duplicates.Add(uid);
+            return;
+        }
+        unique.Add(uid, value);
     }
 
     private static bool AllocatorUidMatches(string expected, string actual) =>

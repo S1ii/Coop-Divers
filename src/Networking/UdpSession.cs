@@ -16,6 +16,12 @@ internal enum SessionRole
     Client
 }
 
+internal readonly record struct DiverCommitDiagnostics(
+    uint HostRuntimeRevision,
+    uint ClientRuntimeRevision,
+    uint WeaponCommitRevision,
+    uint VitalCommitRevision);
+
 internal sealed class UdpSession : IDisposable
 {
     private const int MaxIncomingDatagrams = 1024;
@@ -160,6 +166,8 @@ internal sealed class UdpSession : IDisposable
     private bool _hasClientRuntimeState;
     private uint _lastHostRuntimeRevision;
     private uint _lastClientRuntimeRevision;
+    private uint _lastDiverWeaponCommitRevision;
+    private uint _lastDiverVitalCommitRevision;
     private readonly ConcurrentQueue<DiverVitalResult> _diverVitalResults = new();
     private readonly Dictionary<uint, DiverVitalResult> _pendingWorldDiverVitalResults = new();
     private readonly Dictionary<uint, DiverVitalResult> _pendingDiverVitalCommits = new();
@@ -791,12 +799,16 @@ internal sealed class UdpSession : IDisposable
             _lastVisualSequence = 4,
             _lastProjectileVisualSequence = 5,
             _lastHostRuntimeRevision = 6,
-            _lastClientRuntimeRevision = 7
+            _lastClientRuntimeRevision = 7,
+            _lastDiverWeaponCommitRevision = 8,
+            _lastDiverVitalCommitRevision = 9
         };
         session.ClearRemoteWorldState();
         if (session._lastSnapshotSequence != 0 || session._lastVisualSequence != 0 ||
             session._lastProjectileVisualSequence != 0 ||
-            session._lastHostRuntimeRevision != 0 || session._lastClientRuntimeRevision != 0)
+            session._lastHostRuntimeRevision != 0 || session._lastClientRuntimeRevision != 0 ||
+            session._lastDiverWeaponCommitRevision != 0 ||
+            session._lastDiverVitalCommitRevision != 0)
             throw new InvalidOperationException("World receive cache reset self-test failed");
     }
 
@@ -884,6 +896,9 @@ internal sealed class UdpSession : IDisposable
         session.EnqueueOrderedDiverVitalResult(Result(6, 6, 6));
         if (!session.TryTakeDiverVitalResult(out var sixth) || sixth.CommitRevision != 6)
             throw new InvalidOperationException("Diver vital snapshot race self-test failed");
+        if (session.LastDiverCommitDiagnostics.VitalCommitRevision != 6 ||
+            session.LastDiverCommitDiagnostics.ClientRuntimeRevision != 6)
+            throw new InvalidOperationException("Diver vital diagnostics self-test failed");
 
         var queuedSnapshot = new UdpSession(null);
         queuedSnapshot.EnqueueDiverRuntimeState(default(DiverRuntimeState) with
@@ -960,6 +975,8 @@ internal sealed class UdpSession : IDisposable
         if (!session.TryTakeDiverWeaponResult(out var staleStateResult) ||
             staleStateResult.RequestId != 6)
             throw new InvalidOperationException("Diver weapon result envelope was lost");
+        if (session.LastDiverCommitDiagnostics.WeaponCommitRevision != 6)
+            throw new InvalidOperationException("Diver weapon diagnostics self-test failed");
 
         var queuedSnapshot = ClientSession();
         queuedSnapshot.EnqueueDiverRuntimeState(Result(2, 8, 2).State with { Revision = 1 });
@@ -1400,6 +1417,11 @@ internal sealed class UdpSession : IDisposable
         _localSceneEpoch == uint.MaxValue ? 1 : _localSceneEpoch + 1;
     internal uint RemoteSceneEpoch => _remoteSceneEpoch;
     internal ulong ConnectionId => _connected ? _sessionId : 0;
+    internal DiverCommitDiagnostics LastDiverCommitDiagnostics => new(
+        _lastHostRuntimeRevision,
+        _lastClientRuntimeRevision,
+        _lastDiverWeaponCommitRevision,
+        _lastDiverVitalCommitRevision);
     internal int ReliableCapacityRemaining => ReliableBacklogCount == 0
         ? Math.Max(0, 256 - _pendingReliable.Count)
         : 0;
@@ -1570,6 +1592,7 @@ internal sealed class UdpSession : IDisposable
         if (!_deliveredDiverWeaponRequests.Add(result.RequestId))
             return;
 
+        _lastDiverWeaponCommitRevision = result.CommitRevision;
         _deliveredDiverWeaponRequestOrder.Enqueue(result.RequestId);
         if (_deliveredDiverWeaponRequestOrder.Count > MaxPendingDiverWeaponPackets)
             _deliveredDiverWeaponRequests.Remove(_deliveredDiverWeaponRequestOrder.Dequeue());
@@ -1687,6 +1710,7 @@ internal sealed class UdpSession : IDisposable
         if (!_deliveredDiverVitalEvents.Add(result.EventId))
             return;
 
+        _lastDiverVitalCommitRevision = result.CommitRevision;
         _deliveredDiverVitalEventOrder.Enqueue(result.EventId);
         if (_deliveredDiverVitalEventOrder.Count > MaxPendingDiverVitalResults)
             _deliveredDiverVitalEvents.Remove(_deliveredDiverVitalEventOrder.Dequeue());
@@ -3541,6 +3565,8 @@ internal sealed class UdpSession : IDisposable
         _hasClientRuntimeState = false;
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
+        _lastDiverWeaponCommitRevision = 0;
+        _lastDiverVitalCommitRevision = 0;
         ResetDiverVitalReceiveState(false);
         ResetDiverWeaponState(false);
         _projectileVisualOrder.Clear();
@@ -4246,6 +4272,8 @@ internal sealed class UdpSession : IDisposable
         _hasClientRuntimeState = false;
         _lastHostRuntimeRevision = 0;
         _lastClientRuntimeRevision = 0;
+        _lastDiverWeaponCommitRevision = 0;
+        _lastDiverVitalCommitRevision = 0;
         ResetDiverVitalReceiveState(true);
         ResetDiverWeaponState(true);
         _projectileVisualOrder.Clear();

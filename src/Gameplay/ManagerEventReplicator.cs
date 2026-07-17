@@ -285,6 +285,19 @@ internal sealed class ManagerEventReplicator
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 0f, 3f) ||
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 3f, 2f))
             throw new InvalidOperationException("Manager scene keyframe gate self-test failed");
+        if (!ShouldForceScenarioMilestoneKeyframe(
+                false, SessionRole.Host, true, 17, 17) ||
+            ShouldForceScenarioMilestoneKeyframe(
+                true, SessionRole.Host, true, 17, 17) ||
+            ShouldForceScenarioMilestoneKeyframe(
+                false, SessionRole.Client, true, 17, 17) ||
+            ShouldForceScenarioMilestoneKeyframe(
+                false, SessionRole.Host, false, 17, 17) ||
+            ShouldForceScenarioMilestoneKeyframe(
+                false, SessionRole.Host, true, 0, 0) ||
+            ShouldForceScenarioMilestoneKeyframe(
+                false, SessionRole.Host, true, 17, 18))
+            throw new InvalidOperationException("Manager scenario keyframe gate self-test failed");
 
         var outboundOverflow = new ManagerEventReplicator(null);
         var outboundSession = new UdpSession(null);
@@ -1184,16 +1197,17 @@ internal sealed class ManagerEventReplicator
     internal void ObserveScenarioFinished(
         SessionRole role, UdpSession session, int bundleKey, bool result)
     {
-        if (_applying || role != SessionRole.Host || bundleKey == 0 ||
-            bundleKey != _hostScenarioBundleKey)
+        if (!ShouldForceScenarioMilestoneKeyframe(
+                _applying, role, session?.Connected == true,
+                bundleKey, _hostScenarioBundleKey))
             return;
-        if (session?.Connected == true)
-            Publish(session, ManagerDomain.Scenario, ManagerAction.ScenarioFinished,
-                bundleKey, result ? 1 : 0);
+        Publish(session, ManagerDomain.Scenario, ManagerAction.ScenarioFinished,
+            bundleKey, result ? 1 : 0);
         _hostScenarioBundleId = string.Empty;
         _hostScenarioBundleKey = 0;
         _hostScenarioNodeId = -1;
         _hostScenarioInvocation = null;
+        ForceHostKeyframe();
     }
 
     internal void ObserveScenarioFinished(SessionRole role, UdpSession session) =>
@@ -1500,6 +1514,15 @@ internal sealed class ManagerEventReplicator
         float requestedAt,
         float now) =>
         role == SessionRole.Host && scenesMatch && requestedAt > 0f && now >= requestedAt;
+
+    private static bool ShouldForceScenarioMilestoneKeyframe(
+        bool applying,
+        SessionRole role,
+        bool connected,
+        int bundleKey,
+        int activeBundleKey) =>
+        !applying && role == SessionRole.Host && connected && bundleKey != 0 &&
+        bundleKey == activeBundleKey;
 
     internal void OnSceneChanged()
     {
