@@ -22,6 +22,12 @@ internal readonly record struct DiverCommitDiagnostics(
     uint WeaponCommitRevision,
     uint VitalCommitRevision);
 
+internal readonly record struct PacketReceiveDiagnostics(
+    PacketType Type,
+    long Received,
+    long Dropped,
+    long QueueOverflows);
+
 internal sealed class UdpSession : IDisposable
 {
     private const int MaxIncomingDatagrams = 1024;
@@ -72,6 +78,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingSushiResultStates = 256;
     private const int MaxPendingNpcInteractions = 256;
     private const int MaxFishHookPoses = 128;
+    private const int PacketTypeCounterSlots = byte.MaxValue + 1;
 
     private sealed class ReliableReceiveWindow
     {
@@ -282,6 +289,9 @@ internal sealed class UdpSession : IDisposable
     private long _reliableExpired;
     private long _reliableQueueOverflows;
     private long _visualStatesCoalesced;
+    private readonly long[] _packetReceives = new long[PacketTypeCounterSlots];
+    private readonly long[] _packetDrops = new long[PacketTypeCounterSlots];
+    private readonly long[] _packetQueueOverflows = new long[PacketTypeCounterSlots];
 
     internal UdpSession(ManualLogSource log) => _log = log;
 
@@ -395,6 +405,29 @@ internal sealed class UdpSession : IDisposable
         TestManagerEventEpochGate();
         TestNextWorldControlBuffer();
         TestHandshakeReject();
+        TestPacketReceiveDiagnostics();
+    }
+
+    private static void TestPacketReceiveDiagnostics()
+    {
+        var session = new UdpSession(null);
+        session.TrackPacketReceive(PacketType.RoomState);
+        session.TrackPacketReceive(PacketType.RoomState);
+        session.TrackPacketDrop(PacketType.RoomState);
+        session.TrackPacketQueueOverflow(PacketType.RoomState);
+        session.TrackPacketReceive(PacketType.FishSnapshotBatch);
+
+        var snapshot = session.PacketReceiveDiagnostics;
+        if (snapshot.Length != 2 ||
+            !TryFindPacketDiagnostics(snapshot, PacketType.RoomState, out var room) ||
+            room.Received != 2 || room.Dropped != 1 || room.QueueOverflows != 1 ||
+            !TryFindPacketDiagnostics(snapshot, PacketType.FishSnapshotBatch, out var fish) ||
+            fish.Received != 1 || fish.Dropped != 0 || fish.QueueOverflows != 0)
+            throw new InvalidOperationException("Packet receive diagnostics self-test failed");
+
+        session.ResetPeerState();
+        if (session.PacketReceiveDiagnostics.Length != 0)
+            throw new InvalidOperationException("Packet receive diagnostics reset self-test failed");
     }
 
     private static void TestProjectileVisualQueueLimit()
@@ -463,7 +496,10 @@ internal sealed class UdpSession : IDisposable
         session.QueueSaveSnapshotAck(default);
         if (session._connected || !session._saveSnapshotAcks.IsEmpty ||
             session._peerLostReason != "save snapshot acknowledgement receive queue overflow" ||
-            Interlocked.Read(ref session._reliableQueueOverflows) != 1)
+            Interlocked.Read(ref session._reliableQueueOverflows) != 1 ||
+            !TryFindPacketDiagnostics(
+                session.PacketReceiveDiagnostics, PacketType.SaveSnapshotAck, out var diagnostics) ||
+            diagnostics.Dropped != 1 || diagnostics.QueueOverflows != 1)
             throw new InvalidOperationException("Save snapshot acknowledgement overflow self-test failed");
     }
 
@@ -1422,6 +1458,8 @@ internal sealed class UdpSession : IDisposable
         _lastClientRuntimeRevision,
         _lastDiverWeaponCommitRevision,
         _lastDiverVitalCommitRevision);
+    internal PacketReceiveDiagnostics[] PacketReceiveDiagnostics =>
+        SnapshotPacketReceiveDiagnostics();
     internal int ReliableCapacityRemaining => ReliableBacklogCount == 0
         ? Math.Max(0, 256 - _pendingReliable.Count)
         : 0;
@@ -2562,6 +2600,7 @@ internal sealed class UdpSession : IDisposable
                 $"retries={Interlocked.Exchange(ref _reliableRetries, 0)}, " +
                 $"expired={Interlocked.Exchange(ref _reliableExpired, 0)}, " +
                 $"queueOverflows={Interlocked.Exchange(ref _reliableQueueOverflows, 0)}, " +
+                $"decodedDrops(type:rx/drop/overflow)={PacketDropSummary()}, " +
                 $"visualCoalesced={Interlocked.Exchange(ref _visualStatesCoalesced, 0)}");
             _sentBytes = 0;
             _receivedBytes = 0;
@@ -2683,6 +2722,7 @@ internal sealed class UdpSession : IDisposable
             return;
         if (sessionId == 0 || sessionId != _sessionId)
             return;
+        TrackPacketReceive(type);
         _receivedBytes += received.Buffer.Length;
         _receivedPackets++;
 
@@ -3797,7 +3837,7 @@ internal sealed class UdpSession : IDisposable
             _saveSnapshotChunks.Enqueue(chunk);
             return;
         }
-        FailReliableDelivery("save snapshot receive queue overflow");
+        FailReliableDelivery(PacketType.SaveSnapshotChunk, "save snapshot receive queue overflow");
     }
 
     private void QueueSaveSnapshotAck(SaveSnapshotAck ack)
@@ -3807,7 +3847,7 @@ internal sealed class UdpSession : IDisposable
             _saveSnapshotAcks.Enqueue(ack);
             return;
         }
-        FailReliableDelivery("save snapshot acknowledgement receive queue overflow");
+        FailReliableDelivery(PacketType.SaveSnapshotAck, "save snapshot acknowledgement receive queue overflow");
     }
 
     private void QueueIngredientsSnapshotChunk(IngredientsSnapshotChunk chunk)
@@ -3818,7 +3858,7 @@ internal sealed class UdpSession : IDisposable
             _ingredientsSnapshotChunks.Enqueue(chunk);
             return;
         }
-        FailReliableDelivery("ingredients snapshot receive queue overflow");
+        FailReliableDelivery(PacketType.IngredientsSnapshotChunk, "ingredients snapshot receive queue overflow");
     }
 
     private void QueueIngredientsDelta(IngredientsDelta delta)
@@ -3828,6 +3868,8 @@ internal sealed class UdpSession : IDisposable
             _ingredientsDeltas.Enqueue(delta);
             return;
         }
+        TrackPacketDrop(PacketType.IngredientsDelta);
+        TrackPacketQueueOverflow(PacketType.IngredientsDelta);
         while (_ingredientsDeltas.TryDequeue(out _))
         {
         }
@@ -3842,7 +3884,7 @@ internal sealed class UdpSession : IDisposable
             _roomReady.Enqueue(ready);
             return;
         }
-        FailReliableDelivery("room ready receive queue overflow");
+        FailReliableDelivery(PacketType.RoomReady, "room ready receive queue overflow");
     }
 
     private void QueueRoomState(RoomState state)
@@ -3852,7 +3894,7 @@ internal sealed class UdpSession : IDisposable
             _roomStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("room state receive queue overflow");
+        FailReliableDelivery(PacketType.RoomState, "room state receive queue overflow");
     }
 
     private void QueueFishActionRequest(FishActionRequest request)
@@ -3862,7 +3904,7 @@ internal sealed class UdpSession : IDisposable
             _fishActionRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("fish action request receive queue overflow");
+        FailReliableDelivery(PacketType.FishActionRequest, "fish action request receive queue overflow");
     }
 
     private void QueueFishDamageRequest(FishDamageRequest request)
@@ -3872,7 +3914,7 @@ internal sealed class UdpSession : IDisposable
             _fishDamageRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("fish damage request receive queue overflow");
+        FailReliableDelivery(PacketType.FishDamageRequest, "fish damage request receive queue overflow");
     }
 
     private void QueueFishPickupRequest(FishPickupRequest request)
@@ -3882,7 +3924,7 @@ internal sealed class UdpSession : IDisposable
             _fishPickupRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("fish pickup request receive queue overflow");
+        FailReliableDelivery(PacketType.FishPickupRequest, "fish pickup request receive queue overflow");
     }
 
     private void QueueFishRemoved(FishRemoved removed)
@@ -3892,7 +3934,7 @@ internal sealed class UdpSession : IDisposable
             _fishRemovals.Enqueue(removed);
             return;
         }
-        FailReliableDelivery("fish removal receive queue overflow");
+        FailReliableDelivery(PacketType.FishRemoved, "fish removal receive queue overflow");
     }
 
     private void QueueFishManifest(FishManifest manifest)
@@ -3902,7 +3944,7 @@ internal sealed class UdpSession : IDisposable
             _fishManifests.Enqueue(manifest);
             return;
         }
-        FailReliableDelivery("fish manifest receive queue overflow");
+        FailReliableDelivery(PacketType.FishManifest, "fish manifest receive queue overflow");
     }
 
     private void QueueFishManifestState(FishManifestState state)
@@ -3912,7 +3954,7 @@ internal sealed class UdpSession : IDisposable
             _fishManifestStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("fish manifest state receive queue overflow");
+        FailReliableDelivery(PacketType.FishManifestState, "fish manifest state receive queue overflow");
     }
 
     private void QueueFishPickupResult(FishPickupResult result)
@@ -3922,7 +3964,7 @@ internal sealed class UdpSession : IDisposable
             _fishPickupResults.Enqueue(result);
             return;
         }
-        FailReliableDelivery("fish pickup result receive queue overflow");
+        FailReliableDelivery(PacketType.FishPickupResult, "fish pickup result receive queue overflow");
     }
 
     private void QueuePickupRemoved(PickupRemoved removed)
@@ -3932,7 +3974,7 @@ internal sealed class UdpSession : IDisposable
             _pickupRemovals.Enqueue(removed);
             return;
         }
-        FailReliableDelivery("pickup removal receive queue overflow");
+        FailReliableDelivery(PacketType.PickupRemoved, "pickup removal receive queue overflow");
     }
 
     private void QueueFishLifecycle(FishLifecycle state)
@@ -3942,7 +3984,7 @@ internal sealed class UdpSession : IDisposable
             _fishLifecycles.Enqueue(state);
             return;
         }
-        FailReliableDelivery("fish lifecycle receive queue overflow");
+        FailReliableDelivery(PacketType.FishLifecycle, "fish lifecycle receive queue overflow");
     }
 
     private void QueueFishActionAck(FishActionAck ack)
@@ -3952,7 +3994,7 @@ internal sealed class UdpSession : IDisposable
             _fishActionAcks.Enqueue(ack);
             return;
         }
-        FailReliableDelivery("fish action acknowledgement receive queue overflow");
+        FailReliableDelivery(PacketType.FishActionAck, "fish action acknowledgement receive queue overflow");
     }
 
     private void QueueFishLootGrant(FishLootGrant grant)
@@ -3962,7 +4004,7 @@ internal sealed class UdpSession : IDisposable
             _fishLootGrants.Enqueue(grant);
             return;
         }
-        FailReliableDelivery("fish loot grant receive queue overflow");
+        FailReliableDelivery(PacketType.FishLootGrant, "fish loot grant receive queue overflow");
     }
 
     private void QueueFishLootComplete(FishLootComplete complete)
@@ -3972,7 +4014,7 @@ internal sealed class UdpSession : IDisposable
             _fishLootCompletions.Enqueue(complete);
             return;
         }
-        FailReliableDelivery("fish loot completion receive queue overflow");
+        FailReliableDelivery(PacketType.FishLootComplete, "fish loot completion receive queue overflow");
     }
 
     private void QueuePickupRequest(PickupRequest request)
@@ -3982,7 +4024,7 @@ internal sealed class UdpSession : IDisposable
             _pickupRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("pickup request receive queue overflow");
+        FailReliableDelivery(PacketType.PickupRequest, "pickup request receive queue overflow");
     }
 
     private void QueuePickupResult(PickupResult result)
@@ -3992,7 +4034,7 @@ internal sealed class UdpSession : IDisposable
             _pickupResults.Enqueue(result);
             return;
         }
-        FailReliableDelivery("pickup result receive queue overflow");
+        FailReliableDelivery(PacketType.PickupResult, "pickup result receive queue overflow");
     }
 
     private void QueueWorldFlagRequest(WorldFlagRequest request)
@@ -4002,7 +4044,7 @@ internal sealed class UdpSession : IDisposable
             _worldFlagRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("world flag request receive queue overflow");
+        FailReliableDelivery(PacketType.WorldFlagRequest, "world flag request receive queue overflow");
     }
 
     private void QueueWorldFlagState(WorldFlagState state)
@@ -4012,7 +4054,7 @@ internal sealed class UdpSession : IDisposable
             _worldFlagStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("world flag state receive queue overflow");
+        FailReliableDelivery(PacketType.WorldFlagState, "world flag state receive queue overflow");
     }
 
     private void QueueBossState(BossState state)
@@ -4022,7 +4064,7 @@ internal sealed class UdpSession : IDisposable
             _bossStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("boss state receive queue overflow");
+        FailReliableDelivery(PacketType.BossState, "boss state receive queue overflow");
     }
 
     private void QueueBossDamageRequest(BossDamageRequest request)
@@ -4032,7 +4074,7 @@ internal sealed class UdpSession : IDisposable
             _bossDamageRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("boss damage request receive queue overflow");
+        FailReliableDelivery(PacketType.BossDamageRequest, "boss damage request receive queue overflow");
     }
 
     private void QueueManagerEvent(ManagerEvent state)
@@ -4042,7 +4084,7 @@ internal sealed class UdpSession : IDisposable
             _managerEvents.Enqueue(state);
             return;
         }
-        FailReliableDelivery("manager event receive queue overflow");
+        FailReliableDelivery(PacketType.ManagerEvent, "manager event receive queue overflow");
     }
 
     private void QueueIngredientsSyncRequest(IngredientsSyncRequest request)
@@ -4053,7 +4095,7 @@ internal sealed class UdpSession : IDisposable
             _ingredientsSyncRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("ingredients sync request receive queue overflow");
+        FailReliableDelivery(PacketType.IngredientsSyncRequest, "ingredients sync request receive queue overflow");
     }
 
     private void QueueDiveExitRequest(DiveExitRequest request)
@@ -4063,7 +4105,7 @@ internal sealed class UdpSession : IDisposable
             _diveExitRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("dive exit request receive queue overflow");
+        FailReliableDelivery(PacketType.DiveExitRequest, "dive exit request receive queue overflow");
     }
 
     private void QueueDiveReady(DiveReady ready)
@@ -4073,7 +4115,7 @@ internal sealed class UdpSession : IDisposable
             _diveReady.Enqueue(ready);
             return;
         }
-        FailReliableDelivery("dive ready receive queue overflow");
+        FailReliableDelivery(PacketType.DiveReady, "dive ready receive queue overflow");
     }
 
     private void QueueDiveResultEntry(DiveResultEntry entry)
@@ -4083,7 +4125,7 @@ internal sealed class UdpSession : IDisposable
             _diveResultEntries.Enqueue(entry);
             return;
         }
-        FailReliableDelivery("dive result entry receive queue overflow");
+        FailReliableDelivery(PacketType.DiveResultEntry, "dive result entry receive queue overflow");
     }
 
     private void QueueDiveLootRequest(DiveLootRequest request)
@@ -4093,7 +4135,7 @@ internal sealed class UdpSession : IDisposable
             _diveLootRequests.Enqueue(request);
             return;
         }
-        FailReliableDelivery("dive loot request receive queue overflow");
+        FailReliableDelivery(PacketType.DiveLootRequest, "dive loot request receive queue overflow");
     }
 
     private void QueueDiveResultState(DiveResultState state)
@@ -4103,7 +4145,7 @@ internal sealed class UdpSession : IDisposable
             _diveResultStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("dive result state receive queue overflow");
+        FailReliableDelivery(PacketType.DiveResultState, "dive result state receive queue overflow");
     }
 
     private void QueueTravelState(TravelState state)
@@ -4113,7 +4155,7 @@ internal sealed class UdpSession : IDisposable
             _travelStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("travel state receive queue overflow");
+        FailReliableDelivery(PacketType.TravelState, "travel state receive queue overflow");
     }
 
     private void QueueSushiResultState(SushiResultState state)
@@ -4123,7 +4165,7 @@ internal sealed class UdpSession : IDisposable
             _sushiResultStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("sushi result receive queue overflow");
+        FailReliableDelivery(PacketType.SushiResultState, "sushi result receive queue overflow");
     }
 
     private void QueueNpcInteraction(NpcInteraction state)
@@ -4133,7 +4175,7 @@ internal sealed class UdpSession : IDisposable
             _npcInteractions.Enqueue(state);
             return;
         }
-        FailReliableDelivery("npc interaction receive queue overflow");
+        FailReliableDelivery(PacketType.NpcInteraction, "npc interaction receive queue overflow");
     }
 
     private void QueueMissionState(MissionState state)
@@ -4143,7 +4185,7 @@ internal sealed class UdpSession : IDisposable
             _missionStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("mission state receive queue overflow");
+        FailReliableDelivery(PacketType.MissionState, "mission state receive queue overflow");
     }
 
     private void QueueMissionRoster(MissionRoster roster)
@@ -4153,7 +4195,7 @@ internal sealed class UdpSession : IDisposable
             _missionRosters.Enqueue(roster);
             return;
         }
-        FailReliableDelivery("mission roster receive queue overflow");
+        FailReliableDelivery(PacketType.MissionRoster, "mission roster receive queue overflow");
     }
 
     private void QueueTravelReady(TravelReady ready)
@@ -4163,7 +4205,7 @@ internal sealed class UdpSession : IDisposable
             _travelReady.Enqueue(ready);
             return;
         }
-        FailReliableDelivery("travel ready receive queue overflow");
+        FailReliableDelivery(PacketType.TravelReady, "travel ready receive queue overflow");
     }
 
     private void QueueDiverLifeState(DiverLifeState state)
@@ -4173,11 +4215,65 @@ internal sealed class UdpSession : IDisposable
             _diverLifeStates.Enqueue(state);
             return;
         }
-        FailReliableDelivery("diver life state receive queue overflow");
+        FailReliableDelivery(PacketType.DiverLifeState, "diver life state receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
         Math.Clamp(queued, 0, MaxDatagramsPerUpdate);
+
+    private PacketReceiveDiagnostics[] SnapshotPacketReceiveDiagnostics()
+    {
+        var entries = new List<PacketReceiveDiagnostics>();
+        for (var index = 0; index < PacketTypeCounterSlots; index++)
+        {
+            var received = Interlocked.Read(ref _packetReceives[index]);
+            var dropped = Interlocked.Read(ref _packetDrops[index]);
+            var queueOverflows = Interlocked.Read(ref _packetQueueOverflows[index]);
+            if (received != 0 || dropped != 0 || queueOverflows != 0)
+                entries.Add(new PacketReceiveDiagnostics(
+                    (PacketType)(byte)index, received, dropped, queueOverflows));
+        }
+        return entries.ToArray();
+    }
+
+    private static bool TryFindPacketDiagnostics(
+        PacketReceiveDiagnostics[] snapshot,
+        PacketType type,
+        out PacketReceiveDiagnostics diagnostics)
+    {
+        foreach (var entry in snapshot)
+            if (entry.Type == type)
+            {
+                diagnostics = entry;
+                return true;
+            }
+        diagnostics = default;
+        return false;
+    }
+
+    private void TrackPacketReceive(PacketType type) =>
+        Interlocked.Increment(ref _packetReceives[(byte)type]);
+
+    private void TrackPacketDrop(PacketType type) =>
+        Interlocked.Increment(ref _packetDrops[(byte)type]);
+
+    private void TrackPacketQueueOverflow(PacketType type) =>
+        Interlocked.Increment(ref _packetQueueOverflows[(byte)type]);
+
+    private string PacketDropSummary()
+    {
+        var entries = new List<string>();
+        foreach (var diagnostics in PacketReceiveDiagnostics)
+        {
+            if (diagnostics.Dropped == 0 && diagnostics.QueueOverflows == 0)
+                continue;
+            if (entries.Count == 4)
+                return string.Join(",", entries) + ",...";
+            entries.Add(
+                $"{diagnostics.Type}:{diagnostics.Received}/{diagnostics.Dropped}/{diagnostics.QueueOverflows}");
+        }
+        return entries.Count == 0 ? "none" : string.Join(",", entries);
+    }
 
     private static bool ShouldExpireReliable(int attempts, float firstSend, float now) =>
         attempts >= MaxReliableAttempts ||
@@ -4195,6 +4291,13 @@ internal sealed class UdpSession : IDisposable
         if (_role == SessionRole.Host)
             _remote = null;
         _log?.LogWarning($"Network: {reason}; peer session reset");
+    }
+
+    private void FailReliableDelivery(PacketType type, string reason)
+    {
+        FailReliableDelivery(reason);
+        TrackPacketDrop(type);
+        TrackPacketQueueOverflow(type);
     }
 
     private static bool IsFishDirectionAllowed(SessionRole receiver, PacketType type) =>
@@ -4358,6 +4461,9 @@ internal sealed class UdpSession : IDisposable
         Interlocked.Exchange(ref _reliableRetries, 0);
         Interlocked.Exchange(ref _reliableExpired, 0);
         Interlocked.Exchange(ref _visualStatesCoalesced, 0);
+        Array.Clear(_packetReceives, 0, _packetReceives.Length);
+        Array.Clear(_packetDrops, 0, _packetDrops.Length);
+        Array.Clear(_packetQueueOverflows, 0, _packetQueueOverflows.Length);
         _pendingReliable.Clear();
         _reliableBacklog.Clear();
         _reliableBulkBacklog.Clear();
