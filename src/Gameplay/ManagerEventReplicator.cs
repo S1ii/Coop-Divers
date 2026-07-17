@@ -207,6 +207,7 @@ internal sealed class ManagerEventReplicator
     private bool _wasConnected;
     private bool _storySnapshotPublished;
     private float _nextStoryScan;
+    private float _nextStorySafetyKeyframe;
     private int _hostCurrentChapter = int.MinValue;
     private int _hostReservedChapter = int.MinValue;
     private readonly HashSet<int> _hostEvents = new();
@@ -285,6 +286,12 @@ internal sealed class ManagerEventReplicator
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 0f, 3f) ||
             ShouldForceSceneEntryKeyframe(SessionRole.Host, true, 3f, 2f))
             throw new InvalidOperationException("Manager scene keyframe gate self-test failed");
+        if (!ShouldForceStorySafetyKeyframe(true, true, 5f, 5f) ||
+            ShouldForceStorySafetyKeyframe(false, true, 5f, 6f) ||
+            ShouldForceStorySafetyKeyframe(true, false, 5f, 6f) ||
+            ShouldForceStorySafetyKeyframe(true, true, 0f, 6f) ||
+            ShouldForceStorySafetyKeyframe(true, true, 6f, 5f))
+            throw new InvalidOperationException("Manager story safety keyframe gate self-test failed");
         if (!ShouldScheduleReconnectKeyframe(SessionRole.Host, false, true) ||
             ShouldScheduleReconnectKeyframe(SessionRole.Host, true, true) ||
             ShouldScheduleReconnectKeyframe(SessionRole.Host, false, false) ||
@@ -542,6 +549,7 @@ internal sealed class ManagerEventReplicator
             _nextProgressionScan = 0f;
             _nextDayScan = 0f;
             _nextStoryScan = 0f;
+            _nextStorySafetyKeyframe = 0f;
             _activeSessionSnapshotPublished = false;
         }
         _wasConnected = true;
@@ -560,12 +568,24 @@ internal sealed class ManagerEventReplicator
         {
             _storySnapshotPublished = PublishStorySnapshot(session);
             if (_storySnapshotPublished)
+            {
                 _nextStoryScan = now + 1f;
+                _nextStorySafetyKeyframe = now + 5f;
+            }
         }
         if (role == SessionRole.Host && _storySnapshotPublished && now >= _nextStoryScan)
         {
             _nextStoryScan = now + 1f;
             PublishStoryChanges(session);
+        }
+        if (ShouldForceStorySafetyKeyframe(
+                role == SessionRole.Host && session.Connected,
+                _storySnapshotPublished,
+                _nextStorySafetyKeyframe,
+                now))
+        {
+            ForceHostKeyframe();
+            _nextStorySafetyKeyframe = now + 5f;
         }
         if (role == SessionRole.Host && now >= _nextDayScan)
         {
@@ -1443,6 +1463,7 @@ internal sealed class ManagerEventReplicator
         _nextProgressionScan = 0f;
         _nextDayScan = 0f;
         _nextStoryScan = 0f;
+        _nextStorySafetyKeyframe = 0f;
         _hostCurrentChapter = int.MinValue;
         _hostReservedChapter = int.MinValue;
         _hostEvents.Clear();
@@ -1502,6 +1523,7 @@ internal sealed class ManagerEventReplicator
     {
         _storySnapshotPublished = false;
         _nextStoryScan = 0f;
+        _nextStorySafetyKeyframe = 0f;
         _hostDayTicks = long.MinValue;
         _hostDayTime = int.MinValue;
         _hostWeather = int.MinValue;
@@ -1518,6 +1540,13 @@ internal sealed class ManagerEventReplicator
         float requestedAt,
         float now) =>
         role == SessionRole.Host && scenesMatch && requestedAt > 0f && now >= requestedAt;
+
+    private static bool ShouldForceStorySafetyKeyframe(
+        bool hostConnected,
+        bool storySnapshotPublished,
+        float requestedAt,
+        float now) =>
+        hostConnected && storySnapshotPublished && requestedAt > 0f && now >= requestedAt;
 
     internal static bool ShouldScheduleReconnectKeyframe(
         SessionRole role,
