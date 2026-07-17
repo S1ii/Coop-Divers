@@ -27,6 +27,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
     private const int MaxPendingIngredientsSyncRequests = 256;
+    private const int MaxPendingDiveExitRequests = 256;
     private const int MaxPendingIngredientsSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotChunks = 256;
     private const int MaxPendingSaveSnapshotAcks = 256;
@@ -301,6 +302,7 @@ internal sealed class UdpSession : IDisposable
         TestFishActionRequestQueueOverflow();
         TestManagerEventQueueOverflow();
         TestIngredientsSyncRequestQueueOverflow();
+        TestDiveExitRequestQueueOverflow();
         TestFishActionRequestEpochGate();
         TestNpcInteractionEpochGate();
         TestCargoEpochGate();
@@ -612,6 +614,20 @@ internal sealed class UdpSession : IDisposable
         session.QueueIngredientsSyncRequest(default);
         if (session._connected || !session._ingredientsSyncRequests.IsEmpty)
             throw new InvalidOperationException("Ingredients sync request queue overflow self-test failed");
+    }
+
+    private static void TestDiveExitRequestQueueOverflow()
+    {
+        var session = new UdpSession(null)
+        {
+            _role = SessionRole.Host,
+            _connected = true
+        };
+        for (var index = 0; index < MaxPendingDiveExitRequests; index++)
+            session._diveExitRequests.Enqueue(default);
+        session.QueueDiveExitRequest(default);
+        if (session._connected || !session._diveExitRequests.IsEmpty)
+            throw new InvalidOperationException("Dive exit request queue overflow self-test failed");
     }
 
     private static void TestNpcInteractionEpochGate()
@@ -2426,7 +2442,7 @@ internal sealed class UdpSession : IDisposable
             {
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
-                    _diveExitRequests.Enqueue(request);
+                    QueueDiveExitRequest(request);
             }
             return;
         }
@@ -3068,6 +3084,16 @@ internal sealed class UdpSession : IDisposable
             return;
         }
         FailReliableDelivery("ingredients sync request receive queue overflow");
+    }
+
+    private void QueueDiveExitRequest(DiveExitRequest request)
+    {
+        if (HasDecodedQueueCapacity(_diveExitRequests.Count, MaxPendingDiveExitRequests))
+        {
+            _diveExitRequests.Enqueue(request);
+            return;
+        }
+        FailReliableDelivery("dive exit request receive queue overflow");
     }
 
     private static int DatagramsToProcess(int queued) =>
