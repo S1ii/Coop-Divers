@@ -271,7 +271,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _npcInteractionCoordinator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         if (!UnsafeWorldReplicationBlocked)
-            _worldStateReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
+            _worldStateReplicator?.Update(
+                Role, _session, _session?.SceneMatches(_sceneId) == true,
+                Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _sceneReplicator?.Update(Role, _session);
@@ -1257,12 +1259,14 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal bool AllowPuzzleSave(PuzzleStateSaveObject saveObject, bool value) =>
         UnsafeWorldReplicationBlocked
             ? false
-            : _worldStateReplicator?.AllowLocalSave(Role, _session, saveObject, value) ?? true;
+            : _worldStateReplicator?.AllowLocalSave(
+                Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value) ?? true;
 
     internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value)
     {
         if (!UnsafeWorldReplicationBlocked)
-            _worldStateReplicator?.ObserveHostSave(Role, _session, saveObject, value);
+            _worldStateReplicator?.ObserveHostSave(
+                Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value);
     }
 
     internal bool AllowBossHpWrite(BossControllerBase boss, int hp) =>

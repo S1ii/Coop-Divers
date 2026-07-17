@@ -16,6 +16,7 @@ internal sealed class WorldStateReplicator
     private readonly HashSet<string> _reportedAmbiguousKeys = new(StringComparer.Ordinal);
     private float _nextScan;
     private bool _wasConnected;
+    private bool _hostInitialManifestPending;
 
     internal WorldStateReplicator(ManualLogSource log) => _log = log;
 
@@ -34,14 +35,20 @@ internal sealed class WorldStateReplicator
             IsUniqueOwner(unique, "puzzle-b", first) ||
             !ambiguous.SetEquals(new[] { "puzzle-a" }))
             throw new InvalidOperationException("World-state unique-key policy failed");
+        if (!ShouldScanHostManifest(SessionRole.Host, true, true, false) ||
+            !ShouldScanHostManifest(SessionRole.Host, true, false, true) ||
+            ShouldScanHostManifest(SessionRole.Host, false, true, true) ||
+            ShouldScanHostManifest(SessionRole.Client, true, true, true))
+            throw new InvalidOperationException("World-state initial-manifest gate failed");
     }
 
-    internal void Update(SessionRole role, UdpSession session, float now)
+    internal void Update(SessionRole role, UdpSession session, bool sceneReady, float now)
     {
         var connected = session != null && session.Connected;
         if (!connected)
         {
             _wasConnected = false;
+            _hostInitialManifestPending = false;
             return;
         }
         if (!_wasConnected)
@@ -49,22 +56,39 @@ internal sealed class WorldStateReplicator
             _hostStates.Clear();
             _clientRevisions.Clear();
             _nextScan = 0f;
+            _hostInitialManifestPending = true;
         }
         _wasConnected = true;
 
         if (role == SessionRole.Host)
         {
+            if (!sceneReady)
+            {
+                while (session.TryTakeWorldFlagRequest(out _))
+                {
+                }
+                return;
+            }
             while (session.TryTakeWorldFlagRequest(out var request))
                 ApplyHostRequest(request);
-            if (now >= _nextScan)
+            if (ShouldScanHostManifest(
+                    role, sceneReady, _hostInitialManifestPending, now >= _nextScan))
             {
                 _nextScan = now + 1f;
                 ScanHost(session);
+                _hostInitialManifestPending = false;
             }
             return;
         }
         if (role != SessionRole.Client)
             return;
+        if (!sceneReady)
+        {
+            while (session.TryTakeWorldFlagState(out _))
+            {
+            }
+            return;
+        }
 
         while (session.TryTakeWorldFlagState(out var state))
         {
@@ -80,13 +104,14 @@ internal sealed class WorldStateReplicator
     internal bool AllowLocalSave(
         SessionRole role,
         UdpSession session,
+        bool sceneReady,
         PuzzleStateSaveObject saveObject,
         bool value)
     {
         if (role != SessionRole.Client || session == null || !session.Connected)
             return true;
         var key = saveObject?._key;
-        if (IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
+        if (sceneReady && IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
             session.SendWorldFlagRequest(new WorldFlagRequest(key, value));
         return false;
     }
@@ -94,13 +119,14 @@ internal sealed class WorldStateReplicator
     internal void ObserveHostSave(
         SessionRole role,
         UdpSession session,
+        bool sceneReady,
         PuzzleStateSaveObject saveObject,
         bool value)
     {
         if (role != SessionRole.Host || session == null || !session.Connected)
             return;
         var key = saveObject?._key;
-        if (IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
+        if (sceneReady && IsUniqueOwner(FindUniqueSaveObjects(), key, saveObject))
             Publish(session, key, value);
     }
 
@@ -113,6 +139,7 @@ internal sealed class WorldStateReplicator
         _reportedAmbiguousKeys.Clear();
         _nextScan = 0f;
         _wasConnected = false;
+        _hostInitialManifestPending = false;
     }
 
     private void ApplyHostRequest(WorldFlagRequest request)
@@ -243,6 +270,13 @@ internal sealed class WorldStateReplicator
         where T : class =>
         !string.IsNullOrWhiteSpace(key) && value != null &&
         unique.TryGetValue(key, out var owner) && ReferenceEquals(owner, value);
+
+    private static bool ShouldScanHostManifest(
+        SessionRole role,
+        bool sceneReady,
+        bool initialManifestPending,
+        bool scanDue) =>
+        role == SessionRole.Host && sceneReady && (initialManifestPending || scanDue);
 
     private static uint NextRevision(uint value) => value == uint.MaxValue ? 1 : value + 1;
 
