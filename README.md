@@ -32,6 +32,9 @@ Unofficial community mod, not supported by the game's developer or
 platform. It is still in active development: expect rough edges after game
 updates, unsupported story moments, and the occasional desync.
 
+Bosses, alternate controllers, DLC, additive scenes, and reconnect flows are
+not supported yet.
+
 ## Trust model
 
 Traffic is plain UDP with no encryption or peer authentication. Only play

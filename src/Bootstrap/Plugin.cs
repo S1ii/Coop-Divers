@@ -21,6 +21,7 @@ public sealed class Plugin : BasePlugin
     public override void Load()
     {
         Protocol.SelfTest();
+        HarmonyCompatibilityReporter.SelfTest();
         UdpSession.SelfTest();
         ProbeBehaviour.SelfTest();
         LobbyInput.SelfTest();
@@ -65,6 +66,7 @@ public sealed class Plugin : BasePlugin
         try
         {
             Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, "dev.davethedivermp");
+            HarmonyCompatibilityReporter.Report(Log);
             Log.LogInfo("Gameplay patches active");
         }
         catch (Exception exception)
