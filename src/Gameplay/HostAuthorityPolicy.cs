@@ -381,34 +381,6 @@ internal static class CentralSaveAuthorityPatch
         HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveData");
 }
 
-[HarmonyPatch]
-internal static class SaveSlotJsonAuthorityPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods()
-    {
-        var parameters = new[] { typeof(string), typeof(int), typeof(SaveSlotType) };
-        var gameSave = AccessTools.Method(
-            typeof(SaveSystemGameDataManager), nameof(SaveSystemGameDataManager.SaveSlotWithJson),
-            parameters);
-        if (gameSave != null)
-            yield return gameSave;
-
-        var playerSave = AccessTools.DeclaredMethod(
-            typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.SaveSlotWithJson),
-            parameters);
-        if (playerSave != null && playerSave != gameSave)
-            yield return playerSave;
-    }
-
-    private static bool Prefix(ref bool __result, MethodBase __originalMethod)
-    {
-        if (HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveSlotWithJson"))
-            return true;
-        __result = false;
-        return false;
-    }
-}
-
 [HarmonyPatch(typeof(SteamAchievements), nameof(SteamAchievements.UnlockProgressSyncFromSave))]
 internal static class RemoteSaveAchievementAuthorityPatch
 {
