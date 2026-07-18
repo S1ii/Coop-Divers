@@ -67,6 +67,7 @@ public sealed class Plugin : BasePlugin
         ProbeBehaviour.Address = _addressConfig.Value;
         ProbeBehaviour.Port = _portConfig.Value;
         ProbeBehaviour.ConfiguredName = _playerNameConfig.Value;
+        ClassInjector.RegisterTypeInIl2Cpp<ProbeBehaviour>();
         try
         {
             Harmony.CreateAndPatchAll(typeof(Plugin).Assembly, "dev.davethedivermp");
@@ -78,7 +79,6 @@ public sealed class Plugin : BasePlugin
             Log.LogError($"Gameplay patches failed: {exception.Message}");
         }
         Log.LogInfo($"Probe loaded; Unity {Application.unityVersion}; Steam running: {SteamAPI.IsSteamRunning()}");
-        ClassInjector.RegisterTypeInIl2Cpp<ProbeBehaviour>();
         AddComponent<ProbeBehaviour>();
     }
 

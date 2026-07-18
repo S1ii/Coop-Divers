@@ -629,13 +629,6 @@ internal static class BossDamageAuthorityPatch
     }
 }
 
-[HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.OnHitHarpoon))]
-internal static class BossHarpoonAuthorityPatch
-{
-    private static bool Prefix(BossControllerBase __instance, Vector3 __0, int __1) =>
-        ProbeBehaviour.Instance?.ObserveBossHarpoon(__instance, __0, __1) ?? true;
-}
-
 [HarmonyPatch(typeof(BossControllerBase), nameof(BossControllerBase.OnReflectProjectile))]
 internal static class BossReflectAuthorityPatch
 {
@@ -651,6 +644,10 @@ internal static class BossReflectAuthorityPatch
 [HarmonyPatch]
 internal static class SnapshotBossDamagePatch
 {
+    // Generic family hooks are not ABI-safe on this game build; keep each family host-only
+    // until its native callback contract has been verified.
+    private static bool Prepare() => false;
+
     private static IEnumerable<MethodBase> TargetMethods()
     {
         foreach (var type in SnapshotTypes)
@@ -683,6 +680,8 @@ internal static class SnapshotBossDamagePatch
 [HarmonyPatch]
 internal static class SnapshotBossTransitionPatch
 {
+    private static bool Prepare() => false;
+
     private static IEnumerable<MethodBase> TargetMethods()
     {
         foreach (var type in SnapshotTypes)
@@ -710,6 +709,8 @@ internal static class SnapshotBossTransitionPatch
 [HarmonyPatch]
 internal static class KnownBossFamilyAuthorityPatch
 {
+    private static bool Prepare() => false;
+
     private static IEnumerable<MethodBase> TargetMethods()
     {
         foreach (var name in FamilyTypes)
