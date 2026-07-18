@@ -222,6 +222,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _projectileVisualReplicator?.Clear();
             _diverVitalReplicator?.Clear();
             _diverWeaponReplicator?.Clear();
+            HarpoonRuntimeProbe.Clear();
             _session?.SetLocalScene(_sceneId);
             BeginRecovery("scene changed");
             if (Role == SessionRole.Host)
@@ -492,6 +493,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (_player != player)
             _playerRenderer = RemoteAvatar.FindPrimaryRenderer(player);
         _player = player;
+        HarpoonRuntimeProbe.ReportOnce(_sceneId, player, Logger, _sessionTrace);
 
         if (!_playerPresent || Time.realtimeSinceStartup >= _nextPositionLog)
         {
