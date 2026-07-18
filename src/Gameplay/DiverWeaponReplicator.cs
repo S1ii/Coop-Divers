@@ -1,4 +1,6 @@
 using System;
+using Il2CppInterop.Runtime.InteropTypes;
+using UnityEngine;
 
 namespace DaveTheDiverMP;
 
@@ -17,7 +19,10 @@ internal sealed class DiverWeaponReplicator
 
     internal static void SelfTest()
     {
-        if (NextRequestId(0) != 1 || NextRequestId(ulong.MaxValue) != 1)
+        if (NextRequestId(0) != 1 || NextRequestId(ulong.MaxValue) != 1 ||
+            !TryNormalizeAim(0.6f, 0.8f, out var normalized) ||
+            normalized != new Vector3(0.6f, 0.8f, 0f) ||
+            TryNormalizeAim(0f, 0f, out _))
             throw new InvalidOperationException("Diver weapon observation self-test failed");
     }
 
@@ -75,7 +80,7 @@ internal sealed class DiverWeaponReplicator
             !TryGetActiveOrdinaryGun(player, out var active, out var weaponId, out _, out _) ||
             active != gun || !_hasObservation || _observedWeaponId != weaponId)
             return false;
-        return SendIntent(session, DiverWeaponAction.Fire, weaponId);
+        return SendIntent(session, DiverWeaponAction.Fire, weaponId, player);
     }
 
     internal bool RequestClientReload(UdpSession session, PlayerCharacter player, GunWeaponHandler gun)
@@ -84,7 +89,7 @@ internal sealed class DiverWeaponReplicator
             !TryGetActiveOrdinaryGun(player, out var active, out var weaponId, out _, out _) ||
             active != gun || !_hasObservation || _observedWeaponId != weaponId)
             return false;
-        return SendIntent(session, DiverWeaponAction.Reload, weaponId);
+        return SendIntent(session, DiverWeaponAction.Reload, weaponId, player);
     }
 
     private void BeginWorld(SessionRole role, uint sceneId, uint sceneEpoch)
@@ -114,8 +119,9 @@ internal sealed class DiverWeaponReplicator
             {
                 DiverWeaponAction.Equip when TryResolveMaxAmmo(intent.WeaponId, out var maxAmmo) =>
                     _authority.Equip(intent.RequestId, intent.WeaponId, maxAmmo, maxAmmo),
-                DiverWeaponAction.Fire =>
-                    _authority.Fire(intent.RequestId, intent.WeaponId, 1),
+                DiverWeaponAction.Fire when TryPrepareNativeShot(
+                    intent, remoteAvatar, out var shot) =>
+                    FireNativeShot(intent, shot),
                 DiverWeaponAction.Reload when TryResolveMaxAmmo(intent.WeaponId, out var maxAmmo) &&
                     _authority.Current.WeaponId == intent.WeaponId &&
                     _authority.Current.MaxAmmo == maxAmmo =>
@@ -202,7 +208,7 @@ internal sealed class DiverWeaponReplicator
         if (!TryGetActiveOrdinaryGun(player, out var gun, out var weaponId, out var ammo, out _))
         {
             if (_hasObservation && _observedWeaponId != 0 &&
-                SendIntent(session, DiverWeaponAction.Unequip, 0))
+                SendIntent(session, DiverWeaponAction.Unequip, 0, player))
             {
                 _observedWeaponId = 0;
                 _observedAmmo = 0;
@@ -213,7 +219,7 @@ internal sealed class DiverWeaponReplicator
 
         if (!_hasObservation || _observedWeaponId != weaponId)
         {
-            if (SendIntent(session, DiverWeaponAction.Equip, weaponId))
+            if (SendIntent(session, DiverWeaponAction.Equip, weaponId, player))
             {
                 _hasObservation = true;
                 _observedWeaponId = weaponId;
@@ -225,14 +231,116 @@ internal sealed class DiverWeaponReplicator
             gun.ForceSetBulletCount(_observedAmmo);
     }
 
-    private bool SendIntent(UdpSession session, DiverWeaponAction action, int weaponId)
+    private DiverWeaponAuthorityResult FireNativeShot(
+        DiverWeaponIntent intent,
+        NativeShot shot)
     {
+        var decision = _authority.Fire(intent.RequestId, intent.WeaponId, 1);
+        if (decision.Accepted && !decision.Duplicate)
+            shot.Fire();
+        return decision;
+    }
+
+    private bool SendIntent(
+        UdpSession session,
+        DiverWeaponAction action,
+        int weaponId,
+        PlayerCharacter player)
+    {
+        var aim = Vector2.zero;
+        if (action == DiverWeaponAction.Fire && !TryGetAim(player, out aim))
+            return false;
         var requestId = NextRequestId(_requestId);
         if (!session.SendDiverWeaponIntent(new DiverWeaponIntent(
-                _sceneId, _sceneEpoch, requestId, action, weaponId)))
+                _sceneId, _sceneEpoch, requestId, action, weaponId, aim.x, aim.y)))
             return false;
         _requestId = requestId;
         _pending = true;
+        return true;
+    }
+
+    private readonly record struct NativeShot(
+        Transform Origin,
+        Vector3 Direction,
+        GunSpecData Spec)
+    {
+        internal bool Fire()
+        {
+            GunBullet bullet = null;
+            try
+            {
+                var attacker = new HarpoonIDamager { Owner = Origin }.TryCast<IDamager>();
+                var prefab = Spec?.BulletPrefab;
+                if (attacker == null || prefab == null || Origin == null)
+                    return false;
+                bullet = UnityEngine.Object.Instantiate(
+                    prefab, Origin.position, Quaternion.identity);
+                if (bullet == null)
+                    return false;
+                bullet.Shoot(attacker, Direction, Spec, null);
+                return true;
+            }
+            catch
+            {
+                if (bullet != null)
+                    UnityEngine.Object.Destroy(bullet.gameObject);
+                return false;
+            }
+        }
+    }
+
+    private static bool TryPrepareNativeShot(
+        DiverWeaponIntent intent,
+        RemoteAvatar remoteAvatar,
+        out NativeShot shot)
+    {
+        shot = default;
+        if (!TryNormalizeAim(intent.AimX, intent.AimY, out var direction) ||
+            remoteAvatar?.TargetTransform == null || !ResourceManager.hasInstance ||
+            !ResourceManager.Instance.IsLoadedGunSpecData)
+            return false;
+        try
+        {
+            var spec = ResourceManager.Instance.GetGunSpecData(intent.WeaponId);
+            if (spec == null || spec.TID != intent.WeaponId || spec.BulletPrefab == null)
+                return false;
+            shot = new NativeShot(remoteAvatar.TargetTransform, direction, spec);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryGetAim(PlayerCharacter player, out Vector2 aim)
+    {
+        aim = default;
+        try
+        {
+            var transform = player?.RangeAttackArm?.gunAimPoint?.attackArmTransform;
+            if (transform == null || !TryNormalizeAim(
+                    transform.right.x, transform.right.y, out var direction))
+                return false;
+            aim = new Vector2(direction.x, direction.y);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryNormalizeAim(float x, float y, out Vector3 direction)
+    {
+        direction = default;
+        if (!float.IsFinite(x) || !float.IsFinite(y))
+            return false;
+        var squared = x * x + y * y;
+        if (squared is < 0.25f or > 1.44f)
+            return false;
+        var inverse = 1f / MathF.Sqrt(squared);
+        direction = new Vector3(x * inverse, y * inverse, 0f);
         return true;
     }
 

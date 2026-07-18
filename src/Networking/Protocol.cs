@@ -197,7 +197,9 @@ internal readonly record struct DiverWeaponIntent(
     uint SceneEpoch,
     ulong RequestId,
     DiverWeaponAction Action,
-    int WeaponId);
+    int WeaponId,
+    float AimX,
+    float AimY);
 
 internal readonly record struct DiverWeaponResult(
     uint CommitRevision,
@@ -662,14 +664,14 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 48;
+    private const byte Version = 49;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
     private const int DiverRuntimeStateSize = HeaderSize + DiverRuntimePayloadSize;
     private const int DiverVitalResultSize = HeaderSize + 18 + DiverRuntimePayloadSize;
     private const int DiverVitalIntentSize = HeaderSize + 21;
-    private const int DiverWeaponIntentSize = HeaderSize + 21;
+    private const int DiverWeaponIntentSize = HeaderSize + 29;
     private const int DiverWeaponResultSize = HeaderSize + 19 + DiverRuntimePayloadSize;
     private const int VisualStateFixedSize = HeaderSize + 9;
     private const int VisualSpriteSize = 38;
@@ -1018,6 +1020,8 @@ internal static class Protocol
         BinaryPrimitives.WriteUInt64LittleEndian(packet.AsSpan(HeaderSize + 8), intent.RequestId);
         packet[HeaderSize + 16] = (byte)intent.Action;
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 17), intent.WeaponId);
+        WriteSingle(packet.AsSpan(HeaderSize + 21), intent.AimX);
+        WriteSingle(packet.AsSpan(HeaderSize + 25), intent.AimY);
         return packet;
     }
 
@@ -1037,7 +1041,9 @@ internal static class Protocol
             BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(HeaderSize + 4)),
             BinaryPrimitives.ReadUInt64LittleEndian(packet.Slice(HeaderSize + 8)),
             (DiverWeaponAction)packet[HeaderSize + 16],
-            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 17)));
+            BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 17)),
+            ReadSingle(packet.Slice(HeaderSize + 21)),
+            ReadSingle(packet.Slice(HeaderSize + 25)));
         if (!IsValidDiverWeaponIntent(candidate))
             return false;
         intent = candidate;
@@ -3952,7 +3958,11 @@ internal static class Protocol
         Enum.IsDefined(typeof(DiverWeaponAction), intent.Action) &&
         (intent.Action == DiverWeaponAction.Unequip
             ? intent.WeaponId == 0
-            : intent.WeaponId > 0);
+            : intent.WeaponId > 0) &&
+        (intent.Action == DiverWeaponAction.Fire
+            ? float.IsFinite(intent.AimX) && float.IsFinite(intent.AimY) &&
+              intent.AimX * intent.AimX + intent.AimY * intent.AimY is >= 0.25f and <= 1.44f
+            : intent.AimX == 0f && intent.AimY == 0f);
 
     private static bool IsValidDiverVitalIntent(DiverVitalIntent intent) =>
         intent.SceneId != 0 && intent.SceneEpoch != 0 && intent.RequestId != 0 &&
@@ -4295,7 +4305,8 @@ internal static class Protocol
 
         var expectedWeaponIntent = new DiverWeaponIntent(
             expectedDiverRuntime.SceneId, expectedDiverRuntime.SceneEpoch,
-            0x123456789abcdef0, DiverWeaponAction.Fire, expectedDiverRuntime.WeaponId);
+            0x123456789abcdef0, DiverWeaponAction.Fire, expectedDiverRuntime.WeaponId,
+            0.6f, 0.8f);
         var weaponIntentPacket = EncodeDiverWeaponIntent(49, expectedWeaponIntent);
         if (!TryDecodeDiverWeaponIntent(
                 weaponIntentPacket, out sequence, out var actualWeaponIntent) ||
