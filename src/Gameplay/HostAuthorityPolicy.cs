@@ -381,6 +381,13 @@ internal static class CentralSaveAuthorityPatch
         HostAuthorityPolicy.AllowHostOwnedSave(__originalMethod?.Name ?? "SaveData");
 }
 
+[HarmonyPatch(typeof(SaveLoadPopup), nameof(SaveLoadPopup.OnClickSaveGameSlot))]
+internal static class ManualSaveAuthorityPatch
+{
+    private static bool Prefix() =>
+        HostAuthorityPolicy.AllowHostOwnedSave(nameof(SaveLoadPopup.OnClickSaveGameSlot));
+}
+
 [HarmonyPatch(typeof(SteamAchievements), nameof(SteamAchievements.UnlockProgressSyncFromSave))]
 internal static class RemoteSaveAchievementAuthorityPatch
 {
