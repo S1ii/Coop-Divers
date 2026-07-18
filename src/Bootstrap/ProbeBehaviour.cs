@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using Il2CppInterop.Runtime.Attributes;
 using BepInEx.Unity.IL2CPP;
 using DR.AI;
 using HarmonyLib;
@@ -562,6 +563,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         !_loadedGameplayScenes.AllowsWorldScopedReplication(
             Role, _session?.Connected == true);
 
+    [HideFromIl2Cpp]
     private void WriteSessionDesyncDump(UdpSession session)
     {
         if (session == null || !ShouldEmitSessionDesyncDump(
