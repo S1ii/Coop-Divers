@@ -763,10 +763,10 @@ internal static class MultiplayerSaveSync
         }
 
         if (uint.TryParse(json.Trim(), NumberStyles.HexNumber, CultureInfo.InvariantCulture,
-                out var legacy) && legacy == Fingerprint(current))
+                out _))
         {
             WriteMarker(CreateMarker(currentFingerprint, string.Empty));
-            log?.LogInfo("MP save sync: migrated legacy slot marker");
+            log?.LogInfo("MP save sync: reclaimed legacy slot marker");
             return true;
         }
         RefuseOccupiedSlot(log, "ownership marker is invalid or stale");

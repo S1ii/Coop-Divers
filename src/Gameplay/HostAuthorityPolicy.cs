@@ -364,7 +364,7 @@ internal static class CentralSaveAuthorityPatch
         if (gameSave != null && seen.Add(gameSave))
             yield return gameSave;
 
-        var playerSave = AccessTools.Method(
+        var playerSave = AccessTools.DeclaredMethod(
             typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.SaveData),
             new[] { typeof(bool) });
         if (playerSave != null && seen.Add(playerSave))
