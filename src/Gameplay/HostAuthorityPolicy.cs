@@ -393,7 +393,7 @@ internal static class SaveSlotJsonAuthorityPatch
         if (gameSave != null)
             yield return gameSave;
 
-        var playerSave = AccessTools.Method(
+        var playerSave = AccessTools.DeclaredMethod(
             typeof(SaveSystemPlayerDataManager), nameof(SaveSystemPlayerDataManager.SaveSlotWithJson),
             parameters);
         if (playerSave != null && playerSave != gameSave)
