@@ -198,8 +198,7 @@ internal static class MissionPresentationCountPatch
                 yield return method;
     }
 
-    private static bool Prefix() =>
-        ProbeBehaviour.Instance?.IsCompletingClientPresentation != true;
+    private static bool Prefix() => HostAuthorityPolicy.CanMutatePersistentProgress;
 }
 
 [HarmonyPatch]

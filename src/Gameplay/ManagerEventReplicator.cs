@@ -5,6 +5,8 @@ using BepInEx.Logging;
 using DR.GameData;
 using DR.Save;
 using HarmonyLib;
+using Il2CppInterop.Runtime.InteropTypes;
+using TMPro;
 using UnityEngine;
 
 namespace DaveTheDiverMP;
@@ -85,7 +87,10 @@ internal enum ManagerAction : byte
     SushiWasabiRequest = 77,
     TimeScale = 78,
     TimeStop = 79,
-    TimeReset = 80
+    TimeReset = 80,
+    TutorialStep = 81,
+    DialogueVote = 82,
+    DialogueChoice = 83
 }
 
 internal sealed class ManagerEventReplicator
@@ -93,6 +98,10 @@ internal sealed class ManagerEventReplicator
     private const int MaxTimelineGeneration = 0x3fffffff;
     private const int RewardActionBase = (int)ManagerAction.RewardFirst;
     private const int MaxPendingManagerEvents = 256;
+    private const int DialogueVoteContinue = 1;
+    private const int DialogueVoteSkip = 2;
+    private const int DialogueVoteFinish = 3;
+    private const int DialogueVoteChoiceBase = 4;
 
     private enum RestoreDecision
     {
@@ -193,6 +202,7 @@ internal sealed class ManagerEventReplicator
     private readonly Queue<ManagerEvent> _outboundEvents = new();
     private readonly Dictionary<ManagerDomain, uint> _hostRevisions = new();
     private readonly Dictionary<ManagerDomain, uint> _clientManagerRevisions = new();
+    private readonly Dictionary<ManagerDomain, uint> _lastBlockedTraceRevisions = new();
     private readonly Dictionary<int, MenuSlotState> _hostMenuSlots = new();
     private readonly int[] _hostWasabi = new int[(int)SushiBar.Place.Max];
     private uint _sushiRevision;
@@ -203,11 +213,17 @@ internal sealed class ManagerEventReplicator
     private bool _applyingDialogueAuthority;
     private bool _applyingTimeAuthority;
     private bool _remoteTimeScopeActive;
+    private bool _waitingForManagementPanelClose;
     private int _suppressPublish;
     private float _nextSushiScan;
     private float _nextProgressionScan;
     private readonly int[] _hostWallet = new int[6];
     private readonly Dictionary<int, byte> _hostUnlocks = new();
+    private int _hostTutorialStep = -1;
+    private int _pendingClientTutorialStep = -1;
+    private int _clientTutorialAppliedStep = -1;
+    private uint _clientTutorialAppliedSceneId;
+    private bool _allowClientTutorialActivation;
     private SushiBarOrderQueue.ProgressData _remoteSushiPlate;
     private bool _clientRemoteSushiPlate;
     private bool _wasConnected;
@@ -253,6 +269,15 @@ internal sealed class ManagerEventReplicator
     private int _hostScenarioNodeId = -1;
     private int _hostDialogueBundleKey;
     private int _hostDialogueIndex = -1;
+    private int _localDialogueBundleKey;
+    private int _dialogueVoteBundleKey;
+    private int _dialogueVoteScope = -1;
+    private int _committedDialogueBundleKey;
+    private int _committedDialogueScope = -1;
+    private int _hostDialogueVote;
+    private int _clientDialogueVote;
+    private TextMeshProUGUI _dialogueVoteLabel;
+    private Transform _dialogueVoteLabelParent;
     private string _clientScenarioBundleId = string.Empty;
     private int _clientScenarioBundleKey;
     private int _clientScenarioNodeId = -1;
@@ -288,6 +313,10 @@ internal sealed class ManagerEventReplicator
             !IsActivityTerminal(ManagerDomain.Karaoke, ManagerAction.Result) ||
             IsActivityTerminal(ManagerDomain.Dialogue, ManagerAction.Result))
             throw new InvalidOperationException("Manager time/activity policy self-test failed");
+        if (!IsLocalDialogueBundle("LobbyTalkCobra_001") ||
+            IsLocalDialogueBundle("Tutorial_Mission06") ||
+            IsLocalDialogueBundle(null))
+            throw new InvalidOperationException("Local dialogue policy self-test failed");
         if (!HasManagerEventCapacity(MaxPendingManagerEvents - 1) ||
             HasManagerEventCapacity(MaxPendingManagerEvents))
             throw new InvalidOperationException("Manager event queue capacity self-test failed");
@@ -321,6 +350,30 @@ internal sealed class ManagerEventReplicator
             ShouldForceScenarioMilestoneKeyframe(
                 false, SessionRole.Host, true, 17, 18))
             throw new InvalidOperationException("Manager scenario keyframe gate self-test failed");
+        if (ShouldAllowNativeTutorialActivation(SessionRole.Client, true, false) ||
+            !ShouldAllowNativeTutorialActivation(SessionRole.Client, true, true) ||
+            !ShouldAllowNativeTutorialActivation(SessionRole.Client, false, false) ||
+            !ShouldAllowNativeTutorialActivation(SessionRole.Host, true, false))
+            throw new InvalidOperationException("Tutorial activation authority self-test failed");
+        if (!ShouldCompleteTutorialDialogue(17, 17, true) ||
+            ShouldCompleteTutorialDialogue(17, 18, true) ||
+            ShouldCompleteTutorialDialogue(17, 17, false))
+            throw new InvalidOperationException("Tutorial dialogue completion self-test failed");
+        if (!ShouldReleaseTutorialPresentation(17, 17, "other") ||
+            !ShouldReleaseTutorialPresentation(17, 18, "Tutorial_Test") ||
+            ShouldReleaseTutorialPresentation(17, 18, "Story_Test"))
+            throw new InvalidOperationException("Tutorial presentation release self-test failed");
+        if (!ShouldDeferTutorialReplay(17) || ShouldDeferTutorialReplay(0))
+            throw new InvalidOperationException("Tutorial dialogue ordering self-test failed");
+        if (!ShouldWaitForManagementPanelClose(true, false) ||
+            !ShouldWaitForManagementPanelClose(false, true) ||
+            ShouldWaitForManagementPanelClose(false, false))
+            throw new InvalidOperationException("Management panel close gate self-test failed");
+        if (!ShouldConsumeUnavailableProgression(ManagerAction.Unlock) ||
+            !ShouldConsumeUnavailableProgression(ManagerAction.TutorialStep) ||
+            ShouldConsumeUnavailableProgression(ManagerAction.RewardFirst))
+            throw new InvalidOperationException(
+                "Unavailable progression consumption self-test failed");
         var outboundOverflow = new ManagerEventReplicator(null);
         var outboundSession = new UdpSession(null);
         for (var index = 0; index < MaxPendingManagerEvents; index++)
@@ -417,6 +470,11 @@ internal sealed class ManagerEventReplicator
             true, false, false, true, false, 0f, 0f, 0f));
         var rewardContext = PackRewardContext(17, RewardShowType.SilentReward);
         var sushiTarget = PackSushiTarget(SushiBar.Place.Branch, 7);
+        var dialogueScope = PackDialogueScope(17, 3);
+        var dialogueVotes = PackDialogueVotes(
+            dialogueScope, DialogueVoteChoiceBase + 2, DialogueVoteSkip);
+        var dialogueChoice = PackDialogueChoice(dialogueScope, 2);
+        var dialogueVoteText = FormatDialogueVoteText("Choice", 1);
         if (scenarioCancels != 1 || dialogueCancels != 1 ||
             timelineStarts != 1 || timelineCancels != 1 ||
             dialogueRevision != 0 || dialoguePending.Count != 1 ||
@@ -529,10 +587,29 @@ internal sealed class ManagerEventReplicator
              IsWalletDebitValid(GoodsType.none, -100, 100) ||
              IsWalletDebitValid(GoodsType.gold, 1, 100) ||
              IsWalletDebitValid(GoodsType.gold, -101, 100) ||
+             !IsValidTutorialStep((int)TutorialStep.Open_Sushi_Ingredient) ||
+             IsValidTutorialStep(-1) ||
+             IsValidTutorialStep((int)TutorialStep.AllDone + 1) ||
+             !ShouldQueueTutorialReplay(12, -1, 0, 7) ||
+             ShouldQueueTutorialReplay(12, 12, 7, 7) ||
              !TryUnpackSushiTarget(
                  sushiTarget, out var sushiPlace, out var sushiTable) ||
              sushiPlace != SushiBar.Place.Branch || sushiTable != 7 ||
              TryUnpackSushiTarget(-1, out _, out _) ||
+             !TryUnpackDialogueVotes(
+                 dialogueVotes, out var voteScope, out var hostVote, out var clientVote) ||
+             DialogueNodeFromScope(voteScope) != 17 ||
+             DialogueMessageFromScope(voteScope) != 3 ||
+             hostVote != DialogueVoteChoiceBase + 2 ||
+             clientVote != DialogueVoteSkip ||
+             !TryUnpackDialogueChoice(
+                 dialogueChoice, out var choiceScope, out var choiceIndex) ||
+             choiceScope != dialogueScope || choiceIndex != 2 ||
+             !DialogueVotesMatch(DialogueVoteContinue, DialogueVoteContinue) ||
+             DialogueVotesMatch(DialogueVoteContinue, DialogueVoteSkip) ||
+             DialogueVotesMatch(0, 0) ||
+             StripDialogueVoteText(dialogueVoteText) != "Choice" ||
+             FormatDialogueVoteText(dialogueVoteText, 2) != "Choice  2/2" ||
              GetTimelineTargets()[0] == null || GetTimelineTargets()[1] == null ||
             GetTimelineTargets()[2] == null || GetTimelineTargets()[3] == null)
             throw new InvalidOperationException("Manager event self-test failed");
@@ -564,6 +641,7 @@ internal sealed class ManagerEventReplicator
             }
             Array.Fill(_hostWallet, -1);
             _hostUnlocks.Clear();
+            _hostTutorialStep = -1;
             _nextProgressionScan = 0f;
             _nextDayScan = 0f;
             _nextStoryScan = 0f;
@@ -574,7 +652,10 @@ internal sealed class ManagerEventReplicator
         FlushOutbound(session);
 
         if (role == SessionRole.Host)
+        {
             TryAcceptScenarioStart(ScenarioManager.Instance, session);
+            ObserveLiveHostDialogue(session);
+        }
 
         if (role == SessionRole.Host && !_activeSessionSnapshotPublished)
         {
@@ -602,7 +683,7 @@ internal sealed class ManagerEventReplicator
                 _nextStorySafetyKeyframe,
                 now))
         {
-            ForceHostKeyframe();
+            ForceHostStoryKeyframe();
             _nextStorySafetyKeyframe = now + 5f;
         }
         if (role == SessionRole.Host && now >= _nextDayScan)
@@ -633,8 +714,16 @@ internal sealed class ManagerEventReplicator
             {
                 var lane = LaneOf((ManagerDomain)state.Domain);
                 var revision = GetRevision(_clientManagerRevisions, lane);
+                TraceManagerEvent(
+                    "receive", state, lane, revision,
+                    _pendingHostEvents.TryGetValue(lane, out var receivedPending)
+                        ? receivedPending.Count
+                        : 0);
                 if (!IsNewer(state.Revision, revision))
+                {
+                    TraceManagerEvent("drop-stale", state, lane, revision, 0);
                     continue;
+                }
                 if (!_hasHostClockOffset)
                 {
                     _hostClockOffset = unchecked(CurrentTick() - state.HostTick);
@@ -642,10 +731,18 @@ internal sealed class ManagerEventReplicator
                 }
                 if (!TryQueuePendingHostEvent(session, lane, state))
                     return;
+                if ((ManagerDomain)state.Domain == ManagerDomain.Progression &&
+                    (ManagerAction)state.Action == ManagerAction.TutorialStep &&
+                    IsValidTutorialStep(state.Value) &&
+                    (TutorialManager.Instance == null || ShouldQueueTutorialReplay(
+                        state.Value, _clientTutorialAppliedStep,
+                        _clientTutorialAppliedSceneId, sceneId)))
+                    _pendingClientTutorialStep = state.Value;
             }
         }
         if (role == SessionRole.Client)
         {
+            TryApplyPendingTutorial(sceneId);
             ApplyPendingHostEvents(session, sceneId);
             AlignTimeline();
             while (session.TryTakeSushiResultState(out var state))
@@ -669,11 +766,19 @@ internal sealed class ManagerEventReplicator
         TimeScaleController.Type type,
         float scale)
     {
-        if (_applyingTimeAuthority || IsLocalTimeScope(type) ||
+        if (_applyingTimeAuthority || _localDialogueBundleKey != 0 || IsLocalTimeScope(type) ||
             session == null || !session.Connected)
             return true;
         if (role != SessionRole.Host)
+        {
+            _log?.LogInfo(
+                $"Time authority intercept: role={role}; action=Scale; type={type}; " +
+                $"scale={scale}; allowed={role != SessionRole.Client}; remote={_remoteTimeScopeActive}");
             return role != SessionRole.Client;
+        }
+        _log?.LogInfo(
+            $"Time authority publish: action=Scale; type={type}; scale={scale}; " +
+            $"unityScale={Time.timeScale}");
         Publish(session, ManagerDomain.Time, ManagerAction.TimeScale,
             (int)type, BitConverter.SingleToInt32Bits(scale));
         return true;
@@ -684,22 +789,36 @@ internal sealed class ManagerEventReplicator
         UdpSession session,
         bool isGamePause)
     {
-        if (_applyingTimeAuthority || isGamePause || session == null || !session.Connected)
+        if (_applyingTimeAuthority || _localDialogueBundleKey != 0 || isGamePause ||
+            session == null || !session.Connected)
             return true;
         if (role != SessionRole.Host)
+        {
+            _log?.LogInfo(
+                $"Time authority intercept: role={role}; action=Stop; " +
+                $"allowed={role != SessionRole.Client}; remote={_remoteTimeScopeActive}");
             return role != SessionRole.Client;
+        }
+        _log?.LogInfo($"Time authority publish: action=Stop; unityScale={Time.timeScale}");
         Publish(session, ManagerDomain.Time, ManagerAction.TimeStop, 0, 0);
         return true;
     }
 
     internal bool InterceptTimeReset(SessionRole role, UdpSession session)
     {
-        if (_applyingTimeAuthority || session == null || !session.Connected)
+        if (_applyingTimeAuthority || _localDialogueBundleKey != 0 ||
+            session == null || !session.Connected)
             return true;
         if (role == SessionRole.Client && !_remoteTimeScopeActive)
             return true;
         if (role != SessionRole.Host)
+        {
+            _log?.LogInfo(
+                $"Time authority intercept: role={role}; action=Reset; " +
+                $"allowed={role != SessionRole.Client}; remote={_remoteTimeScopeActive}");
             return role != SessionRole.Client;
+        }
+        _log?.LogInfo($"Time authority publish: action=Reset; unityScale={Time.timeScale}");
         Publish(session, ManagerDomain.Time, ManagerAction.TimeReset, 0, 0);
         return true;
     }
@@ -714,6 +833,14 @@ internal sealed class ManagerEventReplicator
     {
         if (_applying || _suppressPublish > 0 || session == null || !session.Connected)
             return true;
+        if (domain == ManagerDomain.Dialogue &&
+            IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID))
+            return true;
+        if (domain == ManagerDomain.Dialogue &&
+            action is ManagerAction.Continue or ManagerAction.Skip or
+                ManagerAction.FirstChoice or ManagerAction.SecondChoice or
+                ManagerAction.DialogueChoice)
+            return InterceptDialogueAction(role, session, action, value, context);
         if (AllowsLeasedDialogueControl(
                 role, session.Connected,
                 ProbeBehaviour.Instance?.HasActiveNpcLease == true, action))
@@ -732,6 +859,82 @@ internal sealed class ManagerEventReplicator
             FlushOutbound(session);
         }
         return role != SessionRole.Client;
+    }
+
+    private bool InterceptDialogueAction(
+        SessionRole role,
+        UdpSession session,
+        ManagerAction action,
+        int bundleKey,
+        int context)
+    {
+        var manager = DialogueManager.Instance;
+        var liveBundleKey = ContentKey(manager?.CurrentBundleID);
+        var nodeIndex = manager?.m_CurrentDialogueIndex ?? -1;
+        var voteScope = DialogueVoteScope(manager);
+        if (manager?.IsPlaying != true || bundleKey == 0 || bundleKey != liveBundleKey ||
+            nodeIndex < 0 || voteScope < 0 ||
+            IsCommittedDialogueScope(
+                bundleKey, voteScope, _committedDialogueBundleKey, _committedDialogueScope))
+        {
+            _log?.LogWarning(
+                $"Dialogue vote rejected: role={role}; action={action}; " +
+                $"requested={bundleKey:X8}/{context}; live={liveBundleKey:X8}/{voteScope}; " +
+                $"playing={manager?.IsPlaying == true}");
+            return false;
+        }
+        if (action == ManagerAction.Continue && !IsDialoguePanelReady(manager))
+            return true;
+
+        var vote = action switch
+        {
+            ManagerAction.Continue => IsFinalDialogueNode(manager)
+                ? DialogueVoteFinish
+                : DialogueVoteContinue,
+            ManagerAction.Skip => DialogueVoteSkip,
+            ManagerAction.FirstChoice => DialogueVoteChoiceBase,
+            ManagerAction.SecondChoice => DialogueVoteChoiceBase + 1,
+            ManagerAction.DialogueChoice when TryUnpackDialogueChoice(
+                context, out var requestedScope, out var choiceIndex) &&
+                requestedScope == voteScope =>
+                DialogueVoteChoiceBase + choiceIndex,
+            _ => 0
+        };
+        if (!IsDialogueVoteValid(manager, vote))
+        {
+            _log?.LogWarning(
+                $"Dialogue vote invalid: role={role}; bundle={bundleKey:X8}; " +
+                $"scope={voteScope}; vote={vote}");
+            return false;
+        }
+
+        SetDialogueVoteScope(bundleKey, voteScope);
+        if (role == SessionRole.Host)
+        {
+            if (_hostDialogueVote == vote)
+                return false;
+            _hostDialogueVote = vote;
+            _log?.LogInfo(
+                $"Dialogue vote cast: role={role}; bundle={bundleKey:X8}; node={nodeIndex}; " +
+                $"msg={DialogueMessageFromScope(voteScope)}; vote={vote}; ready={DialogueVoteCount(vote)}/2");
+            PublishDialogueVotes(session);
+            TryCommitDialogueVotes(session, manager);
+        }
+        else if (role == SessionRole.Client)
+        {
+            if (_clientDialogueVote == vote)
+                return false;
+            _clientDialogueVote = vote;
+            _log?.LogInfo(
+                $"Dialogue vote cast: role={role}; bundle={bundleKey:X8}; node={nodeIndex}; " +
+                $"msg={DialogueMessageFromScope(voteScope)}; vote={vote}; ready={DialogueVoteCount(vote)}/2");
+            TryQueueOutbound(session, new ManagerEvent(
+                0, 0, CurrentTick(), (byte)ManagerDomain.Dialogue,
+                (byte)ManagerAction.DialogueVote, bundleKey,
+                PackDialogueVotes(voteScope, 0, vote)));
+            FlushOutbound(session);
+        }
+        return false;
     }
 
     internal void ObserveReward(SessionRole role, UdpSession session, Reward reward)
@@ -1003,11 +1206,13 @@ internal sealed class ManagerEventReplicator
         role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool AllowDialogueAdvance(SessionRole role, UdpSession session) =>
-        _applying || ProbeBehaviour.Instance?.HasActiveNpcLease == true ||
+        _applying || IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
+        ProbeBehaviour.Instance?.HasActiveNpcLease == true ||
         role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool AllowDialogueChoice(SessionRole role, UdpSession session) =>
-        _applying || role != SessionRole.Client || session == null || !session.Connected;
+        _applying || IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
+        role != SessionRole.Client || session == null || !session.Connected;
 
     internal bool InterceptPhoneCall(
         SessionRole role, UdpSession session, int tid, Il2CppSystem.Action<bool> callback)
@@ -1061,6 +1266,7 @@ internal sealed class ManagerEventReplicator
         IsTerminalAllowed(role, session?.Connected == true, _applyingScenarioAuthority);
 
     internal bool AllowDialogueTerminal(SessionRole role, UdpSession session) =>
+        IsLocalDialogueBundle(DialogueManager.Instance?.CurrentBundleID) ||
         ProbeBehaviour.Instance?.HasActiveNpcLease == true ||
         IsTerminalAllowed(role, session?.Connected == true, _applyingDialogueAuthority);
 
@@ -1132,6 +1338,16 @@ internal sealed class ManagerEventReplicator
         bool useButton,
         bool showCurtain)
     {
+        if (IsLocalDialogueBundle(bundleId))
+        {
+            _localDialogueBundleKey = ContentKey(bundleId);
+            _pendingHostDialogueInvocation = null;
+            _log?.LogInfo(
+                $"Dialogue kept local: role={role}; bundle={_localDialogueBundleKey:X8}; " +
+                $"id={bundleId}");
+            return true;
+        }
+        _localDialogueBundleKey = 0;
         if (!_applying && role == SessionRole.Host)
         {
             _pendingHostDialogueInvocation = null;
@@ -1309,9 +1525,17 @@ internal sealed class ManagerEventReplicator
     internal void ObserveDialogueStarted(
         SessionRole role, UdpSession session, string bundleId)
     {
-        if (_applying || role != SessionRole.Host || string.IsNullOrEmpty(bundleId))
+        if (_applying || string.IsNullOrEmpty(bundleId))
             return;
         var key = ContentKey(bundleId);
+        if (IsLocalDialogueBundle(bundleId))
+        {
+            _localDialogueBundleKey = key;
+            _pendingHostDialogueInvocation = null;
+            return;
+        }
+        if (role != SessionRole.Host)
+            return;
         if (_hostDialogueBundleKey == key)
             return;
         _hostDialogueBundleKey = key;
@@ -1319,6 +1543,13 @@ internal sealed class ManagerEventReplicator
         _hostDialogueInvocation = _pendingHostDialogueInvocation is { } invocation &&
             ContentKey(invocation.BundleId) == key ? invocation : null;
         _pendingHostDialogueInvocation = null;
+        _hostDialogueInvocation ??= CreateLiveDialogueInvocation(
+            DialogueManager.Instance, bundleId);
+        ResetDialogueVotes();
+        ResetDialogueCommit();
+        _log?.LogInfo(
+            $"Dialogue host start: bundle={key:X8}; id={bundleId}; " +
+            $"invocation={_hostDialogueInvocation?.Kind.ToString() ?? "none"}");
         if (session?.Connected == true)
             Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueStarted,
                 key, 0, _hostDialogueInvocation);
@@ -1329,12 +1560,20 @@ internal sealed class ManagerEventReplicator
     {
         if (_applying || role != SessionRole.Host || manager == null || info == null)
             return;
+        if (IsLocalDialogueBundle(manager.CurrentBundleID))
+            return;
         var key = ContentKey(manager.CurrentBundleID);
         var index = manager.m_CurrentDialogueIndex;
         if (key == 0 || index < 0)
             return;
+        if (_hostDialogueBundleKey != key)
+            ObserveDialogueStarted(role, session, manager.CurrentBundleID);
+        if (_hostDialogueBundleKey != key || _hostDialogueIndex == index)
+            return;
         _hostDialogueBundleKey = key;
         _hostDialogueIndex = index;
+        ResetDialogueVotes();
+        _log?.LogInfo($"Dialogue host node: bundle={key:X8}; node={index}");
         if (session?.Connected == true)
             Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueNode, key, index);
     }
@@ -1342,6 +1581,13 @@ internal sealed class ManagerEventReplicator
     internal void ObserveDialogueFinished(
         SessionRole role, UdpSession session, int bundleKey, bool result)
     {
+        if (_localDialogueBundleKey != 0 && bundleKey == _localDialogueBundleKey)
+        {
+            _log?.LogInfo(
+                $"Local dialogue finished: role={role}; bundle={bundleKey:X8}; result={result}");
+            _localDialogueBundleKey = 0;
+            return;
+        }
         if (_applying || role != SessionRole.Host || bundleKey == 0 ||
             bundleKey != _hostDialogueBundleKey)
             return;
@@ -1351,10 +1597,135 @@ internal sealed class ManagerEventReplicator
         _hostDialogueBundleKey = 0;
         _hostDialogueIndex = -1;
         _hostDialogueInvocation = null;
+        ResetDialogueVotes();
+        ResetDialogueCommit();
+        _log?.LogInfo($"Dialogue host finish: bundle={bundleKey:X8}; result={result}");
     }
 
-    internal void ObserveDialogueFinished(SessionRole role, UdpSession session) =>
+    internal void ObserveDialogueFinished(SessionRole role, UdpSession session)
+    {
+        if (_localDialogueBundleKey != 0)
+        {
+            _log?.LogInfo(
+                $"Local dialogue finished: role={role}; bundle={_localDialogueBundleKey:X8}");
+            _localDialogueBundleKey = 0;
+            return;
+        }
         ObserveDialogueFinished(role, session, _hostDialogueBundleKey, true);
+    }
+
+    private void ObserveLiveHostDialogue(UdpSession session)
+    {
+        var manager = DialogueManager.Instance;
+        var bundleId = manager?.CurrentBundleID;
+        var bundleKey = ContentKey(bundleId);
+        if (bundleKey != 0)
+        {
+            if (IsLocalDialogueBundle(bundleId))
+                return;
+            if (_hostDialogueBundleKey != bundleKey)
+                ObserveDialogueStarted(SessionRole.Host, session, bundleId);
+            var index = manager?.m_CurrentDialogueIndex ?? -1;
+            if (manager?.IsPlaying == true && index >= 0 && index != _hostDialogueIndex)
+            {
+                _hostDialogueIndex = index;
+                ResetDialogueVotes();
+                _log?.LogInfo($"Dialogue host poll node: bundle={bundleKey:X8}; node={index}");
+                Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueNode,
+                    bundleKey, index);
+            }
+            return;
+        }
+        if (_hostDialogueBundleKey != 0)
+            ObserveDialogueFinished(
+                SessionRole.Host, session, _hostDialogueBundleKey, true);
+    }
+
+    private static ManagerInvocationDescriptor? CreateLiveDialogueInvocation(
+        DialogueManager manager, string bundleId)
+    {
+        if (manager == null || string.IsNullOrEmpty(bundleId))
+            return null;
+        var descriptor = new ManagerInvocationDescriptor(
+            manager.IsPlayingSmall
+                ? ManagerInvocationKind.DialogueSmall
+                : ManagerInvocationKind.DialogueNormal,
+            bundleId, null, manager.m_UseButton,
+            manager.backCurtain?.activeSelf == true,
+            false, true, false, 0f, 0f, 0f);
+        return Protocol.IsValidManagerInvocation(
+            (byte)ManagerDomain.Dialogue, (byte)ManagerAction.DialogueStarted,
+            ContentKey(bundleId), descriptor) ? descriptor : null;
+    }
+
+    private void PublishDialogueVotes(UdpSession session) =>
+        Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueVote,
+            _dialogueVoteBundleKey,
+            PackDialogueVotes(
+                _dialogueVoteScope, _hostDialogueVote, _clientDialogueVote));
+
+    private void TryCommitDialogueVotes(UdpSession session, DialogueManager manager)
+    {
+        if (!DialogueVotesMatch(_hostDialogueVote, _clientDialogueVote))
+            return;
+        var bundleKey = _dialogueVoteBundleKey;
+        var voteScope = _dialogueVoteScope;
+        var nodeIndex = DialogueNodeFromScope(voteScope);
+        var vote = _hostDialogueVote;
+        _committedDialogueBundleKey = bundleKey;
+        _committedDialogueScope = voteScope;
+        _log?.LogInfo(
+            $"Dialogue vote committed: bundle={bundleKey:X8}; node={nodeIndex}; " +
+            $"msg={DialogueMessageFromScope(voteScope)}; vote={vote}; ready=2/2");
+        PublishDialogueVotes(session);
+        if (vote >= DialogueVoteChoiceBase)
+            Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueChoice,
+                bundleKey, PackDialogueChoice(voteScope, vote - DialogueVoteChoiceBase));
+        else
+            Publish(session, ManagerDomain.Dialogue,
+                vote == DialogueVoteSkip ? ManagerAction.Skip : ManagerAction.Continue,
+                bundleKey, voteScope);
+        ResetDialogueVotes();
+
+        var previousApplying = _applying;
+        var previousDialogueAuthority = _applyingDialogueAuthority;
+        _applying = true;
+        _applyingDialogueAuthority = true;
+        try
+        {
+            ExecuteDialogueVote(manager, bundleKey, voteScope, vote);
+        }
+        finally
+        {
+            _applying = previousApplying;
+            _applyingDialogueAuthority = previousDialogueAuthority;
+        }
+        ObserveLiveHostDialogue(session);
+    }
+
+    private static bool ExecuteDialogueVote(
+        DialogueManager manager, int bundleKey, int voteScope, int vote)
+    {
+        if (!CanApplyDialogueVoteScope(manager, bundleKey, voteScope))
+            return false;
+        if (vote == DialogueVoteSkip)
+        {
+            manager.OnSkip();
+            return true;
+        }
+        if (vote is DialogueVoteContinue or DialogueVoteFinish)
+        {
+            manager.ContinueDialogueManual();
+            return true;
+        }
+        var panel = FindActiveChoicePanel(manager);
+        var choice = vote - DialogueVoteChoiceBase;
+        if (panel == null || choice < 0 || choice >= panel.CheckChoiceCount())
+            return false;
+        panel.m_CurButtonIndex = choice;
+        panel.ExcuteFocusDialogue();
+        return true;
+    }
 
     private void RecordHostTimelineRoute(int tid, TimelineStartRoute route)
     {
@@ -1511,10 +1882,16 @@ internal sealed class ManagerEventReplicator
         }
         _outboundEvents.Clear();
         ResetLaneState(_pendingHostEvents, _hostRevisions, _clientManagerRevisions);
+        _lastBlockedTraceRevisions.Clear();
         _hostMenuSlots.Clear();
         Array.Fill(_hostWasabi, -1);
         Array.Fill(_hostWallet, -1);
         _hostUnlocks.Clear();
+        _hostTutorialStep = -1;
+        _pendingClientTutorialStep = -1;
+        _clientTutorialAppliedStep = -1;
+        _clientTutorialAppliedSceneId = 0;
+        _allowClientTutorialActivation = false;
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
         _sushiRevision = 0;
@@ -1541,6 +1918,7 @@ internal sealed class ManagerEventReplicator
             }
         }
         _remoteTimeScopeActive = false;
+        _waitingForManagementPanelClose = false;
         _suppressPublish = 0;
         _nextSushiScan = 0f;
         _nextProgressionScan = 0f;
@@ -1583,6 +1961,7 @@ internal sealed class ManagerEventReplicator
             _hostScenarioInvocation = null;
             _hostDialogueBundleKey = 0;
             _hostDialogueIndex = -1;
+            _localDialogueBundleKey = 0;
             _pendingHostDialogueInvocation = null;
             _hostDialogueInvocation = null;
         }
@@ -1591,6 +1970,8 @@ internal sealed class ManagerEventReplicator
         _clientScenarioNodeId = -1;
         _clientDialogueBundleKey = 0;
         _clientDialogueIndex = -1;
+        ResetDialogueVotes();
+        ResetDialogueCommit();
         _blockedClientScenarioNodeKey = 0;
         _blockedClientScenarioNode = null;
         CancelPendingScenarioStart();
@@ -1604,19 +1985,25 @@ internal sealed class ManagerEventReplicator
 
     internal void ForceHostKeyframe()
     {
-        _storySnapshotPublished = false;
-        _nextStoryScan = 0f;
-        _nextStorySafetyKeyframe = _wasConnected
-            ? Time.realtimeSinceStartup + 5f
-            : 0f;
+        ForceHostStoryKeyframe();
         _hostDayTicks = long.MinValue;
         _hostDayTime = int.MinValue;
         _hostWeather = int.MinValue;
         _nextDayScan = 0f;
         Array.Fill(_hostWallet, -1);
         _hostUnlocks.Clear();
+        _hostTutorialStep = -1;
         _nextProgressionScan = 0f;
         _activeSessionSnapshotPublished = false;
+    }
+
+    private void ForceHostStoryKeyframe()
+    {
+        _storySnapshotPublished = false;
+        _nextStoryScan = 0f;
+        _nextStorySafetyKeyframe = _wasConnected
+            ? Time.realtimeSinceStartup + 5f
+            : 0f;
     }
 
     internal static bool ShouldForceSceneEntryKeyframe(
@@ -1648,13 +2035,15 @@ internal sealed class ManagerEventReplicator
         !applying && role == SessionRole.Host && connected && bundleKey != 0 &&
         bundleKey == activeBundleKey;
 
-    internal void OnSceneChanged()
+    internal void OnSceneChanged(SessionRole role)
     {
+        if (role == SessionRole.Client)
+            ClearClientTutorialPresentation();
+        ResetDialogueVotes();
+        ResetDialogueCommit();
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
         _pendingHostTimelineInvocation = null;
-        CancelPendingScenarioStart();
-        CancelPendingDialogueStart();
         CompletePendingPhoneCallback(false);
         _clientPhoneTid = 0;
         var timeline = TimelineManager.Instance?.currentTimeline;
@@ -1668,6 +2057,26 @@ internal sealed class ManagerEventReplicator
         ResetClientTimelineState();
         _hostTimelineTid = 0;
         _hostTimelineRouteTid = 0;
+    }
+
+    private void ClearClientTutorialPresentation()
+    {
+        try
+        {
+            var tutorial = TutorialManager.Instance;
+            tutorial?.GetHandler()?.DeactivateTutorial();
+            tutorial?.HideTutorialUI();
+            _log?.LogInfo(
+                $"Client tutorial presentation cleared: step={_clientTutorialAppliedStep}; " +
+                $"scene={_clientTutorialAppliedSceneId}");
+        }
+        catch (Exception exception)
+        {
+            _log?.LogWarning(
+                $"Client tutorial presentation cleanup failed: {exception.Message}");
+        }
+        _clientTutorialAppliedStep = -1;
+        _clientTutorialAppliedSceneId = 0;
     }
 
     private void ResetClientTimelineState()
@@ -1692,11 +2101,13 @@ internal sealed class ManagerEventReplicator
         var lane = LaneOf(domain);
         var revision = NextRevision(GetRevision(_hostRevisions, lane));
         _hostRevisions[lane] = revision;
-        TryQueueOutbound(session, new ManagerEvent(
+        var state = new ManagerEvent(
             revision,
             IsGlobal(domain) ? 0 : _sceneId,
             CurrentTick(),
-            (byte)domain, (byte)action, value, context, invocation));
+            (byte)domain, (byte)action, value, context, invocation);
+        TraceManagerEvent("publish", state, lane, revision, _outboundEvents.Count);
+        TryQueueOutbound(session, state);
         FlushOutbound(session);
     }
 
@@ -1704,6 +2115,10 @@ internal sealed class ManagerEventReplicator
     {
         if (_outboundEvents.Count >= MaxPendingManagerEvents)
         {
+            _log?.LogError(
+                $"Manager outbound overflow: count={_outboundEvents.Count}; " +
+                $"incoming={(ManagerDomain)state.Domain}/{(ManagerAction)state.Action}; " +
+                $"revision={state.Revision}; scene={state.SceneId}/{state.SceneEpoch}");
             _outboundEvents.Clear();
             session?.FailReliableDeliveryFromDomain("manager event outbound queue overflow");
             return false;
@@ -1722,15 +2137,28 @@ internal sealed class ManagerEventReplicator
         if (pending.ContainsKey(state.Revision))
         {
             pending[state.Revision] = state;
+            TraceManagerEvent(
+                "queue-replace", state, lane,
+                GetRevision(_clientManagerRevisions, lane), pending.Count);
             return true;
         }
         if (pending.Count >= MaxPendingManagerEvents)
         {
+            _log?.LogError(
+                $"Manager pending overflow: lane={lane}; expected=" +
+                $"{NextRevision(GetRevision(_clientManagerRevisions, lane))}; " +
+                $"incomingRevision={state.Revision}; incoming=" +
+                $"{(ManagerDomain)state.Domain}/{(ManagerAction)state.Action}; " +
+                $"laneCount={pending.Count}; all={PendingLaneSummary()}; " +
+                $"runtime={DescribeApplyState(state)}");
             _pendingHostEvents.Clear();
             session?.FailReliableDeliveryFromDomain("manager event pending queue overflow");
             return false;
         }
         pending[state.Revision] = state;
+        TraceManagerEvent(
+            "queue", state, lane,
+            GetRevision(_clientManagerRevisions, lane), pending.Count);
         return true;
     }
 
@@ -1752,6 +2180,12 @@ internal sealed class ManagerEventReplicator
             state.SceneEpoch != session.LocalSceneEpoch)
             return;
         var domain = (ManagerDomain)state.Domain;
+        if (domain == ManagerDomain.Dialogue &&
+            (ManagerAction)state.Action == ManagerAction.DialogueVote)
+        {
+            ApplyClientDialogueVote(session, state);
+            return;
+        }
         if (domain == ManagerDomain.Progression &&
             (ManagerAction)state.Action == ManagerAction.Wallet)
         {
@@ -1780,6 +2214,38 @@ internal sealed class ManagerEventReplicator
                 state.Value, state.Context);
     }
 
+    private void ApplyClientDialogueVote(UdpSession session, ManagerEvent state)
+    {
+        if (!TryUnpackDialogueVotes(
+                state.Context, out var voteScope, out var hostVote, out var clientVote) ||
+            hostVote != 0 || clientVote == 0 || state.Value != _hostDialogueBundleKey)
+        {
+            _log?.LogWarning(
+                $"Client dialogue vote rejected: bundle={state.Value:X8}; " +
+                $"hostBundle={_hostDialogueBundleKey:X8}; context={state.Context}");
+            return;
+        }
+        var manager = DialogueManager.Instance;
+        if (!CanApplyDialogueVoteScope(manager, state.Value, voteScope) ||
+            IsCommittedDialogueScope(
+                state.Value, voteScope,
+                _committedDialogueBundleKey, _committedDialogueScope) ||
+            !IsDialogueVoteValid(manager, clientVote))
+        {
+            _log?.LogWarning(
+                $"Client dialogue vote stale: bundle={state.Value:X8}; " +
+                $"scope={voteScope}; vote={clientVote}; live={DialogueVoteScope(manager)}");
+            return;
+        }
+        SetDialogueVoteScope(state.Value, voteScope);
+        _clientDialogueVote = clientVote;
+        _log?.LogInfo(
+            $"Client dialogue vote accepted: bundle={state.Value:X8}; " +
+            $"scope={voteScope}; vote={clientVote}; ready={DialogueVoteCount(clientVote)}/2");
+        PublishDialogueVotes(session);
+        TryCommitDialogueVotes(session, manager);
+    }
+
     private void ApplyPendingHostEvents(UdpSession session, uint sceneId)
     {
         foreach (var pair in _pendingHostEvents)
@@ -1787,12 +2253,34 @@ internal sealed class ManagerEventReplicator
             var revision = GetRevision(_clientManagerRevisions, pair.Key);
             ApplyPendingLane(pair.Value, ref revision, state =>
             {
+                var applied = false;
                 if (state.SceneId == 0)
-                    return state.SceneEpoch == 0 ? Apply(state) : true;
-                if (state.SceneId == sceneId && state.SceneEpoch == session.RemoteSceneEpoch)
-                    return Apply(state);
-                return state.SceneEpoch != session.RemoteSceneEpoch ||
-                    !session.SceneMatches(state.SceneId);
+                    applied = state.SceneEpoch == 0 ? Apply(state) : true;
+                else if (state.SceneId == sceneId && state.SceneEpoch == session.RemoteSceneEpoch)
+                    applied = Apply(state);
+                else
+                    applied = state.SceneEpoch != session.RemoteSceneEpoch ||
+                        !session.SceneMatches(state.SceneId);
+                if (applied)
+                {
+                    _lastBlockedTraceRevisions.Remove(pair.Key);
+                    TraceManagerEvent(
+                        "apply-ok", state, pair.Key, revision, pair.Value.Count);
+                }
+                else if (ShouldTraceManagerEvent(state) &&
+                         (!_lastBlockedTraceRevisions.TryGetValue(
+                              pair.Key, out var blockedRevision) ||
+                          blockedRevision != state.Revision))
+                {
+                    _lastBlockedTraceRevisions[pair.Key] = state.Revision;
+                    TraceManagerEvent(
+                        "apply-blocked", state, pair.Key, revision, pair.Value.Count);
+                    _log?.LogWarning(
+                        $"Manager lane blocked: lane={pair.Key}; expected={NextRevision(revision)}; " +
+                        $"event={(ManagerDomain)state.Domain}/{(ManagerAction)state.Action}; " +
+                        $"revision={state.Revision}; runtime={DescribeApplyState(state)}");
+                }
+                return applied;
             });
             _clientManagerRevisions[pair.Key] = revision;
         }
@@ -1905,7 +2393,10 @@ internal sealed class ManagerEventReplicator
         }
         catch (Exception exception)
         {
-            _log.LogWarning($"Manager event apply failed: {exception.Message}");
+            _log?.LogWarning(
+                $"Manager event apply failed: domain={domain}; action={(ManagerAction)state.Action}; " +
+                $"revision={state.Revision}; value={state.Value}; context={state.Context}; " +
+                $"runtime={DescribeApplyState(state)}; error={exception}");
             return false;
         }
         finally
@@ -1930,15 +2421,24 @@ internal sealed class ManagerEventReplicator
                         return false;
                     TimeManager.SetTimeScale((TimeScaleController.Type)value, scale);
                     _remoteTimeScopeActive = true;
+                    _log?.LogInfo(
+                        $"Time authority applied: action=Scale; type={(TimeScaleController.Type)value}; " +
+                        $"scale={scale}; unityScale={Time.timeScale}");
                     return true;
                 case ManagerAction.TimeStop:
+                    if (WaitForManagementPanelClose())
+                        return false;
                     TimeManager.Instance?.TimeStop("DaveTheDiverMP", false);
                     _remoteTimeScopeActive = true;
+                    _log?.LogInfo(
+                        $"Time authority applied: action=Stop; unityScale={Time.timeScale}");
                     return true;
                 case ManagerAction.TimeReset:
                     if (_remoteTimeScopeActive)
                         TimeManager.Instance?.ResetTimeScale();
                     _remoteTimeScopeActive = false;
+                    _log?.LogInfo(
+                        $"Time authority applied: action=Reset; unityScale={Time.timeScale}");
                     return true;
                 default:
                     return false;
@@ -2002,6 +2502,42 @@ internal sealed class ManagerEventReplicator
         switch (action)
         {
             case ManagerAction.DialogueStarted:
+                if (WaitForManagementPanelClose())
+                    return false;
+                if (manager?.IsPlaying == true &&
+                    IsLocalDialogueBundle(manager.CurrentBundleID))
+                {
+                    var localBundleId = manager.CurrentBundleID;
+                    manager.TotalFinishDialogue();
+                    _localDialogueBundleKey = 0;
+                    _log?.LogInfo(
+                        $"Local dialogue closed for shared start: id={localBundleId}; " +
+                        $"shared={bundleKey:X8}");
+                }
+                var tutorial = TutorialManager.Instance;
+                var tutorialHandler = tutorial?.GetHandler();
+                if (ShouldReleaseTutorialPresentation(
+                        bundleKey,
+                        ContentKey(tutorialHandler?.startDialogueID),
+                        invocation?.BundleId))
+                {
+                    try
+                    {
+                        ReleaseTutorialPresentation(tutorial, tutorialHandler);
+                        _log?.LogInfo(
+                            $"Shared tutorial presentation released: " +
+                            $"bundle={bundleKey:X8}; step={tutorial?.CurrentStep.ToString() ?? "none"}");
+                    }
+                    catch (Exception exception)
+                    {
+                        _log?.LogWarning(
+                            $"Shared tutorial presentation cleanup failed: " +
+                            $"bundle={bundleKey:X8}; error={exception.Message}");
+                    }
+                }
+                ResetDialogueVotes();
+                if (_clientDialogueBundleKey != bundleKey)
+                    ResetDialogueCommit();
                 _clientDialogueBundleKey = bundleKey;
                 _clientDialogueIndex = -1;
                 if (bundleKey == 0)
@@ -2010,6 +2546,9 @@ internal sealed class ManagerEventReplicator
                 {
                     _clientDialogueIndex = manager.m_CurrentDialogueIndex;
                     _clientDialogueSpectating = false;
+                    _log?.LogInfo(
+                        $"Dialogue client start matched native: bundle={bundleKey:X8}; " +
+                        $"node={_clientDialogueIndex}");
                     return true;
                 }
                 if (CallbackIdentity(_pendingClientDialogueStart?.BundleKey ?? 0, bundleKey) ==
@@ -2033,6 +2572,7 @@ internal sealed class ManagerEventReplicator
                 }
                 _clientDialogueSpectating = false;
                 ReplayDialogueStart(manager, _pendingClientDialogueStart);
+                _log?.LogInfo($"Dialogue client replay started: bundle={bundleKey:X8}");
                 return true;
             case ManagerAction.DialogueNode:
                 if (bundleKey == 0 || bundleKey != _clientDialogueBundleKey)
@@ -2048,6 +2588,7 @@ internal sealed class ManagerEventReplicator
                     return false;
                 _clientDialogueBundleKey = bundleKey;
                 _clientDialogueIndex = index;
+                ResetDialogueVotes();
                 if (manager.m_CurrentDialogueIndex != index)
                 {
                     manager.m_CurrentDialogueIndex = index;
@@ -2065,25 +2606,80 @@ internal sealed class ManagerEventReplicator
                     return true;
                 }
                 if (manager?.IsPlaying == true)
-                    manager.ForceFinishDialogue(false);
-                CompleteDialogueCallback(bundleKey, index != 0);
+                    manager.TotalFinishDialogue();
+                if (!CompleteDialogueCallback(bundleKey, index != 0))
+                {
+                    CompleteSynthesizedTutorialDialogue(bundleKey, index != 0);
+                    var ui = GlobalUI.Instance;
+                    var wasHudOn = ui?.CurMainCanvas?.IsHudOn == true;
+                    ui?.ShowHUD(HUDLockType.Dialogue);
+                    _log?.LogInfo(
+                        $"Shared dialogue HUD lock released: bundle={bundleKey:X8}; " +
+                        $"wasOn={wasHudOn}; nowOn={ui?.CurMainCanvas?.IsHudOn == true}");
+                }
                 _clientDialogueBundleKey = 0;
                 _clientDialogueIndex = -1;
                 _clientDialogueSpectating = false;
                 _pendingClientDialogueStart = null;
+                ResetDialogueVotes();
+                ResetDialogueCommit();
+                _log?.LogInfo(
+                    $"Dialogue client finish: bundle={bundleKey:X8}; result={index != 0}");
+                return true;
+            case ManagerAction.DialogueVote:
+                if (bundleKey == 0 || bundleKey != _clientDialogueBundleKey ||
+                    !TryUnpackDialogueVotes(
+                        index, out var voteScope, out var hostVote, out var clientVote))
+                    return false;
+                if (!CanApplyDialogueVoteScope(manager, bundleKey, voteScope))
+                {
+                    _log?.LogInfo(
+                        $"Dialogue vote consumed before panel ready: bundle={bundleKey:X8}; " +
+                        $"scope={voteScope}; live={DialogueVoteScope(manager)}");
+                    return true;
+                }
+                if (hostVote != 0 && !IsDialogueVoteValid(manager, hostVote) ||
+                    clientVote != 0 && !IsDialogueVoteValid(manager, clientVote))
+                    return true;
+                SetDialogueVoteScope(bundleKey, voteScope);
+                _hostDialogueVote = hostVote;
+                _clientDialogueVote = clientVote;
+                _log?.LogInfo(
+                    $"Dialogue votes received: bundle={bundleKey:X8}; scope={voteScope}; " +
+                    $"host={hostVote}; client={clientVote}");
                 return true;
             case ManagerAction.Continue:
                 if (_clientDialogueSpectating)
                     return true;
-                if (manager == null)
+                if (IsCommittedDialogueScope(
+                        bundleKey, index,
+                        _committedDialogueBundleKey, _committedDialogueScope) ||
+                    IsLiveDialogueScopePast(manager, bundleKey, index))
+                    return true;
+                if (!CanApplyDialogueVoteScope(manager, bundleKey, index))
                     return false;
+                _committedDialogueBundleKey = bundleKey;
+                _committedDialogueScope = index;
+                ResetDialogueVotes();
+                _log?.LogInfo(
+                    $"Dialogue commit applied: action=Continue; bundle={bundleKey:X8}; scope={index}");
                 manager.ContinueDialogueManual();
                 return true;
             case ManagerAction.Skip:
                 if (_clientDialogueSpectating)
                     return true;
-                if (manager == null)
+                if (IsCommittedDialogueScope(
+                        bundleKey, index,
+                        _committedDialogueBundleKey, _committedDialogueScope) ||
+                    IsLiveDialogueScopePast(manager, bundleKey, index))
+                    return true;
+                if (!CanApplyDialogueVoteScope(manager, bundleKey, index))
                     return false;
+                _committedDialogueBundleKey = bundleKey;
+                _committedDialogueScope = index;
+                ResetDialogueVotes();
+                _log?.LogInfo(
+                    $"Dialogue commit applied: action=Skip; bundle={bundleKey:X8}; scope={index}");
                 manager.OnSkip();
                 return true;
             case ManagerAction.FirstChoice:
@@ -2101,6 +2697,33 @@ internal sealed class ManagerEventReplicator
                     return false;
                 manager.ExcuteSecondDialogue();
                 CompleteDialogueChoiceCallback(bundleKey, 1);
+                return true;
+            case ManagerAction.DialogueChoice:
+                if (_clientDialogueSpectating)
+                    return true;
+                if (!TryUnpackDialogueChoice(
+                        index, out var choiceScope, out var choiceIndex))
+                    return false;
+                if (IsCommittedDialogueScope(
+                        bundleKey, choiceScope,
+                        _committedDialogueBundleKey, _committedDialogueScope) ||
+                    IsLiveDialogueScopePast(manager, bundleKey, choiceScope))
+                    return true;
+                if (!CanApplyDialogueVoteScope(manager, bundleKey, choiceScope))
+                    return false;
+                var choicePanel = FindActiveChoicePanel(manager);
+                if (choicePanel == null || choiceIndex < 0 ||
+                    choiceIndex >= choicePanel.CheckChoiceCount())
+                    return false;
+                _committedDialogueBundleKey = bundleKey;
+                _committedDialogueScope = choiceScope;
+                ResetDialogueVotes();
+                _log?.LogInfo(
+                    $"Dialogue commit applied: action=Choice; bundle={bundleKey:X8}; " +
+                    $"scope={choiceScope}; choice={choiceIndex}");
+                choicePanel.m_CurButtonIndex = choiceIndex;
+                choicePanel.ExcuteFocusDialogue();
+                CompleteDialogueChoiceCallback(bundleKey, choiceIndex);
                 return true;
             case ManagerAction.PhoneCall:
                 if (manager == null || bundleKey <= 0)
@@ -2339,7 +2962,7 @@ internal sealed class ManagerEventReplicator
         InvokeClientPresentationCallback(() => callback?.Invoke(result), "scenario");
     }
 
-    private void CompleteDialogueCallback(int bundleKey, bool result)
+    private bool CompleteDialogueCallback(int bundleKey, bool result)
     {
         var decision = CallbackIdentity(
             _pendingClientDialogueStart?.BundleKey ?? 0, bundleKey);
@@ -2347,12 +2970,28 @@ internal sealed class ManagerEventReplicator
         {
             if (decision == CallbackIdentityDecision.Clear)
                 CancelPendingDialogueStart();
-            return;
+            return false;
         }
-        var callback = _pendingClientDialogueStart?.Callback;
-        if (_pendingClientDialogueStart != null)
-            _pendingClientDialogueStart.Callback = null;
+        var pending = _pendingClientDialogueStart;
+        _pendingClientDialogueStart = null;
+        var callback = pending?.Callback;
+        if (pending != null)
+            pending.Callback = null;
         InvokeClientPresentationCallback(() => callback?.Invoke(result), "dialogue");
+        return callback != null;
+    }
+
+    private void CompleteSynthesizedTutorialDialogue(int bundleKey, bool result)
+    {
+        var tutorial = TutorialManager.Instance;
+        var handler = tutorial?.GetHandler();
+        var tutorialBundleKey = ContentKey(handler?.startDialogueID);
+        if (!ShouldCompleteTutorialDialogue(bundleKey, tutorialBundleKey, result))
+            return;
+        InvokeClientPresentationCallback(() => handler.FinishDialogue(result), "tutorial dialogue");
+        _log?.LogInfo(
+            $"Shared tutorial dialogue callback completed: bundle={bundleKey:X8}; " +
+            $"step={tutorial.CurrentStep}");
     }
 
     private void CompleteDialogueChoiceCallback(int bundleKey, int choice)
@@ -3186,14 +3825,55 @@ internal sealed class ManagerEventReplicator
                     CommonDefine.Instance?.AddPlayerGoods(type, context - current);
                 return true;
             }
+            if (action == ManagerAction.TutorialStep)
+            {
+                if (!IsValidTutorialStep(value))
+                    return false;
+                if (TutorialManager.Instance == null)
+                    return ShouldConsumeUnavailableProgression(action);
+                if (ShouldQueueTutorialReplay(
+                        value, _clientTutorialAppliedStep,
+                        _clientTutorialAppliedSceneId, _sceneId))
+                    _pendingClientTutorialStep = value;
+                return true;
+            }
             if (action != ManagerAction.Unlock || context is < 0 or > 3)
                 return false;
-            var data = ContentsUnlockManager.Instance?.GetUnlockData((ContentsList)value);
+            var unlockManager = ContentsUnlockManager.Instance;
+            var contents = (ContentsList)value;
+            var data = unlockManager?.GetUnlockData(contents);
+            var created = false;
+            if (data == null && unlockManager != null && (context & 1) != 0)
+            {
+                unlockManager.ForceUnlock(contents);
+                data = unlockManager.GetUnlockData(contents);
+                created = data != null;
+                _log?.LogInfo(
+                    $"Shared unlock native force: id={value}; created={created}");
+            }
             if (data == null)
-                return false;
-            data.isUnlock = (context & 1) != 0;
-            data.isNew = (context & 2) != 0;
-            data.Save();
+            {
+                _log?.LogWarning(
+                    $"Shared unlock deferred: id={value}; flags={context}; " +
+                    "native unlock data unavailable; event consumed for lane progress");
+                return ShouldConsumeUnavailableProgression(action);
+            }
+            var isUnlock = (context & 1) != 0;
+            var isNew = (context & 2) != 0;
+            var changed = data.isUnlock != isUnlock || data.isNew != isNew;
+            if (changed)
+            {
+                data.isUnlock = isUnlock;
+                data.isNew = isNew;
+            }
+            if (created || changed)
+            {
+                data.Save();
+                unlockManager.RefreshUI();
+                _log?.LogInfo(
+                    $"Shared unlock committed: id={value}; created={created}; " +
+                    $"changed={changed}; unlock={data.isUnlock}; new={data.isNew}");
+            }
             return true;
         }
         finally
@@ -3208,20 +3888,194 @@ internal sealed class ManagerEventReplicator
             PublishWalletIfChanged(session, (GoodsType)value);
 
         var unlocks = ContentsUnlockManager.Instance?.m_UnlockDatas;
-        if (unlocks == null)
-            return;
-        foreach (var pair in unlocks)
+        if (unlocks != null)
         {
-            var data = pair.Value;
-            if (data == null)
-                continue;
-            var id = (int)pair.Key;
-            var flags = (byte)((data.isUnlock ? 1 : 0) | (data.isNew ? 2 : 0));
-            if (_hostUnlocks.TryGetValue(id, out var previous) && previous == flags)
-                continue;
-            _hostUnlocks[id] = flags;
-            if (flags != 0 || previous != 0)
-                Publish(session, ManagerDomain.Progression, ManagerAction.Unlock, id, flags);
+            foreach (var pair in unlocks)
+            {
+                var data = pair.Value;
+                if (data == null)
+                    continue;
+                var id = (int)pair.Key;
+                var flags = (byte)((data.isUnlock ? 1 : 0) | (data.isNew ? 2 : 0));
+                if (_hostUnlocks.TryGetValue(id, out var previous) && previous == flags)
+                    continue;
+                _hostUnlocks[id] = flags;
+                if (flags != 0 || previous != 0)
+                    Publish(session, ManagerDomain.Progression, ManagerAction.Unlock, id, flags);
+            }
+        }
+
+        var tutorial = TutorialManager.Instance;
+        var tutorialStep = tutorial == null ? -1 : (int)tutorial.CurrentStep;
+        if (IsValidTutorialStep(tutorialStep) && _hostTutorialStep != tutorialStep)
+        {
+            _hostTutorialStep = tutorialStep;
+            Publish(session, ManagerDomain.Progression,
+                ManagerAction.TutorialStep, tutorialStep, 0);
+        }
+    }
+
+    private static bool IsValidTutorialStep(int value) =>
+        value is >= (int)TutorialStep.None and <= (int)TutorialStep.AllDone;
+
+    private static bool ShouldConsumeUnavailableProgression(ManagerAction action) =>
+        action is ManagerAction.Unlock or ManagerAction.TutorialStep;
+
+    private static bool ShouldAllowNativeTutorialActivation(
+        SessionRole role, bool connected, bool controlledActivation) =>
+        role != SessionRole.Client || !connected || controlledActivation;
+
+    internal bool AllowNativeTutorialActivation(SessionRole role, UdpSession session)
+    {
+        var allowed = ShouldAllowNativeTutorialActivation(
+            role, session?.Connected == true, _allowClientTutorialActivation);
+        if (!allowed)
+            _log?.LogInfo(
+                $"Duplicate tutorial activation suppressed: " +
+                $"step={TutorialManager.Instance?.CurrentStep.ToString() ?? "none"}");
+        return allowed;
+    }
+
+    private static bool ShouldQueueTutorialReplay(
+        int step, int appliedStep, uint appliedScene, uint scene) =>
+        step != appliedStep || appliedScene != scene;
+
+    private static bool ShouldCompleteTutorialDialogue(
+        int bundleKey, int tutorialBundleKey, bool result) =>
+        result && bundleKey != 0 && bundleKey == tutorialBundleKey;
+
+    private static bool ShouldReleaseTutorialPresentation(
+        int bundleKey, int tutorialBundleKey, string bundleId) =>
+        bundleKey != 0 && (bundleKey == tutorialBundleKey ||
+            bundleId?.StartsWith("Tutorial_", StringComparison.Ordinal) == true);
+
+    private static void ReleaseTutorialPresentation(
+        TutorialManager tutorial, TutorialHandler handler)
+    {
+        var branch = handler?.m_CurrentBranchTutorial;
+        handler?.StopAllCoroutines();
+        if (branch != handler)
+            branch?.StopAllCoroutines();
+        handler?.DeactivateTutorial();
+        DisableTutorialLocks(handler);
+        if (branch != handler)
+            DisableTutorialLocks(branch);
+        tutorial?.HideTutorialUI();
+        var guide = UnityEngine.Object.FindFirstObjectByType<GuideHelperPanel>();
+        guide?.StopAllCoroutines();
+        guide?.HideGuideTextUI();
+        guide?.HideGuidePointerUI();
+    }
+
+    private static void DisableTutorialLocks(TutorialHandler handler)
+    {
+        handler?.actionLock?.SetEnable(false);
+        handler?.inputLocker?.SetEnable(false);
+        handler?.m_Pointerlocker?.SetEnable(false);
+    }
+
+    private static bool ShouldDeferTutorialReplay(int activeDialogueBundleKey) =>
+        activeDialogueBundleKey != 0;
+
+    private static bool ShouldWaitForManagementPanelClose(
+        bool isShown, bool isTransitioning) =>
+        isShown || isTransitioning;
+
+    private bool WaitForManagementPanelClose()
+    {
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        if (!ShouldWaitForManagementPanelClose(
+                panel?.IsShow == true, panel?.IsTransitioning == true))
+        {
+            if (_waitingForManagementPanelClose)
+                _log?.LogInfo("Management panel closed; shared pause may continue");
+            _waitingForManagementPanelClose = false;
+            return false;
+        }
+
+        if (panel.IsShow && !panel.IsTransitioning)
+            panel.OnClickClose();
+        if (!_waitingForManagementPanelClose)
+            _log?.LogInfo(
+                $"Management panel close deferred shared pause: " +
+                $"shown={panel.IsShow}; transitioning={panel.IsTransitioning}; " +
+                $"unityScale={Time.timeScale}");
+        _waitingForManagementPanelClose = true;
+        return true;
+    }
+
+    private void TryApplyPendingTutorial(uint sceneId)
+    {
+        if (!IsValidTutorialStep(_pendingClientTutorialStep) || sceneId == 0)
+            return;
+        var tutorial = TutorialManager.Instance;
+        if (tutorial == null)
+            return;
+        if (ShouldDeferTutorialReplay(_clientDialogueBundleKey))
+            return;
+
+        var step = (TutorialStep)_pendingClientTutorialStep;
+        var probe = ProbeBehaviour.Instance;
+        var previousApplying = _applying;
+        var initialized = false;
+        probe?.BeginRemoteMissionApply();
+        _applying = true;
+        try
+        {
+            try
+            {
+                tutorial.GetHandler()?.DeactivateTutorial();
+            }
+            catch (Exception exception)
+            {
+                _log.LogWarning(
+                    $"Passive tutorial stale handler cleanup failed: step={step}; " +
+                    $"error={exception.Message}");
+            }
+            tutorial.ApplyStep(step);
+            tutorial.RefreshTutorialHandler();
+            if (tutorial.CurrentStep != step)
+            {
+                tutorial.CurrentStep = step;
+                tutorial.ApplyStep(step);
+                tutorial.RefreshTutorialHandler();
+            }
+            tutorial.InitActivateTutorial();
+            initialized = true;
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning(
+                $"Passive tutorial step not ready: step={step}; scene={sceneId}; " +
+                $"error={exception.Message}");
+        }
+        finally
+        {
+            _applying = previousApplying;
+            probe?.EndRemoteMissionApply();
+        }
+        if (!initialized)
+            return;
+        try
+        {
+            _allowClientTutorialActivation = true;
+            tutorial.ActivateTutorial();
+            _pendingClientTutorialStep = -1;
+            _clientTutorialAppliedStep = (int)step;
+            _clientTutorialAppliedSceneId = sceneId;
+            _log.LogInfo(
+                $"Shared tutorial runtime activated: step={step}; scene={sceneId}; " +
+                "dialogueAuthority=host");
+        }
+        catch (Exception exception)
+        {
+            _log.LogWarning(
+                $"Shared tutorial activation not ready: step={step}; scene={sceneId}; " +
+                $"error={exception.Message}");
+        }
+        finally
+        {
+            _allowClientTutorialActivation = false;
         }
     }
 
@@ -3287,6 +4141,307 @@ internal sealed class ManagerEventReplicator
     private static int PackUShorts(int low, int high) =>
         (Math.Clamp(low, 0, ushort.MaxValue) & 0xffff) |
         (Math.Clamp(high, 0, ushort.MaxValue) << 16);
+
+    private static int PackDialogueVotes(int voteScope, int hostVote, int clientVote) =>
+        (Math.Clamp(voteScope, 0, ushort.MaxValue) & 0xffff) |
+        (Math.Clamp(hostVote, 0, 0xff) << 16) |
+        (Math.Clamp(clientVote, 0, 0x7f) << 24);
+
+    private static bool TryUnpackDialogueVotes(
+        int context, out int voteScope, out int hostVote, out int clientVote)
+    {
+        voteScope = context & 0xffff;
+        hostVote = context >> 16 & 0xff;
+        clientVote = context >> 24 & 0x7f;
+        return context >= 0 && hostVote <= 0x7f;
+    }
+
+    private static int PackDialogueChoice(int voteScope, int choiceIndex) =>
+        PackUShorts(voteScope, choiceIndex);
+
+    private static bool TryUnpackDialogueChoice(
+        int context, out int voteScope, out int choiceIndex)
+    {
+        voteScope = context & 0xffff;
+        choiceIndex = (int)((uint)context >> 16);
+        return context >= 0;
+    }
+
+    private static int PackDialogueScope(int nodeIndex, int messageIndex) =>
+        nodeIndex is >= 0 and <= byte.MaxValue &&
+        messageIndex is >= 0 and <= byte.MaxValue
+            ? nodeIndex | messageIndex << 8
+            : -1;
+
+    private static int DialogueNodeFromScope(int voteScope) => voteScope & 0xff;
+
+    private static int DialogueMessageFromScope(int voteScope) => voteScope >> 8 & 0xff;
+
+    internal static int DialogueVoteScope(DialogueManager manager)
+    {
+        var nodeIndex = manager?.m_CurrentDialogueIndex ?? -1;
+        var messageIndex = CurrentDialoguePanel(manager)?.m_MsgsIndex ?? 0;
+        return PackDialogueScope(nodeIndex, messageIndex);
+    }
+
+    private static DialoguePanel CurrentDialoguePanel(DialogueManager manager) =>
+        manager?.current?.TryCast<DialoguePanel>();
+
+    private static bool IsFinalDialogueNode(DialogueManager manager) =>
+        manager?.m_CurrentDialogues != null &&
+        IsFinalDialogueNode(manager.m_CurrentDialogueIndex, manager.m_CurrentDialogues.Count);
+
+    private static bool IsFinalDialogueNode(int index, int count) =>
+        count > 0 && index >= count - 1;
+
+    private static bool DialogueVotesMatch(int hostVote, int clientVote) =>
+        hostVote != 0 && hostVote == clientVote;
+
+    private static bool IsDialogueVoteValid(DialogueManager manager, int vote)
+    {
+        if (manager == null || vote <= 0 || vote > 0x7f)
+            return false;
+        if (vote == DialogueVoteContinue)
+            return IsDialoguePanelReady(manager) && !manager.CanChoiceButtonAciton &&
+                !IsFinalDialogueNode(manager);
+        if (vote == DialogueVoteFinish)
+            return IsDialoguePanelReady(manager) && !manager.CanChoiceButtonAciton &&
+                IsFinalDialogueNode(manager);
+        if (vote == DialogueVoteSkip)
+            return manager.IsShowSkipButton;
+        var panel = FindActiveChoicePanel(manager);
+        var choice = vote - DialogueVoteChoiceBase;
+        return manager.CanChoiceButtonAciton && panel != null && choice >= 0 &&
+            choice < panel.CheckChoiceCount();
+    }
+
+    private static bool IsDialoguePanelReady(DialogueManager manager) =>
+        CurrentDialoguePanel(manager)?.textingDone != false;
+
+    private static bool CanApplyDialogueNode(
+        DialogueManager manager, int bundleKey, int nodeIndex) =>
+        manager?.IsPlaying == true && bundleKey != 0 &&
+        ContentKey(manager.CurrentBundleID) == bundleKey &&
+        manager.m_CurrentDialogueIndex == nodeIndex;
+
+    private static bool CanApplyDialogueVoteScope(
+        DialogueManager manager, int bundleKey, int voteScope) =>
+        voteScope >= 0 && CanApplyDialogueNode(
+            manager, bundleKey, DialogueNodeFromScope(voteScope)) &&
+        DialogueVoteScope(manager) == voteScope;
+
+    private static bool IsCommittedDialogueScope(
+        int bundleKey, int voteScope, int committedBundleKey, int committedScope) =>
+        bundleKey != 0 && bundleKey == committedBundleKey && voteScope == committedScope;
+
+    private static bool IsDialogueScopePast(int liveScope, int receivedScope)
+    {
+        var liveNode = DialogueNodeFromScope(liveScope);
+        var receivedNode = DialogueNodeFromScope(receivedScope);
+        return liveNode > receivedNode || liveNode == receivedNode &&
+            DialogueMessageFromScope(liveScope) > DialogueMessageFromScope(receivedScope);
+    }
+
+    private static bool IsLiveDialogueScopePast(
+        DialogueManager manager, int bundleKey, int receivedScope)
+    {
+        var liveScope = DialogueVoteScope(manager);
+        return liveScope >= 0 && manager?.IsPlaying == true &&
+            ContentKey(manager.CurrentBundleID) == bundleKey &&
+            IsDialogueScopePast(liveScope, receivedScope);
+    }
+
+    private static ChoiceDialoguePanel FindActiveChoicePanel(DialogueManager manager)
+    {
+        if (manager?.imageChoiceDialoguePanel?.gameObject.activeInHierarchy == true)
+            return manager.imageChoiceDialoguePanel;
+        if (manager?.deliveryDialoguePanel?.gameObject.activeInHierarchy == true)
+            return manager.deliveryDialoguePanel;
+        if (manager?.requestMissionDialoguePanel?.gameObject.activeInHierarchy == true)
+            return manager.requestMissionDialoguePanel;
+        if (manager?.normalChoiceDialoguePanel?.gameObject.activeInHierarchy == true)
+            return manager.normalChoiceDialoguePanel;
+        return manager?.choiceDialoguePanel?.gameObject.activeInHierarchy == true
+            ? manager.choiceDialoguePanel
+            : null;
+    }
+
+    private void SetDialogueVoteScope(int bundleKey, int voteScope)
+    {
+        if (_dialogueVoteBundleKey == bundleKey && _dialogueVoteScope == voteScope)
+            return;
+        ResetDialogueVotes();
+        _dialogueVoteBundleKey = bundleKey;
+        _dialogueVoteScope = voteScope;
+        _log?.LogInfo(
+            $"Dialogue vote scope: bundle={bundleKey:X8}; node={DialogueNodeFromScope(voteScope)}; " +
+            $"msg={DialogueMessageFromScope(voteScope)}; ready=0/2");
+    }
+
+    private void ResetDialogueVotes()
+    {
+        RestoreDialogueVoteLabels();
+        _dialogueVoteBundleKey = 0;
+        _dialogueVoteScope = -1;
+        _hostDialogueVote = 0;
+        _clientDialogueVote = 0;
+    }
+
+    private void ResetDialogueCommit()
+    {
+        _committedDialogueBundleKey = 0;
+        _committedDialogueScope = -1;
+    }
+
+    private int DialogueVoteCount(int vote) =>
+        (_hostDialogueVote == vote ? 1 : 0) + (_clientDialogueVote == vote ? 1 : 0);
+
+    internal void UpdateDialogueVoteLabels()
+    {
+        var manager = DialogueManager.Instance;
+        if (manager?.IsPlaying != true || IsLocalDialogueBundle(manager.CurrentBundleID))
+        {
+            RestoreDialogueVoteLabels();
+            return;
+        }
+        var bundleKey = ContentKey(manager.CurrentBundleID);
+        var voteScope = DialogueVoteScope(manager);
+        if (bundleKey != 0 && voteScope >= 0 &&
+            !IsCommittedDialogueScope(
+                bundleKey, voteScope,
+                _committedDialogueBundleKey, _committedDialogueScope))
+            SetDialogueVoteScope(bundleKey, voteScope);
+        var panel = CurrentDialoguePanel(manager);
+        if (panel != null && manager.m_UseButton && panel.text != null)
+        {
+            var vote = IsFinalDialogueNode(manager)
+                ? DialogueVoteFinish
+                : DialogueVoteContinue;
+            var ready = Math.Max(DialogueVoteCount(vote), DialogueVoteCount(DialogueVoteSkip));
+            var label = GetDialogueVoteLabel(panel);
+            if (label != null)
+            {
+                label.text = $"{Math.Clamp(ready, 0, 2)}/2";
+                label.gameObject.SetActive(panel.textingDone);
+            }
+        }
+        else if (_dialogueVoteLabel != null)
+            _dialogueVoteLabel.gameObject.SetActive(false);
+        if (manager.CanChoiceButtonAciton)
+        {
+            UpdateChoiceVoteLabels(manager.imageChoiceDialoguePanel);
+            UpdateChoiceVoteLabels(manager.deliveryDialoguePanel);
+            UpdateChoiceVoteLabels(manager.requestMissionDialoguePanel);
+            UpdateChoiceVoteLabels(manager.normalChoiceDialoguePanel);
+            UpdateChoiceVoteLabels(manager.choiceDialoguePanel);
+        }
+    }
+
+    private void UpdateChoiceVoteLabels(ChoiceDialoguePanel panel)
+    {
+        if (panel?.gameObject.activeInHierarchy != true || panel.chocieButtonPanel == null)
+            return;
+        for (var index = 0; index < panel.chocieButtonPanel.Count; index++)
+        {
+            var button = panel.chocieButtonPanel[index];
+            var text = button?.focusText?.text;
+            if (text != null && button.gameObject.activeInHierarchy)
+                text.text = FormatDialogueVoteText(
+                    text.text, DialogueVoteCount(DialogueVoteChoiceBase + index));
+        }
+    }
+
+    private static string FormatDialogueVoteText(string text, int ready)
+    {
+        ready = Math.Clamp(ready, 0, 2);
+        if (HasDialogueVoteSuffix(text) && text[^3] == '0' + ready)
+            return text;
+        var clean = StripDialogueVoteText(text);
+        return $"{clean}  {ready}/2";
+    }
+
+    private static string StripDialogueVoteText(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text ?? string.Empty;
+        return HasDialogueVoteSuffix(text) ? text[..^5] : text;
+    }
+
+    private static bool HasDialogueVoteSuffix(string text) =>
+        text?.Length >= 5 && text[^5] == ' ' && text[^4] == ' ' &&
+        text[^3] is >= '0' and <= '2' && text[^2] == '/' && text[^1] == '2';
+
+    private void RestoreDialogueVoteLabels()
+    {
+        if (_dialogueVoteLabel != null)
+            _dialogueVoteLabel.gameObject.SetActive(false);
+        var manager = DialogueManager.Instance;
+        RestoreChoiceVoteLabels(manager?.imageChoiceDialoguePanel);
+        RestoreChoiceVoteLabels(manager?.deliveryDialoguePanel);
+        RestoreChoiceVoteLabels(manager?.requestMissionDialoguePanel);
+        RestoreChoiceVoteLabels(manager?.normalChoiceDialoguePanel);
+        RestoreChoiceVoteLabels(manager?.choiceDialoguePanel);
+    }
+
+    private TextMeshProUGUI GetDialogueVoteLabel(DialoguePanel panel)
+    {
+        var parent = panel?.passIcon?.transform;
+        if (parent == null)
+            return null;
+        if (_dialogueVoteLabelParent == parent)
+            return _dialogueVoteLabel;
+        if (_dialogueVoteLabel != null)
+            UnityEngine.Object.Destroy(_dialogueVoteLabel.gameObject);
+        _dialogueVoteLabel = null;
+        _dialogueVoteLabelParent = parent;
+
+        var source = panel.text?.textTMProUGUI;
+        if (source == null)
+            return null;
+        GameObject gameObject = null;
+        try
+        {
+            gameObject = new GameObject("DTMP Dialogue Vote");
+            gameObject.transform.SetParent(parent, false);
+            var label = gameObject.AddComponent<TextMeshProUGUI>();
+            label.font = source.font;
+            label.fontSharedMaterial = source.fontSharedMaterial;
+            label.fontSize = Mathf.Max(18f, source.fontSize * 0.7f);
+            label.fontStyle = FontStyles.Bold;
+            label.color = source.color;
+            label.alignment = TextAlignmentOptions.MidlineLeft;
+            label.raycastTarget = false;
+            label.enableWordWrapping = false;
+            var rect = label.rectTransform;
+            rect.anchorMin = new Vector2(1f, 0.5f);
+            rect.anchorMax = new Vector2(1f, 0.5f);
+            rect.pivot = new Vector2(0f, 0.5f);
+            rect.anchoredPosition = new Vector2(16f, 2f);
+            rect.sizeDelta = new Vector2(96f, 48f);
+            _dialogueVoteLabel = label;
+            _log?.LogInfo("Dialogue vote label attached to native pass icon");
+            return label;
+        }
+        catch (Exception exception)
+        {
+            if (gameObject != null)
+                UnityEngine.Object.Destroy(gameObject);
+            _log?.LogWarning($"Dialogue vote label unavailable: {exception.Message}");
+            return null;
+        }
+    }
+
+    private static void RestoreChoiceVoteLabels(ChoiceDialoguePanel panel)
+    {
+        if (panel?.chocieButtonPanel == null)
+            return;
+        for (var index = 0; index < panel.chocieButtonPanel.Count; index++)
+        {
+            var text = panel.chocieButtonPanel[index]?.focusText?.text;
+            if (text != null)
+                text.text = StripDialogueVoteText(text.text);
+        }
+    }
 
     private bool ValidateDialogueIntent(ManagerEvent state)
     {
@@ -3371,6 +4526,8 @@ internal sealed class ManagerEventReplicator
             if (_hostDialogueIndex >= 0)
                 Publish(session, ManagerDomain.Dialogue, ManagerAction.DialogueNode,
                     _hostDialogueBundleKey, _hostDialogueIndex);
+            if (_dialogueVoteBundleKey == _hostDialogueBundleKey && _dialogueVoteScope >= 0)
+                PublishDialogueVotes(session);
         }
         if (_hostPhoneTid != 0)
             Publish(session, ManagerDomain.Dialogue, ManagerAction.PhoneCall, _hostPhoneTid, 0);
@@ -3484,6 +4641,9 @@ internal sealed class ManagerEventReplicator
     private static int ContentKey(string value) => string.IsNullOrEmpty(value)
         ? 0
         : unchecked((int)Protocol.SceneId(value));
+
+    private static bool IsLocalDialogueBundle(string bundleId) =>
+        bundleId?.StartsWith("LobbyTalk", StringComparison.Ordinal) == true;
 
     internal static int ScenarioPreviousKey(bool wasPlaying, Func<string> readSequenceId)
     {
@@ -3717,6 +4877,73 @@ internal sealed class ManagerEventReplicator
         }
     }
 
+    private static bool ShouldTraceManagerEvent(ManagerEvent state) => state.Domain != 0;
+
+    private void TraceManagerEvent(
+        string stage,
+        ManagerEvent state,
+        ManagerDomain lane,
+        uint appliedRevision,
+        int queued)
+    {
+        if (_log == null || !ShouldTraceManagerEvent(state))
+            return;
+        _log.LogInfo(
+            $"Manager trace: stage={stage}; lane={lane}; " +
+            $"event={(ManagerDomain)state.Domain}/{(ManagerAction)state.Action}; " +
+            $"revision={state.Revision}; applied={appliedRevision}; next={NextRevision(appliedRevision)}; " +
+            $"queued={queued}; value={state.Value}; context={state.Context}; " +
+            $"scene={state.SceneId}/{state.SceneEpoch}; hostTick={state.HostTick}; " +
+            $"invocation={state.Invocation?.Kind.ToString() ?? "none"}");
+    }
+
+    private string PendingLaneSummary()
+    {
+        if (_pendingHostEvents.Count == 0)
+            return "empty";
+        var lanes = new List<string>(_pendingHostEvents.Count);
+        foreach (var pair in _pendingHostEvents)
+        {
+            uint first = 0;
+            uint last = 0;
+            foreach (var revision in pair.Value.Keys)
+            {
+                if (first == 0)
+                    first = revision;
+                last = revision;
+            }
+            lanes.Add($"{pair.Key}:{pair.Value.Count}[{first}..{last}]");
+        }
+        return string.Join(",", lanes);
+    }
+
+    private string DescribeApplyState(ManagerEvent state)
+    {
+        try
+        {
+            var dialogue = DialogueManager.Instance;
+            var scenario = ScenarioManager.Instance;
+            var tutorial = TutorialManager.Instance;
+            return
+                $"dialoguePlaying={dialogue?.IsPlaying == true}; " +
+                $"dialogueBundle={ContentKey(dialogue?.CurrentBundleID):X8}; " +
+                $"dialogueNode={dialogue?.m_CurrentDialogueIndex ?? -1}; " +
+                $"dialogueScope={DialogueVoteScope(dialogue)}; " +
+                $"dialogueChoice={dialogue?.CanChoiceButtonAciton == true}; " +
+                $"scenarioPlaying={scenario?.IsPlaying == true}; " +
+                $"scenarioKey={ScenarioPreviousKey(
+                    scenario?.IsPlaying == true, () => scenario.CurrentSequenceID):X8}; " +
+                $"tutorial={tutorial?.CurrentStep.ToString() ?? "none"}; " +
+                $"tutorialBundle={ContentKey(tutorial?.GetHandler()?.startDialogueID):X8}; " +
+                $"pendingDialogue={_pendingClientDialogueStart?.BundleKey ?? 0:X8}; " +
+                $"unityScale={Time.timeScale}; eventValue={state.Value}; eventContext={state.Context}";
+        }
+        catch (Exception exception)
+        {
+            return $"state-read-failed:{exception.Message}";
+        }
+    }
+
     private static bool IsGlobal(ManagerDomain domain) =>
         domain is ManagerDomain.Story or ManagerDomain.Day or
             ManagerDomain.Dialogue or ManagerDomain.Scenario or ManagerDomain.Progression or
@@ -3770,6 +4997,27 @@ internal static class ManagerEventPatchHelper
     internal static void End(bool suppressNested) =>
         ProbeBehaviour.Instance?.EndManagerEvent(suppressNested);
 
+    internal static bool BeginChoice(int choiceIndex, out bool suppressNested)
+    {
+        var behaviour = ProbeBehaviour.Instance;
+        var dialogue = DialogueManager.Instance;
+        if (behaviour != null && dialogue != null && choiceIndex >= 0)
+        {
+            var bundleKey = string.IsNullOrEmpty(dialogue.CurrentBundleID)
+                ? 0
+                : unchecked((int)Protocol.SceneId(dialogue.CurrentBundleID));
+            var context = (Math.Clamp(
+                    ManagerEventReplicator.DialogueVoteScope(dialogue),
+                    0, ushort.MaxValue) & 0xffff) |
+                (Math.Clamp(choiceIndex, 0, ushort.MaxValue) << 16);
+            return behaviour.BeginManagerEvent(
+                ManagerDomain.Dialogue, ManagerAction.DialogueChoice,
+                bundleKey, context, out suppressNested);
+        }
+        suppressNested = false;
+        return true;
+    }
+
     internal static int TableContext(SushiBarTable table)
     {
         if (table == null)
@@ -3780,6 +5028,13 @@ internal static class ManagerEventPatchHelper
                 return place << 16 | table.tableNumber & 0xffff;
         return table.tableNumber & 0xffff;
     }
+}
+
+[HarmonyPatch(typeof(TutorialManager), nameof(TutorialManager.ActivateTutorial))]
+internal static class PassiveClientTutorialActivationPatch
+{
+    private static bool Prefix() =>
+        ProbeBehaviour.Instance?.AllowNativeTutorialActivation() ?? true;
 }
 
 [HarmonyPatch(typeof(SushiBarManager), nameof(SushiBarManager.OnEventSushiBarOpened))]
@@ -3832,6 +5087,13 @@ internal static class DialogueContinueSyncPatch
         ManagerEventPatchHelper.Intercept(ManagerDomain.Dialogue, ManagerAction.Continue);
 }
 
+[HarmonyPatch(typeof(DialogueManager), "ContinueDialogue")]
+internal static class DialogueNativeContinueSyncPatch
+{
+    private static bool Prefix() =>
+        ManagerEventPatchHelper.Intercept(ManagerDomain.Dialogue, ManagerAction.Continue);
+}
+
 [HarmonyPatch(typeof(DialogueManager), nameof(DialogueManager.OnSkip))]
 internal static class DialogueSkipSyncPatch
 {
@@ -3859,16 +5121,9 @@ internal static class DialoguePhoneAnswerAuthorityPatch
 [HarmonyPatch(typeof(DialogueManager), nameof(DialogueManager.ExcuteFirstDialogue))]
 internal static class DialogueFirstChoiceSyncPatch
 {
-    private static bool Prefix(out bool __state)
-    {
-        if (!(ProbeBehaviour.Instance?.AllowDialogueChoice() ?? true))
-        {
-            __state = false;
-            return false;
-        }
-        return ManagerEventPatchHelper.Begin(
+    private static bool Prefix(out bool __state) =>
+        ManagerEventPatchHelper.Begin(
             ManagerDomain.Dialogue, ManagerAction.FirstChoice, out __state);
-    }
 
     private static Exception Finalizer(Exception __exception, bool __state)
     {
@@ -3880,16 +5135,23 @@ internal static class DialogueFirstChoiceSyncPatch
 [HarmonyPatch(typeof(DialogueManager), nameof(DialogueManager.ExcuteSecondDialogue))]
 internal static class DialogueSecondChoiceSyncPatch
 {
-    private static bool Prefix(out bool __state)
-    {
-        if (!(ProbeBehaviour.Instance?.AllowDialogueChoice() ?? true))
-        {
-            __state = false;
-            return false;
-        }
-        return ManagerEventPatchHelper.Begin(
+    private static bool Prefix(out bool __state) =>
+        ManagerEventPatchHelper.Begin(
             ManagerDomain.Dialogue, ManagerAction.SecondChoice, out __state);
+
+    private static Exception Finalizer(Exception __exception, bool __state)
+    {
+        ManagerEventPatchHelper.End(__state);
+        return __exception;
     }
+}
+
+[HarmonyPatch(typeof(ChoiceDialoguePanel), nameof(ChoiceDialoguePanel.ExcuteFocusDialogue))]
+internal static class DialogueFocusedChoiceSyncPatch
+{
+    private static bool Prefix(ChoiceDialoguePanel __instance, out bool __state) =>
+        ManagerEventPatchHelper.BeginChoice(
+            __instance?.m_CurButtonIndex ?? -1, out __state);
 
     private static Exception Finalizer(Exception __exception, bool __state)
     {

@@ -53,7 +53,7 @@ internal sealed class FishReplicator
     private const float CorpsePickupRangeSquared = 16f;
     private const int MaxQueuedActionsPerFish = 8;
     private const int ProcessedRequestWindow = 256;
-    private const double SnapshotTicksPerSecond = 10d;
+    private const double SnapshotTicksPerSecond = 20d;
     private const double InterpolationTicks = 3d;
     private const double MaxExtrapolationTicks = 1.5d;
     private const int MaxSamples = 8;
@@ -62,6 +62,9 @@ internal sealed class FishReplicator
     private const int InterestLeaveTicks = 10;
     private const int SnapshotEntityBudget = 24;
     private const int SnapshotByteBudget = 1100;
+    private const float NearSnapshotDistance = 40f;
+    private const float NearSnapshotInterval = 0.05f;
+    private const float MidSnapshotInterval = 0.2f;
     private const float RecentDamageSeconds = 2f;
     private const int MissingAllocatorScanGrace = 3;
     private const float LeaseCorrectionSeconds = 0.15f;
@@ -122,6 +125,7 @@ internal sealed class FishReplicator
     private sealed class Target
     {
         internal FishAISystem Fish;
+        internal SpriteRenderer Renderer;
         internal Vector3 Position;
         internal float Rotation;
         internal float Hp;
@@ -142,11 +146,14 @@ internal sealed class FishReplicator
         internal float CorrectionRotation;
         internal float CorrectionStarted;
         internal bool CorrectingLeasePresentation;
+        internal bool HasAppliedFlip;
+        internal bool AppliedFlip;
     }
 
     private sealed class HostFish
     {
         internal FishAISystem Fish;
+        internal SpriteRenderer Renderer;
         internal string AllocatorUid;
         internal int FishDataTID;
         internal FishSnapshot LastSnapshot;
@@ -478,7 +485,8 @@ internal sealed class FishReplicator
             !IsNewer(1, uint.MaxValue) || IsNewer(uint.MaxValue, 1) ||
             MathF.Abs(interpolation.X - 3f) > 0.001f ||
             MathF.Abs(Mathf.DeltaAngle(interpolation.Rotation, 0f)) > 0.001f ||
-            MathF.Abs(extrapolation.X - 11.5f) > 0.001f || teleport.X != 0f ||
+            MathF.Abs(extrapolation.X -
+                (10f + 10f * (float)(MaxExtrapolationTicks / SnapshotTicksPerSecond))) > 0.001f ||
             CanActivateManifest(assembly, 5) || AddManifestTestEntry(assembly, 2) != 2 ||
             !CanActivateManifest(assembly, 5) || CanActivateManifest(assembly, 12) ||
             !RemovalWins(20, 20) || !RemovalWins(21, 20) || RemovalWins(19, 20) ||
@@ -490,9 +498,9 @@ internal sealed class FishReplicator
             !ManifestRetryDue(10f, 10f) || ManifestRetryDue(9.99f, 10f) ||
             !SceneScopeChanged(7, 9, 7, 10) || SceneScopeChanged(7, 9, 7, 9) ||
             Math.Abs(snappedClock - 97d) > 0.001d ||
-             Math.Abs(fastClock - 96.1d) > 0.001d ||
-             Math.Abs(slowClock - 99.9d) > 0.001d ||
-             Math.Abs(steadyClock - 97.8d) > 0.001d ||
+             Math.Abs(fastClock - 97.2d) > 0.001d ||
+             Math.Abs(slowClock - 100.8d) > 0.001d ||
+             Math.Abs(steadyClock - 98.8d) > 0.001d ||
              Math.Abs(cappedClock - 101.5d) > 0.001d ||
              !retainedMissingFish || !despawnedMissingFish || resetMissingScans != 0 ||
              !liveMissingRetained || !liveMissingRemoved || !destroyedMissingRemoved)
@@ -1413,7 +1421,7 @@ internal sealed class FishReplicator
         {
             _nextRemoteStimulus = now + RemoteStimulusInterval;
             StimulateHostFishForRemotePlayer(
-                session, sceneId, now, remotePlayerTransform);
+                session, sceneId, now, hostPlayer?.transform, remotePlayerTransform);
         }
 
         while (session.TryTakeFishDamageRequest(out _))
@@ -1441,7 +1449,7 @@ internal sealed class FishReplicator
         if (now < _nextSend)
             return;
 
-        _nextSend = now + 0.1f;
+        _nextSend = now + NearSnapshotInterval;
         _fishTick = NextRevision(_fishTick);
         _snapshotBuffer.Clear();
         _snapshotCandidates.Clear();
@@ -1469,40 +1477,34 @@ internal sealed class FishReplicator
             info.LastHp = hp;
             var distance = hasRemotePlayer
                 ? Vector2.Distance(new Vector2(position.x, position.y), new Vector2(remotePlayer.X, remotePlayer.Y))
-                : 0f;
+                : float.PositiveInfinity;
             var forced = IsForcedRelevant(
                 fish, info, now, hostPlayer?.transform, remotePlayerTransform);
-            var interest = UpdateInterestForRemote(
-                info.Interested, info.OutsideInterestTicks, distance, forced,
-                hasRemotePlayer || !info.InterestKnown);
-            var interestChanged = !info.InterestKnown || interest.Interested != info.Interested;
+            var interestChanged = !info.InterestKnown || !info.Interested;
             info.InterestKnown = true;
-            info.Interested = interest.Interested;
-            info.OutsideInterestTicks = interest.OutsideTicks;
+            info.Interested = true;
+            info.OutsideInterestTicks = 0;
             if (interestChanged)
             {
                 info.Revision = NextRevision(info.Revision);
-                SendHostLifecycle(session, sceneId, pair.Key, info,
-                    info.Interested ? FishLifecycleKind.InterestEnter : FishLifecycleKind.InterestLeave);
-                if (info.Interested)
-                {
-                    info.HasSnapshot = false;
-                    _fishInterestEnters++;
-                }
-                else
-                    _fishInterestLeaves++;
+                SendHostLifecycle(session, sceneId, pair.Key, info, FishLifecycleKind.InterestEnter);
+                info.HasSnapshot = false;
+                _fishInterestEnters++;
             }
-            if (!info.Interested)
-                continue;
             var snapshot = new FishSnapshot(
                 sceneId, session.LocalSceneEpoch, _fishTick, pair.Key, info.Revision, fish.FishDataTID,
                 position.x, position.y, position.z, fish.Rotation,
-                velocity.x, velocity.y, hp, BuildFlags(fish, info.Phase));
+                velocity.x, velocity.y, hp, BuildFlags(fish, info.Phase, info.Renderer));
             if (phaseChanged || interestChanged)
             {
                 SendImmediateHostSnapshot(session, sceneId, pair.Key, info, snapshot);
                 continue;
             }
+            var snapshotInterval = hasRemotePlayer && distance <= NearSnapshotDistance
+                ? NearSnapshotInterval
+                : MidSnapshotInterval;
+            if (now < info.LastSnapshotSend + snapshotInterval)
+                continue;
             if (!ShouldSendSnapshot(info, snapshot, now))
                 continue;
             info.Priority = Math.Min(12f, info.Priority + 1f);
@@ -1512,7 +1514,7 @@ internal sealed class FishReplicator
             else
             {
                 var bonus = Math.Min(8f,
-                    Math.Max(0f, InterestLeaveDistance - distance) * 0.05f +
+                    Math.Max(0f, NearSnapshotDistance - distance) * 0.05f +
                     (forced ? 4f : 0f));
                 InsertSnapshotCandidate(_snapshotCandidates,
                     new SnapshotCandidate(snapshot, info, info.Priority + bonus));
@@ -1648,6 +1650,7 @@ internal sealed class FishReplicator
             else if (info.AllocatorUid != uid || info.FishDataTID != fishDataTID)
                 topologyChanged = true;
             info.Fish = fish;
+            info.Renderer ??= fish.GetComponentInChildren<SpriteRenderer>(true);
             info.AllocatorUid = uid;
             info.FishDataTID = fishDataTID;
             info.MissingScans = 0;
@@ -1683,6 +1686,7 @@ internal sealed class FishReplicator
         UdpSession session,
         uint sceneId,
         float now,
+        Transform hostPlayerTransform,
         Transform remotePlayerTransform)
     {
         if (remotePlayerTransform == null ||
@@ -1721,7 +1725,7 @@ internal sealed class FishReplicator
 
                 var current = fish.DetectedEnemyData;
                 var currentTarget = current?.DetectedEnemy;
-                if (currentTarget != null && currentTarget != remotePlayerTransform)
+                if (currentTarget == hostPlayerTransform)
                 {
                     var currentDistance = Vector2.Distance(
                         fish.SensorCenterPoint, currentTarget.position);
@@ -1923,7 +1927,7 @@ internal sealed class FishReplicator
                 info.Revision, info.AllocatorUid, info.FishDataTID,
                 position.x, position.y, position.z, fish.Rotation,
                 Mathf.Max(0f, fish.HP),
-                BuildManifestFlags(BuildFlags(fish, info.Phase), info.Interested));
+                BuildManifestFlags(BuildFlags(fish, info.Phase, info.Renderer), info.Interested));
             if (!session.SendFishManifest(manifest))
                 break;
             info.ManifestQueued = true;
@@ -2426,7 +2430,8 @@ internal sealed class FishReplicator
         var snapshot = new FishSnapshot(
             sceneId, session.LocalSceneEpoch, _fishTick, id, info.Revision, info.FishDataTID,
             position.x, position.y, position.z, fish.Rotation,
-            velocity.x, velocity.y, Mathf.Max(0f, fish.HP), BuildFlags(fish, info.Phase));
+            velocity.x, velocity.y, Mathf.Max(0f, fish.HP),
+            BuildFlags(fish, info.Phase, info.Renderer));
         SendImmediateHostSnapshot(session, sceneId, id, info, snapshot);
     }
 
@@ -2877,7 +2882,6 @@ internal sealed class FishReplicator
         if (!CanActivateManifest(assembly, _latestClientManifestRevision))
             return;
 
-        RestoreSuppressedClientFish();
         _latestClientManifestRevision = assembly.Revision;
         _activeClientManifest.Clear();
         _pendingClientManifests.Clear();
@@ -2889,15 +2893,16 @@ internal sealed class FishReplicator
         foreach (var id in new List<int>(_targets.Keys))
             if (!_activeClientManifest.ContainsKey(id))
                 RemoveClientTarget(id, true);
-        var retried = RetryPendingClientManifests(Time.realtimeSinceStartup);
-        var suppressed = retried ? SuppressUnboundClientFish() : 0;
+        var suppressed = RetryPendingClientManifests(Time.realtimeSinceStartup)
+            ? SuppressUnboundClientFish()
+            : 0;
         foreach (var revision in new List<uint>(_clientManifestAssemblies.Keys))
             if (revision != assembly.Revision)
                 _clientManifestAssemblies.Remove(revision);
         _log.LogInfo(
             $"Network fish manifest applied: scene={assembly.SceneId:X8}; epoch={assembly.SceneEpoch}; " +
-            $"revision={assembly.Revision}; fish={assembly.Expected}; " +
-            $"bound={_targets.Count}; suppressed={suppressed}");
+            $"revision={assembly.Revision}; fish={assembly.Expected}; bound={_targets.Count}; " +
+            $"suppressed={suppressed}");
         _trace?.Write("MANIFEST-COMPLETE",
             $"scene={assembly.SceneId:X8} epoch={assembly.SceneEpoch} revision={assembly.Revision} " +
             $"expected={assembly.Expected} bound={_targets.Count} suppressed={suppressed}");
@@ -2966,6 +2971,7 @@ internal sealed class FishReplicator
         var target = new Target
         {
             Fish = fish,
+            Renderer = fish.GetComponentInChildren<SpriteRenderer>(true),
             AllocatorUid = manifest.AllocatorUid,
             FishDataTID = manifest.FishDataTID,
             Phase = PhaseFromFlags(manifest.Flags, manifest.Hp),
@@ -2985,10 +2991,9 @@ internal sealed class FishReplicator
             _applyingClientState = false;
         }
         SetClientSimulation(fish, false, manifest.Id);
-        if (ShouldHideClientTarget(target.Interested, fish.gameObject.activeInHierarchy))
-            fish.gameObject.SetActive(false);
         _targets[manifest.Id] = target;
         _clientIdsByFish[fish] = manifest.Id;
+        fish.gameObject.SetActive(target.Interested);
         _pendingClientManifests.Remove(manifest.Id);
         _missingAllocatorIds.Remove(manifest.Id);
         _log.LogDebug($"Network fish manifest bound: id={manifest.Id}; type={manifest.FishDataTID}");
@@ -3002,12 +3007,10 @@ internal sealed class FishReplicator
 
     private bool RetryPendingClientManifests(float now)
     {
-        if (!ManifestRetryDue(now, _nextClientBind))
+        if (_pendingClientManifests.Count == 0 || !ManifestRetryDue(now, _nextClientBind))
             return false;
         _nextClientBind = now + 0.1f;
         IndexAvailableClientFish(_appliedClientSceneId);
-        if (_pendingClientManifests.Count == 0)
-            return false;
         _manifestScratch.Clear();
         _manifestScratch.AddRange(_pendingClientManifests.Values);
         foreach (var manifest in _manifestScratch)
@@ -3342,6 +3345,13 @@ internal sealed class FishReplicator
             var enabled = (target.Flags & 4) != 0;
             if (target.Fish.IsFishEnable != enabled)
                 target.Fish.IsFishEnable = enabled;
+            var flipped = (target.Flags & 16) != 0;
+            if (!target.HasAppliedFlip || target.AppliedFlip != flipped)
+            {
+                ApplyFishFlip(target.Renderer, flipped);
+                target.HasAppliedFlip = true;
+                target.AppliedFlip = flipped;
+            }
         }
         finally
         {
@@ -3830,7 +3840,8 @@ internal sealed class FishReplicator
                 valid++;
         _trace?.Write("FISH-SUMMARY",
             $"bound={_targets.Count} active={valid} pendingBind={_pendingClientManifests.Count} " +
-            $"missing={_missingAllocatorIds.Count} suppressed={_suppressedClientFish.Count} " +
+            $"missing={_missingAllocatorIds.Count} " +
+            $"suppressed={_suppressedClientFish.Count} " +
             $"samples={_clientSnapshotsAccepted}/{_clientSnapshotsRejected} " +
             $"teleports={_clientTeleports} tombstones={_clientTombstones.Count} " +
             $"clock={_clientRenderTick:F1}/{_clientLatestTick:F1} " +
@@ -3839,18 +3850,17 @@ internal sealed class FishReplicator
 
     private int SuppressUnboundClientFish()
     {
-        var count = 0;
         var represented = new HashSet<string>();
         foreach (var manifest in _activeClientManifest.Values)
             if (!string.IsNullOrEmpty(manifest.AllocatorUid))
                 represented.Add(manifest.AllocatorUid);
+
+        var suppressed = 0;
         foreach (var allocator in UnityEngine.Object.FindObjectsByType<FishAllocator>(
                      FindObjectsInactive.Include, FindObjectsSortMode.None))
         {
-            if (allocator == null)
-                continue;
-            var uid = GetNetworkAllocatorUid(allocator);
-            if (!ShouldSuppressAllocator(uid, represented))
+            if (allocator == null ||
+                !ShouldSuppressAllocator(GetNetworkAllocatorUid(allocator), represented))
                 continue;
             var fishs = allocator.GetInstancedFishs;
             if (fishs == null)
@@ -3860,36 +3870,19 @@ internal sealed class FishReplicator
                 if (fish == null || !fish.gameObject.activeInHierarchy ||
                     _clientIdsByFish.ContainsKey(fish) || _suppressedClientFish.Contains(fish))
                     continue;
-                try
-                {
-                    fish.gameObject.SetActive(false);
-                    _suppressedClientFish.Add(fish);
-                    count++;
-                }
-                catch (Exception exception)
-                {
-                    _trace?.Write("SUPPRESS-ERROR",
-                        $"uid={uid} type={fish.FishDataTID} " +
-                        $"error={exception.GetType().Name}:{exception.Message}");
-                }
+                fish.gameObject.SetActive(false);
+                _suppressedClientFish.Add(fish);
+                suppressed++;
             }
         }
-        return count;
+        return suppressed;
     }
 
     private void RestoreSuppressedClientFish()
     {
         foreach (var fish in _suppressedClientFish)
-        {
-            try
-            {
-                if (fish != null)
-                    fish.gameObject.SetActive(true);
-            }
-            catch
-            {
-            }
-        }
+            if (fish != null)
+                fish.gameObject.SetActive(true);
         _suppressedClientFish.Clear();
     }
 
@@ -4018,6 +4011,7 @@ internal sealed class FishReplicator
         new()
         {
             Fish = fish,
+            Renderer = fish?.GetComponentInChildren<SpriteRenderer>(true),
             AllocatorUid = allocatorUid,
             FishDataTID = fishDataTID,
             Active = active,
@@ -4260,7 +4254,10 @@ internal sealed class FishReplicator
     private static bool AllocatorUidMatches(string expected, string actual) =>
         !string.IsNullOrEmpty(expected) && expected == actual;
 
-    private static byte BuildFlags(FishAISystem fish, FishPhase phase = FishPhase.None)
+    private static byte BuildFlags(
+        FishAISystem fish,
+        FishPhase phase = FishPhase.None,
+        SpriteRenderer renderer = null)
     {
         byte flags = 0;
         if (fish.IsCorpse)
@@ -4269,7 +4266,18 @@ internal sealed class FishReplicator
             flags |= 2;
         if (fish.IsFishEnable)
             flags |= 4;
+        if (FishFlipped(renderer ?? fish?.GetComponentInChildren<SpriteRenderer>(true)))
+            flags |= 16;
         return flags;
+    }
+
+    private static bool FishFlipped(SpriteRenderer renderer) =>
+        renderer != null && RemoteAvatar.CaptureVisibleTransform(renderer).FlipX;
+
+    private static void ApplyFishFlip(SpriteRenderer renderer, bool flipped)
+    {
+        if (renderer != null && RemoteAvatar.CaptureVisibleTransform(renderer).FlipX != flipped)
+            renderer.flipX = !renderer.flipX;
     }
 
     private static bool TryGetRemotePlayer(

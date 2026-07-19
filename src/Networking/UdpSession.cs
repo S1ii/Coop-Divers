@@ -58,6 +58,7 @@ internal sealed class UdpSession : IDisposable
     private const int MaxPendingBossStates = 256;
     private const int MaxPendingFishActionRequests = 256;
     private const int MaxPendingManagerEvents = 256;
+    private const int MaxPendingAdditiveSceneLoads = 64;
     private const int MaxPendingIngredientsSyncRequests = 256;
     private const int MaxPendingRoomReady = 256;
     private const int MaxPendingRoomStates = 256;
@@ -198,10 +199,13 @@ internal sealed class UdpSession : IDisposable
     private readonly ConcurrentQueue<PickupRemoved> _pickupRemovals = new();
     private readonly ConcurrentQueue<PickupRequest> _pickupRequests = new();
     private readonly ConcurrentQueue<PickupResult> _pickupResults = new();
+    private readonly ConcurrentQueue<AdditiveSceneLoad> _additiveSceneLoads = new();
     private SceneTransitionCommand _nextSceneTransition;
+    private SceneTransitionCommand _diveSceneTransition;
     private SceneSeed _nextSceneSeed;
     private DiveState _nextDiveState;
     private bool _hasNextSceneTransition;
+    private bool _hasDiveSceneTransition;
     private bool _hasNextSceneSeed;
     private bool _hasNextDiveState;
     private uint _nextWorldSceneId;
@@ -1426,6 +1430,24 @@ internal sealed class UdpSession : IDisposable
         if (!session.StageNextWorldSeed(16, currentSeed) ||
             !session.TryTakeSceneSeed(out deliveredSeed) || deliveredSeed != currentSeed)
             throw new InvalidOperationException("Next-world control reset self-test failed");
+        var barrier = new UdpSession(null);
+        if (!barrier.StageNextWorldTransition(1, transition))
+            throw new InvalidOperationException("Dive transition setup self-test failed");
+        barrier.ClearDiveSceneTransition();
+        if (barrier.TryTakeDiveSceneTransition(out _) ||
+            !barrier.StageNextWorldTransition(2, transition) ||
+            !barrier.TryStageNextWorld(
+                3, Protocol.SceneId("Empty"), currentSeed.SceneEpoch + 1, 0) ||
+            !barrier.TryTakeDiveSceneTransition(out deliveredTransition) ||
+            deliveredTransition != transition ||
+            barrier.TryTakeDiveSceneTransition(out _))
+            throw new InvalidOperationException("Dive transition barrier self-test failed");
+        var singleConsumer = new UdpSession(null);
+        if (!singleConsumer.StageNextWorldTransition(1, transition) ||
+            !singleConsumer.TryTakeDiveSceneTransition(out deliveredTransition) ||
+            deliveredTransition != transition ||
+            singleConsumer.TryTakeSceneTransition(out _))
+            throw new InvalidOperationException("Dive transition was delivered twice");
     }
 
     private static void TestHandshakeReject()
@@ -2174,6 +2196,26 @@ internal sealed class UdpSession : IDisposable
         return true;
     }
 
+    internal void ClearDiveSceneTransition()
+    {
+        _diveSceneTransition = default;
+        _hasDiveSceneTransition = false;
+    }
+
+    internal bool TryTakeDiveSceneTransition(out SceneTransitionCommand command)
+    {
+        command = _diveSceneTransition;
+        if (!_hasDiveSceneTransition)
+            return false;
+        _hasDiveSceneTransition = false;
+        if (_hasNextSceneTransition && _nextSceneTransition == command)
+        {
+            _nextSceneTransition = default;
+            _hasNextSceneTransition = false;
+        }
+        return true;
+    }
+
     internal void SendSceneSeed(SceneSeed seed)
     {
         if (_role == SessionRole.Host && MatchesLocalWorld(seed.SceneId, seed.SceneEpoch))
@@ -2189,12 +2231,25 @@ internal sealed class UdpSession : IDisposable
         return true;
     }
 
+    internal void SendAdditiveSceneLoad(AdditiveSceneLoad state)
+    {
+        if (_connected)
+            SendReliable(Protocol.EncodeAdditiveSceneLoad(++_sequence, state));
+    }
+
+    internal bool TryTakeAdditiveSceneLoad(out AdditiveSceneLoad state) =>
+        _additiveSceneLoads.TryDequeue(out state);
+
     private bool StageNextWorldTransition(uint sequence, SceneTransitionCommand command)
     {
+        if (command.SceneId == 0 || command.SceneEpoch == 0)
+            return false;
         if (!TryStageNextWorld(sequence, command.SceneId, command.SceneEpoch, command.Seed))
             return false;
         _nextSceneTransition = command;
         _hasNextSceneTransition = true;
+        _diveSceneTransition = command;
+        _hasDiveSceneTransition = true;
         return true;
     }
 
@@ -2914,6 +2969,20 @@ internal sealed class UdpSession : IDisposable
                 _lastReceive = now;
                 if (AcceptReliable(sequence))
                     StageNextWorldSeed(sequence, seed);
+            }
+            return;
+        }
+
+        if (type == PacketType.AdditiveSceneLoad)
+        {
+            if (_connected &&
+                Protocol.TryDecodeAdditiveSceneLoad(received.Buffer, out _, out var state))
+            {
+                _lastReceive = now;
+                if (AcceptReliable(sequence) &&
+                    HasDecodedQueueCapacity(
+                        _additiveSceneLoads.Count, MaxPendingAdditiveSceneLoads))
+                    _additiveSceneLoads.Enqueue(state);
             }
             return;
         }
@@ -3641,9 +3710,11 @@ internal sealed class UdpSession : IDisposable
         _nextWorldSeed = 0;
         _hasNextWorld = false;
         _nextSceneTransition = default;
+        _diveSceneTransition = default;
         _nextSceneSeed = default;
         _nextDiveState = default;
         _hasNextSceneTransition = false;
+        _hasDiveSceneTransition = false;
         _hasNextSceneSeed = false;
         _hasNextDiveState = false;
     }
@@ -3717,6 +3788,9 @@ internal sealed class UdpSession : IDisposable
         while (_pickupResults.TryDequeue(out _))
         {
         }
+        while (_additiveSceneLoads.TryDequeue(out _))
+        {
+        }
         _latestCargoState = default;
         _hasCargoState = false;
         while (_bossDamageRequests.TryDequeue(out _))
@@ -3736,6 +3810,9 @@ internal sealed class UdpSession : IDisposable
         {
         }
         while (_pickupResults.TryDequeue(out _))
+        {
+        }
+        while (_additiveSceneLoads.TryDequeue(out _))
         {
         }
         while (_bossDamageRequests.TryDequeue(out _))

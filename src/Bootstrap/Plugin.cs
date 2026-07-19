@@ -32,13 +32,7 @@ public sealed class Plugin : BasePlugin
         FishReplicator.SelfTest();
         DiveCoordinator.SelfTest();
         TravelCoordinator.SelfTest();
-        DiverRuntimeAuthority.SelfTest();
-        DiverVitalReplicator.SelfTest();
-        DiverEquipmentPolicy.SelfTest();
-        DiverWeaponAuthority.SelfTest();
-        DiverWeaponReplicator.SelfTest();
         SceneReplicator.SelfTest();
-        LoadedGameplaySceneTracker.SelfTest();
         FishSpawnSeedCoordinator.SelfTest();
         HostAuthorityPolicy.SelfTest();
         MissionProgressReplicator.SelfTest();

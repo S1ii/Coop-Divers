@@ -31,8 +31,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private float _nextPositionLog;
     private float _nextSnapshot;
     private float _nextVisual;
-    private float _nextRuntimeState;
-    private uint _runtimeRevision;
     private uint _sceneId;
     private ResolvedSceneMetadata _sceneMetadata;
     private float _nextSceneMetadataRefresh;
@@ -60,14 +58,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
     private DiveCoordinator _diveCoordinator;
     private TravelCoordinator _travelCoordinator;
     private ProjectileVisualReplicator _projectileVisualReplicator;
-    private DiverVitalReplicator _diverVitalReplicator;
-    private DiverWeaponReplicator _diverWeaponReplicator;
     private RemoteCatchLedger _remoteCatchLedger;
     private SessionTrace _sessionTrace;
-    private readonly LoadedGameplaySceneTracker _loadedGameplayScenes = new();
     private UnityAction<Scene, LoadSceneMode> _sceneLoadedHandler;
-    private UnityAction<Scene> _sceneUnloadedHandler;
-    private bool _unsafeWorldReplicationBlocked;
     private readonly RemoteAvatar _remoteAvatar = new();
     private bool _showLobby;
     private bool _cursorWasVisible;
@@ -142,18 +135,12 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _diveCoordinator = new DiveCoordinator(Logger);
         _travelCoordinator = new TravelCoordinator(Logger);
         _projectileVisualReplicator = new ProjectileVisualReplicator();
-        _diverVitalReplicator = new DiverVitalReplicator();
-        _diverWeaponReplicator = new DiverWeaponReplicator();
         _lobbyAddress = Address;
         _lobbyPort = Port.ToString();
         _lobbyName = ConfiguredName;
         _sceneLoadedHandler = DelegateSupport.ConvertDelegate<UnityAction<Scene, LoadSceneMode>>(
             (Action<Scene, LoadSceneMode>)OnUnitySceneLoaded);
-        _sceneUnloadedHandler = DelegateSupport.ConvertDelegate<UnityAction<Scene>>(
-            (Action<Scene>)OnUnitySceneUnloaded);
         SceneManager.sceneLoaded += _sceneLoadedHandler;
-        SceneManager.sceneUnloaded += _sceneUnloadedHandler;
-        _loadedGameplayScenes.Reset();
         if (!SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _lobbyError))
             SwitchSession(SessionRole.Offline, Address, Port, ConfiguredName, false, out _);
     }
@@ -190,7 +177,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (scene != _scene || activeScene.handle != _sceneHandle)
         {
             var wasDiveScene = _sceneMetadata.CanDive;
-            _managerEventReplicator?.OnSceneChanged();
+            _managerEventReplicator?.OnSceneChanged(Role);
             _npcInteractionCoordinator?.Clear(Role, _session);
             if (_showLobby)
                 SetLobbyVisible(false, false);
@@ -212,8 +199,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _sushiRenderer = null;
             _unsupportedControllerName = string.Empty;
             _remoteAvatar.Clear();
-            _nextRuntimeState = 0f;
-            _runtimeRevision = 0;
             _fishReplicator?.Clear();
             _pickupReplicator?.Clear();
             _bossReplicator?.Clear();
@@ -221,8 +206,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _diveCoordinator?.Reset();
             _travelCoordinator?.Reset();
             _projectileVisualReplicator?.Clear();
-            _diverVitalReplicator?.Clear();
-            _diverWeaponReplicator?.Clear();
             HarpoonRuntimeProbe.Clear();
             _session?.SetLocalScene(_sceneId);
             BeginRecovery("scene changed");
@@ -281,46 +264,35 @@ public sealed class ProbeBehaviour : MonoBehaviour
             ReturnToOnlineRoom(peerLoss);
             return;
         }
-        UpdateUnsafeWorldReplicationGate();
         TitleOnlineMenu.Tick(this);
         _remoteCatchLedger?.Update(
             Role, _session, _scene, _sceneMetadata.SceneType == SceneType.lobby,
             Time.realtimeSinceStartup);
         _managerEventReplicator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
+        _managerEventReplicator?.UpdateDialogueVoteLabels();
         _npcInteractionCoordinator?.Update(Role, _session, _sceneId, Time.realtimeSinceStartup);
         _missionProgressReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
-        if (!UnsafeWorldReplicationBlocked)
-            _worldStateReplicator?.Update(
-                Role, _session, _session?.SceneMatches(_sceneId) == true,
-                Time.realtimeSinceStartup);
+        _worldStateReplicator?.Update(
+            Role, _session, _session?.SceneMatches(_sceneId) == true,
+            Time.realtimeSinceStartup);
         _ingredientsReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
         _boatDecoReplicator?.Update(Role, _session, Time.realtimeSinceStartup);
-        _sceneReplicator?.Update(Role, _session);
         _diveCoordinator?.Update(
             Role, _session, Time.realtimeSinceStartup, _player, _remoteAvatar.TargetTransform);
+        if (!(_diveCoordinator?.WaitingForHostDiveTransition ?? false))
+            _sceneReplicator?.Update(Role, _session);
         _travelCoordinator?.Update(
             Role, _session,
             _diveCoordinator?.HostDead ?? false,
             _diveCoordinator?.ClientDead ?? false);
-        _diverWeaponReplicator?.Update(
-            Role, _session, _sceneId, _player, _remoteAvatar,
-            Role == SessionRole.Host && (_diveCoordinator?.ClientDead ?? false));
-        if (Role == SessionRole.Client)
-            _diverVitalReplicator?.ApplyClientResults(_session, _sceneId, _player);
         _projectileVisualReplicator?.Update(_session, _sceneId, Time.realtimeSinceStartup);
-        if (!UnsafeWorldReplicationBlocked)
-        {
-            _fishReplicator?.Update(
-                Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
-                _player, _remoteAvatar.TargetTransform);
-        }
-        if (!UnsafeWorldReplicationBlocked)
-        {
-            _bossReplicator?.Update(
-                Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
-            _pickupReplicator?.Update(
-                Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
-        }
+        _fishReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime,
+            _player, _remoteAvatar.TargetTransform);
+        _bossReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, Time.unscaledDeltaTime);
+        _pickupReplicator?.Update(
+            Role, _session, _sceneId, Time.realtimeSinceStartup, _player);
         if (ManagerEventReplicator.ShouldForceSceneEntryKeyframe(
                 Role,
                 _session?.SceneMatches(_sceneId) == true,
@@ -338,8 +310,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
         {
             var renderer = _playerRenderer ?? _lobbyRenderer ?? _sushiRenderer;
             if (renderer != null && _session.SceneMatches(_sceneId) && snapshot.SceneId == _sceneId)
-                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene(),
-                    HandleRemoteDiverDamage, Role == SessionRole.Host && IsDiveScene());
+                _remoteAvatar.Apply(snapshot, renderer, _session.RemoteName, IsDiveScene());
             else
                 _remoteAvatar.Clear();
         }
@@ -349,17 +320,11 @@ public sealed class ProbeBehaviour : MonoBehaviour
                 visualState.SceneEpoch == _session.RemoteSceneEpoch)
                 _remoteAvatar.ApplyVisual(visualState, _session.RemoteName);
         }
-        while (_session != null && _session.TryTakeDiverRuntimeState(out var runtimeState))
-            if (Role == SessionRole.Host && runtimeState.Owner == DiverOwner.Client)
-            {
-                _diverVitalReplicator?.ObserveHostRuntime(_session, runtimeState, _remoteAvatar);
-                _remoteAvatar.ArmProxy();
-            }
-            else if (Role == SessionRole.Client && runtimeState.Owner == DiverOwner.Host)
-                _remoteAvatar.ApplyRuntime(runtimeState);
-        if (Role == SessionRole.Host)
-            _diverVitalReplicator?.ApplyHostIntents(_session, _remoteAvatar);
+        while (_session != null && _session.TryTakeDiverRuntimeState(out _))
+        {
+        }
         _remoteAvatar.Update(Time.unscaledDeltaTime);
+        _sceneReplicator?.UpdateAdditiveScenes(_session, IsDiveScene());
 
         if (_session != null && _session.SceneMatches(_sceneId) &&
             (_player != null || _lobbyPlayer != null || _sushiPlayer != null) &&
@@ -412,18 +377,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
             _session.SendPlayerVisualState(RemoteAvatar.CaptureVisualState(
                 _sceneId, _session.LocalSceneEpoch, visualPlayer));
             _nextVisual = Time.realtimeSinceStartup + 0.1f;
-        }
-
-        if (Role is SessionRole.Host or SessionRole.Client && _session != null && _player != null &&
-            _session.SceneMatches(_sceneId) && Time.realtimeSinceStartup >= _nextRuntimeState)
-        {
-            _runtimeRevision = _runtimeRevision == uint.MaxValue ? 1 : _runtimeRevision + 1;
-            if (RemoteAvatar.TryCaptureRuntimeState(
-                    _sceneId, _session.LocalSceneEpoch, _runtimeRevision,
-                    Role == SessionRole.Host ? DiverOwner.Host : DiverOwner.Client, _player,
-                    out var runtimeState))
-                _session.SendDiverRuntimeState(runtimeState);
-            _nextRuntimeState = Time.realtimeSinceStartup + 0.2f;
         }
 
         if (Time.realtimeSinceStartup < _nextScan)
@@ -531,8 +484,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
     {
         if (_sceneLoadedHandler != null)
             SceneManager.sceneLoaded -= _sceneLoadedHandler;
-        if (_sceneUnloadedHandler != null)
-            SceneManager.sceneUnloaded -= _sceneUnloadedHandler;
         if (_showLobby)
             SetLobbyVisible(false);
         else
@@ -549,8 +500,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
-        _diverVitalReplicator?.Clear();
-        _diverWeaponReplicator?.Clear();
         FishSpawnSeedCoordinator.Clear();
         _remoteCatchLedger?.Clear("plugin stopped");
         _remoteAvatar.Dispose();
@@ -558,10 +507,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
         if (Instance == this)
             Instance = null;
     }
-
-    private bool UnsafeWorldReplicationBlocked =>
-        !_loadedGameplayScenes.AllowsWorldScopedReplication(
-            Role, _session?.Connected == true);
 
     [HideFromIl2Cpp]
     private void WriteSessionDesyncDump(UdpSession session)
@@ -661,114 +606,15 @@ public sealed class ProbeBehaviour : MonoBehaviour
             scene.name != "Empty")
         {
             var sceneId = Protocol.SceneId(scene.name);
-            FishSpawnSeedCoordinator.StageLocalScene(
-                FishSpawnSeedCoordinator.GetOrCreate(sceneId, _session.NextLocalSceneEpoch));
+            var epoch = mode == LoadSceneMode.Additive
+                ? _session.LocalSceneEpoch
+                : _session.NextLocalSceneEpoch;
+            var seed = FishSpawnSeedCoordinator.GetOrCreate(sceneId, epoch);
+            FishSpawnSeedCoordinator.StageLocalScene(seed);
+            _session.SendSceneSeed(seed);
         }
-        _loadedGameplayScenes.OnSceneLoaded(scene, mode);
-        UpdateUnsafeWorldReplicationGate();
-    }
-
-    private void OnUnitySceneUnloaded(Scene scene)
-    {
-        _loadedGameplayScenes.OnSceneUnloaded(scene);
-        UpdateUnsafeWorldReplicationGate();
-    }
-
-    private void UpdateUnsafeWorldReplicationGate()
-    {
-        _loadedGameplayScenes.Refresh();
-        var blocked = UnsafeWorldReplicationBlocked;
-        if (blocked == _unsafeWorldReplicationBlocked)
-        {
-            if (blocked)
-                DrainBlockedWorldPackets();
-            return;
-        }
-
-        _unsafeWorldReplicationBlocked = blocked;
-        if (!blocked)
-        {
-            _fishReplicator?.Clear();
-            _pickupReplicator?.Clear();
-            _bossReplicator?.Clear();
-            _worldStateReplicator?.Clear();
-            Logger?.LogInfo("Network world replication restored: one gameplay scene loaded");
-            return;
-        }
-
-        _fishReplicator?.Clear();
-        _pickupReplicator?.Clear();
-        _bossReplicator?.Clear();
-        Logger?.LogWarning(
-            $"Network world replication disabled: {_loadedGameplayScenes.GameplaySceneCount} " +
-            "gameplay scenes are loaded; leave the additive route to resume replication");
-        DrainBlockedWorldPackets();
-    }
-
-    private void DrainBlockedWorldPackets()
-    {
-        if (_session == null)
-            return;
-        while (_session.TryTakePickupRequest(out _))
-        {
-        }
-        while (_session.TryTakePickupResult(out _))
-        {
-        }
-        while (_session.TryTakePickupRemoved(out _))
-        {
-        }
-        while (_session.TryTakeBossDamageRequest(out _))
-        {
-        }
-        while (_session.TryTakeBossState(out _))
-        {
-        }
-        while (_session.TryTakeWorldFlagRequest(out _))
-        {
-        }
-        while (_session.TryTakeWorldFlagState(out _))
-        {
-        }
-        while (_session.TryTakeFishSnapshot(out _))
-        {
-        }
-        while (_session.TryTakeFishRemoved(out _))
-        {
-        }
-        while (_session.TryTakeFishPickupResult(out _))
-        {
-        }
-        while (_session.TryTakeFishManifest(out _))
-        {
-        }
-        while (_session.TryTakeFishManifestState(out _))
-        {
-        }
-        while (_session.TryTakeFishLifecycle(out _))
-        {
-        }
-        while (_session.TryTakeFishActionRequest(out _))
-        {
-        }
-        while (_session.TryTakeFishActionAck(out _))
-        {
-        }
-        while (_session.TryTakeFishLootGrant(out _))
-        {
-        }
-        while (_session.TryTakeFishLootComplete(out _))
-        {
-        }
-        while (_session.TryTakeFishDamageRequest(out _))
-        {
-        }
-        while (_session.TryTakeFishPickupRequest(out _))
-        {
-        }
-        while (_session.TryTakeFishHookPose(out _))
-        {
-        }
+        if (Role == SessionRole.Host && mode == LoadSceneMode.Additive)
+            _sceneReplicator?.ObserveAdditiveScene(_session, scene.name);
     }
 
     private void DrawLobbyPanel()
@@ -1001,8 +847,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
         _ingredientsReplicator?.Clear();
         _boatDecoReplicator?.Clear();
         _projectileVisualReplicator?.Clear();
-        _diverVitalReplicator?.Clear();
-        _diverWeaponReplicator?.Clear();
         FishSpawnSeedCoordinator.Clear();
     }
 
@@ -1071,8 +915,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void OnPickupDestroyed(PickupInstanceItem item)
     {
-        if (!UnsafeWorldReplicationBlocked &&
-            Role is SessionRole.Host or SessionRole.Client)
+        if (Role is SessionRole.Host or SessionRole.Client)
             _pickupReplicator?.OnDestroyed(Role, _session, _sceneId, item);
     }
 
@@ -1184,16 +1027,13 @@ public sealed class ProbeBehaviour : MonoBehaviour
         (_managerEventReplicator?.Intercept(Role, _session, domain, action, value, context) ?? true);
 
     internal bool InterceptTimeScale(TimeScaleController.Type type, float scale) =>
-        AllowRecoveryMutation("time") &&
-        (_managerEventReplicator?.InterceptTimeScale(Role, _session, type, scale) ?? true);
+        _managerEventReplicator?.InterceptTimeScale(Role, _session, type, scale) ?? true;
 
     internal bool InterceptTimeStop(bool isGamePause) =>
-        isGamePause || AllowRecoveryMutation("time") &&
-        (_managerEventReplicator?.InterceptTimeStop(Role, _session, isGamePause) ?? true);
+        _managerEventReplicator?.InterceptTimeStop(Role, _session, isGamePause) ?? true;
 
     internal bool InterceptTimeReset() =>
-        AllowRecoveryMutation("time") &&
-        (_managerEventReplicator?.InterceptTimeReset(Role, _session) ?? true);
+        _managerEventReplicator?.InterceptTimeReset(Role, _session) ?? true;
 
     internal bool BeginManagerEvent(
         ManagerDomain domain,
@@ -1216,6 +1056,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void EndManagerEvent(bool suppressNested) =>
         _managerEventReplicator?.EndIntercept(suppressNested);
+
+    internal bool AllowNativeTutorialActivation() =>
+        _managerEventReplicator?.AllowNativeTutorialActivation(Role, _session) ?? true;
 
     internal bool AllowScenarioControl() =>
         AllowRecoveryMutation("story") &&
@@ -1270,9 +1113,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         bool useButton,
         bool showCurtain,
         bool ignorePlaying) =>
-        AllowRecoveryMutation("story") && (_managerEventReplicator?.InterceptScenarioStart(
+        _managerEventReplicator?.InterceptScenarioStart(
             Role, _session, bundleId, isBranch, branchData, arguments, callback,
-            useButton, showCurtain, ignorePlaying) ?? true);
+            useButton, showCurtain, ignorePlaying) ?? true;
 
     internal bool InterceptDialogueStart(
         string bundleId,
@@ -1284,9 +1127,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Il2CppSystem.Action<int> choiceCallback,
         bool useButton,
         bool showCurtain) =>
-        AllowRecoveryMutation("story") && (_managerEventReplicator?.InterceptDialogueStart(
+        _managerEventReplicator?.InterceptDialogueStart(
             Role, _session, bundleId, kind, arguments, entries, buttonInfo,
-            callback, choiceCallback, useButton, showCurtain) ?? true);
+            callback, choiceCallback, useButton, showCurtain) ?? true;
 
     internal bool InterceptScenarioNode(ScenarioManager manager, DRSequence sequence) =>
         AllowRecoveryMutation("story") &&
@@ -1406,42 +1249,37 @@ public sealed class ProbeBehaviour : MonoBehaviour
     }
 
     internal bool AllowPuzzleSave(PuzzleStateSaveObject saveObject, bool value) =>
-        UnsafeWorldReplicationBlocked
-            ? false
-            : _worldStateReplicator?.AllowLocalSave(
-                Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value) ?? true;
+        _worldStateReplicator?.AllowLocalSave(
+            Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value) ?? true;
 
     internal void OnPuzzleSaved(PuzzleStateSaveObject saveObject, bool value)
     {
-        if (!UnsafeWorldReplicationBlocked)
-            _worldStateReplicator?.ObserveHostSave(
-                Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value);
+        _worldStateReplicator?.ObserveHostSave(
+            Role, _session, _session?.SceneMatches(_sceneId) == true, saveObject, value);
     }
 
     internal bool AllowBossHpWrite(BossControllerBase boss, int hp) =>
-        UnsafeWorldReplicationBlocked
-            ? false
-            : _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
+        _bossReplicator?.AllowHpWrite(Role, _session, _sceneId, boss, hp) ?? true;
 
     internal bool AllowBossMutation(BossControllerBase boss) =>
-        !UnsafeWorldReplicationBlocked &&
-        (_bossReplicator?.AllowClientBossMutation(Role, _session, boss) ?? true);
+        _bossReplicator?.AllowClientBossMutation(Role, _session, boss) ?? true;
 
     internal bool AllowBossFamilyMutation(MonoBehaviour boss) =>
-        !UnsafeWorldReplicationBlocked &&
-        (_bossReplicator?.AllowClientFamilyMutation(Role, _session, boss) ?? true);
+        _bossReplicator?.AllowClientFamilyMutation(Role, _session, boss) ?? true;
 
     internal void ObserveBossTransition(BossControllerBase boss) =>
         _bossReplicator?.ObserveNativeTransition(Role, _session, _sceneId, boss);
 
     internal bool ObserveBossDamage(BossControllerBase boss, AttackData attack) =>
-        !UnsafeWorldReplicationBlocked &&
-        (_bossReplicator?.ObserveClientDamage(Role, _session, _sceneId, boss, attack) ?? true);
+        _bossReplicator?.ObserveClientDamage(Role, _session, _sceneId, boss, attack) ?? true;
 
     internal bool ObserveBossHarpoon(BossControllerBase boss, Vector3 hitPosition, int damage) =>
-        !UnsafeWorldReplicationBlocked &&
-        (_bossReplicator?.ObserveClientHarpoon(
-            Role, _session, _sceneId, boss, hitPosition, damage) ?? true);
+        _bossReplicator?.ObserveClientHarpoon(
+            Role, _session, _sceneId, boss, hitPosition, damage) ?? true;
+
+    internal bool AllowAdditiveSceneUnload(int sceneId) =>
+        _sceneReplicator?.AllowAdditiveSceneUnload(
+            _session, IsDiveScene(), sceneId) ?? true;
 
     internal bool TryCaptureRemoteLoot(
         int itemId,
@@ -1494,8 +1332,6 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal bool OnPickupInteract(PickupInstanceItem item, BaseCharacter character)
     {
-        if (UnsafeWorldReplicationBlocked)
-            return false;
         if (Role != SessionRole.Client)
             return true;
         if (!(_pickupReplicator?.RequestPickup(_session, _sceneId, item) ?? false))
@@ -1759,6 +1595,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal void CancelClientNativeDiveTransition() =>
         _sceneReplicator?.CancelClientNativeDiveTransition();
 
+    internal string RedirectClientDiveTarget(string sceneName) =>
+        _sceneReplicator?.RedirectClientDiveTarget(Role, sceneName) ?? sceneName;
+
     internal bool RequestDiveExit(Common.SceneExitTrigger trigger)
     {
         if (!IsSharedActionScene())
@@ -1784,76 +1623,21 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     internal void ReportDiveLife(bool dead)
     {
-        if (IsSharedActionScene() && !(_diverVitalReplicator?.ApplyingClientResult ?? false))
+        if (IsSharedActionScene())
             _diveCoordinator?.ReportLocalLife(Role, _session, dead);
     }
 
-    private bool HandleRemoteDiverDamage(AttackData attack, DefenseData _) =>
-        Role == SessionRole.Host && IsDiveScene() &&
-        (_diverVitalReplicator?.TryApplyHostDamage(_session, attack, _remoteAvatar) ?? false);
+    internal bool AllowDiverGunFire(GunWeaponHandler _) => true;
 
-    internal bool AllowDiverGunFire(GunWeaponHandler gun)
-    {
-        if (_diverWeaponReplicator?.ApplyingClientFire == true)
-            return true;
-        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true))
-            return true;
-        if (_diverWeaponReplicator?.RequestClientFire(_session, _player, gun) == true)
-            _sessionTrace?.Write("DIVER-WEAPON", "fire=requested");
-        else
-            _sessionTrace?.Write("DIVER-POLICY", "reject=gun not-ready");
-        return false;
-    }
+    internal bool AllowDiverGunReload(GunWeaponHandler _) => true;
 
-    internal bool AllowDiverGunReload(GunWeaponHandler gun)
-    {
-        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true))
-            return true;
-        if (_diverWeaponReplicator?.RequestClientReload(_session, _player, gun) == true)
-            _sessionTrace?.Write("DIVER-WEAPON", "reload=requested");
-        else
-            _sessionTrace?.Write("DIVER-POLICY", "reject=reload not-ready");
-        return false;
-    }
+    internal bool AllowDiverDeviceUse(PlayerCharacter _) => true;
 
-    internal bool AllowDiverDeviceUse(PlayerCharacter player) =>
-        AllowDiverClientOnlyMutation(player == _player, "sub-helper");
+    internal bool RequestDiverOxygenCapsule(PlayerCharacter player, float ratio) => true;
 
-    internal bool RequestDiverOxygenCapsule(PlayerCharacter player, float ratio)
-    {
-        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true) ||
-            (_diverVitalReplicator?.ApplyingClientResult ?? false))
-            return true;
-        var requested = _diverVitalReplicator?.RequestOxygenCapsule(_session, player, ratio) == true;
-        _sessionTrace?.Write("DIVER-VITAL", requested ? "oxygen=requested" : "oxygen=not-ready");
-        return false;
-    }
+    internal bool RequestDiverRevive(PlayerCharacter _) => true;
 
-    internal bool RequestDiverRevive(PlayerCharacter player)
-    {
-        if (!IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true) ||
-            (_diverVitalReplicator?.ApplyingClientResult ?? false))
-            return true;
-        var requested = _diverVitalReplicator?.RequestRevive(_session, player) == true;
-        _sessionTrace?.Write("DIVER-VITAL", requested ? "revive=requested" : "revive=not-ready");
-        return false;
-    }
-
-    internal bool AllowDiverBuff(BuffHandler handler) =>
-        AllowDiverClientOnlyMutation(handler != null && handler == _player?.m_PlayerBuffHandler, "buff");
-
-    private bool AllowDiverClientOnlyMutation(bool localOwner, string kind)
-    {
-        if (!localOwner || !IsSharedActionScene() || DiverEquipmentPolicy.AllowClientMutation(
-                Role, _session?.Connected == true))
-            return true;
-        _sessionTrace?.Write("DIVER-POLICY", $"reject={kind} client-only");
-        return false;
-    }
+    internal bool AllowDiverBuff(BuffHandler _) => true;
 
     internal bool RequestDiveDeathReturn()
     {

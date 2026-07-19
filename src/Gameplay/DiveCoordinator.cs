@@ -20,6 +20,7 @@ internal sealed class DiveCoordinator
     private bool _hostReady;
     private bool _clientReady;
     private bool _starting;
+    private bool _clientDiveRequested;
     private bool _clientNativeStartRequested;
     private bool _allowNativeStart;
     private bool _allowNativeExit;
@@ -71,8 +72,7 @@ internal sealed class DiveCoordinator
             !HasRequiredExitConfirmations(false, true, true, false) ||
             HasRequiredExitConfirmations(false, true, false, true) ||
              !ShouldStartClientDive(true, true, false) ||
-             !CanStartClientDive(true, true, false, true) ||
-             ShouldStartClientDive(false, true, false) ||
+            ShouldStartClientDive(false, true, false) ||
             ShouldStartClientDive(true, true, true) ||
             ShouldAllowEscapePodInteraction(SessionRole.Client, true) ||
             !ShouldAllowEscapePodInteraction(SessionRole.Host, true) ||
@@ -119,9 +119,11 @@ internal sealed class DiveCoordinator
             TryStartHostDive(session, Time.realtimeSinceStartup);
             return false;
         }
-        if (role == SessionRole.Client && !_clientReady)
+        if (role == SessionRole.Client && !_clientDiveRequested)
         {
+            session.ClearDiveSceneTransition();
             _clientReady = true;
+            _clientDiveRequested = true;
             _localRevision = NextRevision(_localRevision);
             session.SendDiveReady(new DiveReady(_localRevision, true));
             _log.LogInfo("Dive: client is ready; waiting for host");
@@ -229,6 +231,7 @@ internal sealed class DiveCoordinator
         (_hostReady, _clientReady, _starting, _clientNativeStartRequested,
             _allowNativeStart, _allowNativeExit) =
             (false, false, false, false, false, false);
+        _clientDiveRequested = false;
         (_hostDead, _clientDead) = (false, false);
         _localSpectating = false;
         (_hostExitReady, _clientExitReady) = (false, false);
@@ -257,19 +260,22 @@ internal sealed class DiveCoordinator
 
     private void TryStartClientDive(UdpSession session, float now)
     {
-        if (!CanStartClientDive(
-                _hostReady, _clientReady, _clientNativeStartRequested, _panel != null))
+        if (_panel == null ||
+            !ShouldStartClientDive(_hostReady, _clientReady, _clientNativeStartRequested) ||
+            !session.TryTakeDiveSceneTransition(out var transition))
             return;
 
+        FishSpawnSeedCoordinator.StageRemoteScene(
+            new SceneSeed(transition.SceneId, transition.SceneEpoch, transition.Seed));
         _clientNativeStartRequested = true;
         _allowNativeStart = true;
         RefreshPrompt(session, now);
         var probe = ProbeBehaviour.Instance;
-        probe?.BeginClientNativeDiveTransition(_startParameter?.StartSceneName);
-        _log.LogInfo("Dive: both players ready; client starts native dive");
+        probe?.BeginClientNativeDiveTransition(transition.SceneName);
+        _log.LogInfo("Dive: host transition observed; client starts native dive");
         try
         {
-            _panel.StartGame(_startParameter);
+            _panel.StartGame(null);
         }
         catch
         {
@@ -286,6 +292,7 @@ internal sealed class DiveCoordinator
             ? FishSpawnSeedCoordinator.GetOrCreate(
                 Protocol.SceneId(targetScene), session.NextLocalSceneEpoch)
             : new SceneSeed(1, session.NextLocalSceneEpoch, 1);
+        FishSpawnSeedCoordinator.StageLocalScene(seed);
         session.SendDiveState(new DiveState(
             _stateRevision, _hostReady, _clientReady,
             seed.SceneId, seed.SceneEpoch, seed.Seed));
@@ -450,10 +457,6 @@ internal sealed class DiveCoordinator
     private static bool ShouldStartClientDive(bool hostReady, bool clientReady, bool alreadyStarted) =>
         hostReady && clientReady && !alreadyStarted;
 
-    private static bool CanStartClientDive(
-        bool hostReady, bool clientReady, bool alreadyStarted, bool panelPresent) =>
-        panelPresent && ShouldStartClientDive(hostReady, clientReady, alreadyStarted);
-
     private static bool ShouldAllowEscapePodInteraction(SessionRole role, bool connected) =>
         role != SessionRole.Client || !connected;
 
@@ -517,6 +520,8 @@ internal sealed class DiveCoordinator
     internal bool HostDead => _hostDead;
     internal bool ClientDead => _clientDead;
     internal bool AnyPlayerDead => _hostDead || _clientDead;
+    internal bool WaitingForHostDiveTransition =>
+        _clientDiveRequested && !_clientNativeStartRequested;
 
     private void UpdateSpectator(Transform remoteAvatar, string message)
     {

@@ -36,29 +36,33 @@ internal sealed class MissionProgressReplicator
     internal static void SelfTest()
     {
         var conditions = new[] { new MissionConditionState(100, 3) };
-        var local = new MissionState(1, 10, 2, 2, 20, conditions);
-        var keyframe = new MissionState(2, 10, 2, 2, 20, conditions);
-        var changed = new MissionState(3, 10, 2, 2, 20,
+        var local = new MissionState(1, 10, 2, 2, 20, true, false, conditions);
+        var keyframe = new MissionState(2, 10, 2, 2, 20, true, false, conditions);
+        var changed = new MissionState(3, 10, 2, 2, 20, true, false,
             new[] { new MissionConditionState(100, 4) });
         if (ShouldApplyClientState(local, keyframe) || !ShouldApplyClientState(local, changed))
             throw new InvalidOperationException("Mission client apply decision failed");
+        if (!ShouldPresentTerminal((byte)global::MissionState.InProgress,
+                (byte)global::MissionState.Clear) ||
+            ShouldPresentTerminal((byte)global::MissionState.Clear,
+                (byte)global::MissionState.Done) ||
+            ShouldPresentTerminal((byte)global::MissionState.InProgress,
+                (byte)global::MissionState.InProgress))
+            throw new InvalidOperationException("Mission terminal presentation policy failed");
         if (ResolveConditionCount(Array.Empty<MissionConditionState>(), 100, 7) != 7 ||
             ResolveConditionCount(conditions, 100, 7) != 3 ||
             ResolveConditionCount(conditions, 200, 7) != 7)
             throw new InvalidOperationException("Mission condition snapshot merge failed");
         if (!ShouldRetainUnrestoredOriginal(true) || !ShouldRetainUnrestoredOriginal(false))
             throw new InvalidOperationException("Mission original restore retry policy failed");
-        var rosterBeforeTerminal = ShouldRetainAbsentMissionForPendingTerminal(false, 0);
+        var rosterBeforeTerminal = ShouldDeferAbsentMission(false, false, 0);
         var terminalBeforeRoster =
-            ShouldRetainAbsentMissionForPendingTerminal(
-                true, (byte)global::MissionState.Clear) &&
-            ShouldRetainAbsentMissionForPendingTerminal(
-                true, (byte)global::MissionState.Done) &&
-            ShouldRetainAbsentMissionForPendingTerminal(
-                true, (byte)global::MissionState.Fail) &&
-            ShouldRetainAbsentMissionForPendingTerminal(
-                true, (byte)global::MissionState.Failed);
-        if (rosterBeforeTerminal || !terminalBeforeRoster)
+            ShouldDeferAbsentMission(false, true, (byte)global::MissionState.Clear) &&
+            ShouldDeferAbsentMission(false, true, (byte)global::MissionState.Done) &&
+            ShouldDeferAbsentMission(false, true, (byte)global::MissionState.Fail) &&
+            ShouldDeferAbsentMission(false, true, (byte)global::MissionState.Failed);
+        if (rosterBeforeTerminal || !terminalBeforeRoster ||
+            !ShouldDeferAbsentMission(true, false, 0))
             throw new InvalidOperationException("Mission roster/terminal order policy failed");
         if (!IsActiveRosterState(global::MissionState.Accept) ||
             !IsActiveRosterState(global::MissionState.InProgress) ||
@@ -84,8 +88,7 @@ internal sealed class MissionProgressReplicator
             !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.Failed) ||
             !ShouldRetainPendingStateForRoster(false, (byte)global::MissionState.InProgress) ||
             !ShouldRetainPendingStateForRoster(true, (byte)global::MissionState.InProgress) ||
-            ShouldRetainAbsentMissionForPendingTerminal(
-                true, (byte)global::MissionState.InProgress))
+            ShouldDeferAbsentMission(false, true, (byte)global::MissionState.InProgress))
             throw new InvalidOperationException("Mission active roster policy failed");
     }
 
@@ -167,6 +170,7 @@ internal sealed class MissionProgressReplicator
             _hasPendingClientRoster = false;
         }
         var changed = false;
+        var terminalHandled = false;
         foreach (var pair in new List<KeyValuePair<int, MissionState>>(_pendingClientStates))
         {
             if (!ShouldAcceptStateForRoster(
@@ -177,7 +181,8 @@ internal sealed class MissionProgressReplicator
             var mission = MissionManager.Instance?.GetMissionData(pair.Key);
             if (mission == null)
                 continue;
-            if (!ShouldApplyClientState(Capture(mission, pair.Value.Revision), pair.Value))
+            var local = Capture(mission, pair.Value.Revision);
+            if (!ShouldApplyClientState(local, pair.Value))
             {
                 _clientRevisions[pair.Key] = pair.Value.Revision;
                 _pendingClientStates.Remove(pair.Key);
@@ -189,9 +194,11 @@ internal sealed class MissionProgressReplicator
                 continue;
             _clientRevisions[pair.Key] = pair.Value.Revision;
             _pendingClientStates.Remove(pair.Key);
+            if (ShouldPresentTerminal(local.State, pair.Value.State))
+                terminalHandled = true;
             changed = true;
         }
-        if (changed)
+        if (changed && !terminalHandled)
             RefreshMissionUI("state");
     }
 
@@ -297,17 +304,21 @@ internal sealed class MissionProgressReplicator
                 if (mission == null || mission.TID <= 0 ||
                     _clientRosterIds.Contains(mission.TID))
                     continue;
-                if (ShouldResetAbsentMission(mission.State) &&
-                    _pendingClientStates.TryGetValue(mission.TID, out var pending) &&
-                    ShouldRetainAbsentMissionForPendingTerminal(true, pending.State))
-                    continue;
+                if (ShouldResetAbsentMission(mission.State))
+                {
+                    var hasPending = _pendingClientStates.TryGetValue(
+                        mission.TID, out var pending);
+                    if (ShouldDeferAbsentMission(
+                            _clientRosterRevision != 0, hasPending, pending.State))
+                        continue;
+                }
                 manager.InProgressList.Remove(mission);
                 manager.NewMissionList.Remove(mission);
                 if (!ShouldResetAbsentMission(mission.State))
                     continue;
                 var state = new MissionState(
                     1, mission.TID, 0, (byte)global::MissionState.NotStarted, 0,
-                    Array.Empty<MissionConditionState>());
+                    false, false, Array.Empty<MissionConditionState>());
                 if (ApplyClientState(state, preserveOriginal: true))
                 {
                     reset++;
@@ -357,6 +368,8 @@ internal sealed class MissionProgressReplicator
             Math.Max(0, mission.Progress),
             (byte)mission.State,
             task?.TID ?? 0,
+            mission.Selected,
+            mission.WasExplicitlyDeselected,
             conditions.ToArray());
     }
 
@@ -375,8 +388,14 @@ internal sealed class MissionProgressReplicator
             probe?.BeginRemoteMissionApply();
             try
             {
-                mission.State = (global::MissionState)state.State;
+                var nativeTerminal = ShouldPresentTerminal(
+                    (byte)mission.State, state.State);
+                if (!nativeTerminal)
+                    mission.State = (global::MissionState)state.State;
                 mission.Progress = state.Progress;
+                mission._Selected_k__BackingField = state.Selected;
+                mission._WasExplicitlyDeselected_k__BackingField =
+                    state.WasExplicitlyDeselected;
                 mission.ForceUpdateCurrenTask();
                 SelectTask(mission, state.CurrentTaskId);
                 var task = mission.CurrentTask;
@@ -388,14 +407,23 @@ internal sealed class MissionProgressReplicator
                             condition.NowCount = ResolveConditionCount(
                                 state.Conditions, condition.TID, condition.NowCount);
                 }
-                SetMembership(manager.InProgressList, mission,
-                    mission.State == global::MissionState.InProgress);
-                SetMembership(manager.NewMissionList, mission,
-                    mission.State == global::MissionState.Accept);
-                if (mission.State is global::MissionState.Clear or global::MissionState.Done)
-                    manager.ClearedSet.Add(mission.TID);
+                if (nativeTerminal &&
+                    (global::MissionState)state.State is global::MissionState.Clear or
+                        global::MissionState.Done)
+                    manager.ClearMission(mission.TID);
+                else if (nativeTerminal)
+                    manager.SetMissionFailed(mission);
                 else
-                    manager.ClearedSet.Remove(mission.TID);
+                {
+                    SetMembership(manager.InProgressList, mission,
+                        mission.State == global::MissionState.InProgress);
+                    SetMembership(manager.NewMissionList, mission,
+                        mission.State == global::MissionState.Accept);
+                    if (mission.State is global::MissionState.Clear or global::MissionState.Done)
+                        manager.ClearedSet.Add(mission.TID);
+                    else
+                        manager.ClearedSet.Remove(mission.TID);
+                }
             }
             finally
             {
@@ -404,6 +432,7 @@ internal sealed class MissionProgressReplicator
             _trace?.Write("MISSION-APPLY",
                 $"mission={state.MissionId} revision={state.Revision} " +
                 $"state={state.State} progress={state.Progress} " +
+                $"selected={state.Selected} " +
                 $"conditions={FormatConditions(state.Conditions)}");
             return true;
         }
@@ -447,6 +476,13 @@ internal sealed class MissionProgressReplicator
             manager.OrderInProgressList();
             manager.RaiseInProgressChanged();
             manager.RefreshMissionEventListener();
+            var hud = UnityEngine.Object.FindFirstObjectByType<MissionHUD>();
+            if (hud != null)
+            {
+                hud.ClearQueue();
+                hud.RefreshMissionHUD();
+                hud.UpdateTextOnly();
+            }
             _trace?.Write("MISSION-HUD", $"refreshed source={source}");
         }
         catch (Exception exception)
@@ -508,6 +544,8 @@ internal sealed class MissionProgressReplicator
     {
         if (left.MissionId != right.MissionId || left.Progress != right.Progress ||
             left.State != right.State || left.CurrentTaskId != right.CurrentTaskId ||
+            left.Selected != right.Selected ||
+            left.WasExplicitlyDeselected != right.WasExplicitlyDeselected ||
             left.Conditions == null || right.Conditions == null ||
             left.Conditions.Length != right.Conditions.Length)
             return false;
@@ -519,6 +557,9 @@ internal sealed class MissionProgressReplicator
 
     private static bool ShouldApplyClientState(MissionState local, MissionState remote) =>
         !SameContent(local, remote);
+
+    private static bool ShouldPresentTerminal(byte localState, byte remoteState) =>
+        !IsTerminal(localState) && IsTerminal(remoteState);
 
     private static bool IsActiveRosterState(global::MissionState state) =>
         state is global::MissionState.Accept or global::MissionState.InProgress;
@@ -532,9 +573,9 @@ internal sealed class MissionProgressReplicator
 
     private static bool ShouldRetainPendingStateForRoster(bool _, byte __) => true;
 
-    private static bool ShouldRetainAbsentMissionForPendingTerminal(
-        bool hasPendingState, byte pendingState) =>
-        hasPendingState && IsTerminal(pendingState);
+    private static bool ShouldDeferAbsentMission(
+        bool rosterKnown, bool hasPendingState, byte pendingState) =>
+        rosterKnown || hasPendingState && IsTerminal(pendingState);
 
     private static bool ShouldRetainUnrestoredOriginal(bool _) => true;
 

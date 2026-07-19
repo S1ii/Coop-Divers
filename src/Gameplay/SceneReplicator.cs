@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using BepInEx.Logging;
 using HarmonyLib;
 using UnityEngine;
@@ -293,7 +294,10 @@ internal sealed class SceneReplicator
     private SceneTransitionCommand? _pending;
     private bool _applyingHostTransition;
     private string _allowedClientTransitionScene;
+    private string _clientDiveTargetScene;
     private float _allowedClientTransitionUntil;
+    private readonly HashSet<int> _sharedAdditiveScenes = new();
+    private AdditiveSceneLoad? _pendingAdditiveScene;
 
     internal SceneReplicator(ManualLogSource log) => _log = log;
 
@@ -304,9 +308,16 @@ internal sealed class SceneReplicator
             CanAllowClientTransition(false, "A01", "B01", 2f, 3f) ||
             CanAllowClientTransition(false, "A01", "A01", 4f, 3f) ||
             !CanAllowClientTransition(true, null, "B01", 4f, 0f) ||
+            TargetSceneEpoch(7, false) != 7 ||
+            TargetSceneEpoch(7, true) != 8 ||
+            TargetSceneEpoch(uint.MaxValue, true) != 1 ||
             !ShouldWaitForSceneSeed(true, false) ||
             ShouldWaitForSceneSeed(true, true) ||
-            ShouldWaitForSceneSeed(false, false))
+            ShouldWaitForSceneSeed(false, false) ||
+            !ShouldProtectAdditiveScene(true, true, true, 12) ||
+            ShouldProtectAdditiveScene(true, true, false, 12) ||
+            ShouldProtectAdditiveScene(false, true, true, 12) ||
+            ShouldProtectAdditiveScene(true, false, true, 12))
             throw new System.InvalidOperationException("Client native transition gate failed");
         var gate = new SceneReplicator(null);
         gate.BeginClientNativeDiveTransition("A01", 1f);
@@ -324,6 +335,10 @@ internal sealed class SceneReplicator
         gate.BeginClientNativeDiveTransition(null, 1f);
         if (!gate.AllowTransition(SessionRole.Client, "A02", 2f))
             throw new System.InvalidOperationException("Client wildcard dive transition failed");
+        gate.BeginClientNativeDiveTransition("A02", 1f);
+        if (gate.RedirectClientDiveTarget(SessionRole.Client, "A01") != "A02" ||
+            gate.RedirectClientDiveTarget(SessionRole.Client, "A01") != "A01")
+            throw new System.InvalidOperationException("Client dive target redirect failed");
     }
 
     internal void OnHostTransition(
@@ -351,7 +366,8 @@ internal sealed class SceneReplicator
         Set(ref options, 7, skipEmptySceneOptionIsUnloadAssets);
         Set(ref options, 8, firstFindSceneManagerInActiveScene);
         var seed = FishSpawnSeedCoordinator.GetOrCreate(
-            Protocol.SceneId(sceneName), session.NextLocalSceneEpoch);
+            Protocol.SceneId(sceneName),
+            TargetSceneEpoch(session.NextLocalSceneEpoch, throughEmptyScene));
         FishSpawnSeedCoordinator.StageLocalScene(seed);
         session.SendSceneTransition(new SceneTransitionCommand(
             sceneName, (int)transitionType, options, seed.SceneId, seed.SceneEpoch, seed.Seed));
@@ -374,13 +390,25 @@ internal sealed class SceneReplicator
         _allowedClientTransitionScene = string.IsNullOrEmpty(sceneName)
             ? AnyClientTransition
             : sceneName;
+        _clientDiveTargetScene = sceneName;
         _allowedClientTransitionUntil = now + 10f;
     }
 
     internal void CancelClientNativeDiveTransition()
     {
         _allowedClientTransitionScene = null;
+        _clientDiveTargetScene = null;
         _allowedClientTransitionUntil = 0f;
+    }
+
+    internal string RedirectClientDiveTarget(SessionRole role, string sceneName)
+    {
+        if (role != SessionRole.Client || string.IsNullOrEmpty(_clientDiveTargetScene))
+            return sceneName;
+        var hostScene = _clientDiveTargetScene;
+        _clientDiveTargetScene = null;
+        _log?.LogInfo($"Network: redirecting client dive {sceneName} to host scene {hostScene}");
+        return hostScene;
     }
 
     internal void Update(SessionRole role, UdpSession session)
@@ -395,8 +423,8 @@ internal sealed class SceneReplicator
             return;
         }
 
-        if (_allowedClientTransitionScene != null &&
-            Time.realtimeSinceStartup > _allowedClientTransitionUntil)
+        var now = Time.realtimeSinceStartup;
+        if (_allowedClientTransitionScene != null && now > _allowedClientTransitionUntil)
             CancelClientNativeDiveTransition();
 
         while (session.TryTakeSceneTransition(out var command))
@@ -475,10 +503,70 @@ internal sealed class SceneReplicator
         return true;
     }
 
+    internal void ObserveAdditiveScene(UdpSession session, string sceneName)
+    {
+        if (session?.Connected != true || string.IsNullOrWhiteSpace(sceneName))
+            return;
+        try
+        {
+            var nativeId = SceneContext.Instance?.GetSceneDataCacheBySceneName(sceneName)?.SceneID ?? 0;
+            if (nativeId <= 0)
+                return;
+            _sharedAdditiveScenes.Add(nativeId);
+            session.SendAdditiveSceneLoad(new AdditiveSceneLoad(sceneName, nativeId));
+            _log?.LogInfo($"Network: shared additive territory {sceneName} ({nativeId})");
+        }
+        catch (System.Exception exception)
+        {
+            _log?.LogWarning($"Network: additive territory announce failed: {exception.Message}");
+        }
+    }
+
+    internal void UpdateAdditiveScenes(UdpSession session, bool isDiveScene)
+    {
+        if (session?.Connected != true || !isDiveScene)
+            return;
+        if (!_pendingAdditiveScene.HasValue &&
+            session.TryTakeAdditiveSceneLoad(out var requested))
+            _pendingAdditiveScene = requested;
+        if (!_pendingAdditiveScene.HasValue)
+            return;
+
+        var pending = _pendingAdditiveScene.Value;
+        try
+        {
+            if (SceneManager.GetSceneByName(pending.SceneName).isLoaded)
+            {
+                _sharedAdditiveScenes.Add(pending.NativeSceneId);
+                _pendingAdditiveScene = null;
+                return;
+            }
+            var loader = UnityEngine.Object.FindFirstObjectByType<SceneLoader>();
+            if (loader == null || SceneLoader.IsSceneLoading)
+                return;
+            _sharedAdditiveScenes.Add(pending.NativeSceneId);
+            loader.StartCoroutine(loader.coLoadAdditiveScene(pending.NativeSceneId));
+            _log?.LogInfo(
+                $"Network: loading shared additive territory {pending.SceneName} ({pending.NativeSceneId})");
+            _pendingAdditiveScene = null;
+        }
+        catch (System.Exception exception)
+        {
+            _log?.LogWarning($"Network: additive territory load deferred: {exception.Message}");
+        }
+    }
+
+    internal bool AllowAdditiveSceneUnload(UdpSession session, bool isDiveScene, int sceneId) =>
+        !ShouldProtectAdditiveScene(
+            session?.Connected == true, isDiveScene,
+            _sharedAdditiveScenes.Contains(sceneId), sceneId);
+
     internal void Clear()
     {
         _pending = null;
         _applyingHostTransition = false;
+        _pendingAdditiveScene = null;
+        _sharedAdditiveScenes.Clear();
         CancelClientNativeDiveTransition();
     }
 
@@ -503,6 +591,29 @@ internal sealed class SceneReplicator
 
     private static bool ShouldWaitForSceneSeed(bool canDive, bool hasSeed) =>
         canDive && !hasSeed;
+
+    private static bool ShouldProtectAdditiveScene(
+        bool connected,
+        bool isDiveScene,
+        bool shared,
+        int unloadSceneId) =>
+        connected && isDiveScene && unloadSceneId > 0 && shared;
+
+    private static uint TargetSceneEpoch(uint nextSceneEpoch, bool throughEmptyScene) =>
+        !throughEmptyScene ? nextSceneEpoch :
+        nextSceneEpoch == uint.MaxValue ? 1 : nextSceneEpoch + 1;
+}
+
+[HarmonyPatch(typeof(SceneContext), nameof(SceneContext.IsUnloadable))]
+internal static class CoopAdditiveSceneUnloadPatch
+{
+    private static bool Prefix(int sceneId, ref bool __result)
+    {
+        if (ProbeBehaviour.Instance?.AllowAdditiveSceneUnload(sceneId) ?? true)
+            return true;
+        __result = false;
+        return false;
+    }
 }
 
 [HarmonyPatch(typeof(SceneLoader), nameof(SceneLoader.ChangeSceneAsync))]
@@ -537,5 +648,17 @@ internal static class SceneTransitionPatch
             skipEmptySceneOption_isUnloadAssets,
             firstFindSceneManagerInActiveScene);
         return true;
+    }
+}
+
+[HarmonyPatch(typeof(SceneLoader), nameof(SceneLoader.GoToLevelScene),
+    typeof(string), typeof(SceneTransitionType))]
+internal static class ClientDiveTargetPatch
+{
+    private static void Prefix(ref string __0)
+    {
+        var behaviour = ProbeBehaviour.Instance;
+        if (behaviour != null)
+            __0 = behaviour.RedirectClientDiveTarget(__0);
     }
 }

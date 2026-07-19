@@ -64,7 +64,8 @@ internal enum PacketType : byte
     DiverVitalResult = 58,
     DiverWeaponIntent = 59,
     DiverWeaponResult = 60,
-    DiverVitalIntent = 61
+    DiverVitalIntent = 61,
+    AdditiveSceneLoad = 62
 }
 
 internal enum HandshakeRejectReason : byte
@@ -516,6 +517,7 @@ internal readonly record struct DiveState(
     uint SceneEpoch,
     int Seed);
 internal readonly record struct SceneSeed(uint SceneId, uint SceneEpoch, int Seed);
+internal readonly record struct AdditiveSceneLoad(string SceneName, int NativeSceneId);
 internal readonly record struct CargoState(
     uint SceneId,
     float WeightMax,
@@ -592,6 +594,8 @@ internal readonly record struct MissionState(
     int Progress,
     byte State,
     int CurrentTaskId,
+    bool Selected,
+    bool WasExplicitlyDeselected,
     MissionConditionState[] Conditions);
 internal readonly record struct MissionRoster(uint Revision, int[] MissionIds);
 internal readonly record struct WorldFlagRequest(string Key, bool Value);
@@ -664,7 +668,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 49;
+    private const byte Version = 53;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -721,7 +725,7 @@ internal static class Protocol
     private const int DiveLootRequestPacketSize = HeaderSize + 25;
     private const int DiveResultEntryPacketSize = HeaderSize + 28;
     private const int DiveResultStatePacketSize = HeaderSize + 10;
-    private const int MissionStateFixedSize = HeaderSize + 18;
+    private const int MissionStateFixedSize = HeaderSize + 19;
     private const int MissionConditionStateSize = 8;
     private const int MissionRosterFixedSize = HeaderSize + 6;
     internal const int MaxIngredientEntriesPerPacket =
@@ -1328,6 +1332,43 @@ internal static class Protocol
         return true;
     }
 
+    internal static byte[] EncodeAdditiveSceneLoad(uint sequence, AdditiveSceneLoad state)
+    {
+        var name = StrictUtf8.GetBytes(state.SceneName ?? string.Empty);
+        if (state.NativeSceneId <= 0 || name.Length is < 1 or > 128)
+            throw new ArgumentOutOfRangeException(nameof(state));
+        var packet = new byte[HeaderSize + 5 + name.Length];
+        WriteHeader(packet, PacketType.AdditiveSceneLoad, sequence);
+        BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize), state.NativeSceneId);
+        packet[HeaderSize + 4] = (byte)name.Length;
+        name.CopyTo(packet, HeaderSize + 5);
+        return packet;
+    }
+
+    internal static bool TryDecodeAdditiveSceneLoad(
+        ReadOnlySpan<byte> packet, out uint sequence, out AdditiveSceneLoad state)
+    {
+        sequence = 0;
+        state = default;
+        if (!TryDecode(packet, out var type, out sequence) || type != PacketType.AdditiveSceneLoad ||
+            packet.Length < HeaderSize + 6 || packet[HeaderSize + 4] is < 1 or > 128 ||
+            packet.Length != HeaderSize + 5 + packet[HeaderSize + 4])
+            return false;
+        try
+        {
+            var nativeSceneId = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize));
+            var sceneName = StrictUtf8.GetString(packet.Slice(HeaderSize + 5));
+            if (nativeSceneId <= 0 || string.IsNullOrWhiteSpace(sceneName))
+                return false;
+            state = new AdditiveSceneLoad(sceneName, nativeSceneId);
+            return true;
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+    }
+
     internal static byte[] EncodeCargoState(uint sequence, CargoState state)
     {
         if (state.SceneId == 0 || state.SceneEpoch == 0 || state.WeightMax <= 0f ||
@@ -1565,7 +1606,7 @@ internal static class Protocol
         snapshot.Hp is >= 0f and <= 1_000_000_000f &&
         MathF.Abs(snapshot.X) <= 1_000_000f && MathF.Abs(snapshot.Y) <= 1_000_000f &&
         MathF.Abs(snapshot.Z) <= 1_000_000f && MathF.Abs(snapshot.VelocityX) <= 10_000f &&
-        MathF.Abs(snapshot.VelocityY) <= 10_000f && snapshot.Flags <= 7;
+        MathF.Abs(snapshot.VelocityY) <= 10_000f && snapshot.Flags <= 23;
 
     private static bool CanCompactFishSnapshot(FishSnapshot snapshot) =>
         CanQuantize(snapshot.X, 64f) && CanQuantize(snapshot.Y, 64f) &&
@@ -1770,7 +1811,8 @@ internal static class Protocol
 
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
-        if (state.Domain == 0 || state.Domain > 18 || state.Action == 0 || state.Action > 80)
+        if (state.Domain == 0 || state.Domain > 18 || state.Action == 0 ||
+            state.Action > (byte)ManagerAction.DialogueChoice)
             throw new ArgumentOutOfRangeException(nameof(state));
         var invocationSize = 0;
         if (state.Invocation is { } invocation &&
@@ -2076,7 +2118,7 @@ internal static class Protocol
         var pairIsValid = state.Domain switch
         {
             1 or 2 => state.Action is 1 or 2 or 3,
-            3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39,
+            3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39 or 82 or 83,
             4 or 5 or 6 or 7 => state.Action == 8,
             8 => state.Action is 9 or 10 or 11 or >= 71 and <= 74,
             9 => state.Action is 8 or 77,
@@ -2087,7 +2129,7 @@ internal static class Protocol
             14 => state.Action == 26,
             15 => state.Action == 27,
             16 => state.Action is 32 or 33 or 34,
-            17 => state.Action is >= 40 and <= 70,
+            17 => state.Action is >= 40 and <= 70 or 81,
             18 => state.Action is 78 or 79 or 80,
             _ => false
         };
@@ -2096,10 +2138,13 @@ internal static class Protocol
         if ((state.SceneId == 0) != (state.SceneEpoch == 0) ||
             state.Domain is 3 or 16 or 18 && state.SceneId != 0)
             return false;
-        if (state.Action is 32 or 35 && (state.Value == 0 || state.Context != 0) ||
+        if (state.Action == 32 && (state.Value == 0 || state.Context != 0) ||
+            state.Action == 35 &&
+                (state.Value == 0 || state.Context is < 0 or > (int)TutorialStep.AllDone + 1) ||
             state.Action is 38 or 39 && (state.Value <= 0 || state.Context != 0) ||
             state.Action == 33 && (state.Value == 0 || state.Context == 0) ||
             state.Action == 36 && (state.Value == 0 || state.Context < 0) ||
+            state.Action is 82 or 83 && (state.Value == 0 || state.Context < 0) ||
             (state.Action is 34 or 37) &&
                 (state.Value == 0 || state.Context is not 0 and not 1))
             return false;
@@ -2137,6 +2182,10 @@ internal static class Protocol
                 (state.Value is < 1 or > 6 || state.Context < -1_000_000_000))
                 return false;
             if (state.Action == 70 && (state.Value < 0 || state.Context is < 0 or > 3))
+                return false;
+            if (state.Action == 81 &&
+                (state.Value is < (int)TutorialStep.None or > (int)TutorialStep.AllDone ||
+                 state.Context != 0))
                 return false;
         }
         if (state.Domain == 18)
@@ -3453,7 +3502,9 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 8), state.Progress);
         packet[HeaderSize + 12] = state.State;
         BinaryPrimitives.WriteInt32LittleEndian(packet.AsSpan(HeaderSize + 13), state.CurrentTaskId);
-        packet[HeaderSize + 17] = (byte)conditions.Length;
+        packet[HeaderSize + 17] = (byte)((state.Selected ? 1 : 0) |
+            (state.WasExplicitlyDeselected ? 2 : 0));
+        packet[HeaderSize + 18] = (byte)conditions.Length;
         for (var index = 0; index < conditions.Length; index++)
         {
             var offset = MissionStateFixedSize + index * MissionConditionStateSize;
@@ -3473,7 +3524,8 @@ internal static class Protocol
         if (packet.Length < MissionStateFixedSize ||
             !TryDecode(packet, out var type, out sequence) || type != PacketType.MissionState)
             return false;
-        var count = packet[HeaderSize + 17];
+        var flags = packet[HeaderSize + 17];
+        var count = packet[HeaderSize + 18];
         if (count > MaxMissionConditions ||
             packet.Length != MissionStateFixedSize + count * MissionConditionStateSize)
             return false;
@@ -3482,7 +3534,8 @@ internal static class Protocol
         var progress = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 8));
         var stateValue = packet[HeaderSize + 12];
         var currentTaskId = BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(HeaderSize + 13));
-        if (revision == 0 || missionId <= 0 || progress < 0 || stateValue > 6 || currentTaskId < 0)
+        if (revision == 0 || missionId <= 0 || progress < 0 || stateValue > 6 ||
+            currentTaskId < 0 || (flags & ~3) != 0)
             return false;
         var conditions = new MissionConditionState[count];
         for (var index = 0; index < count; index++)
@@ -3494,7 +3547,9 @@ internal static class Protocol
         }
         if (!AreValidMissionConditions(conditions))
             return false;
-        state = new MissionState(revision, missionId, progress, stateValue, currentTaskId, conditions);
+        state = new MissionState(
+            revision, missionId, progress, stateValue, currentTaskId,
+            (flags & 1) != 0, (flags & 2) != 0, conditions);
         return true;
     }
 
@@ -3789,7 +3844,7 @@ internal static class Protocol
         float.IsFinite(manifest.Z) && float.IsFinite(manifest.Rotation) &&
         float.IsFinite(manifest.Hp) && manifest.Hp is >= 0f and <= 1_000_000_000f &&
         MathF.Abs(manifest.X) <= 1_000_000f && MathF.Abs(manifest.Y) <= 1_000_000f &&
-        MathF.Abs(manifest.Z) <= 1_000_000f && manifest.Flags <= 15;
+        MathF.Abs(manifest.Z) <= 1_000_000f && manifest.Flags <= 31;
 
     private static bool IsValidVisualSprite(VisualSprite sprite) =>
         sprite.SpriteId != 0 && float.IsFinite(sprite.OffsetX) && float.IsFinite(sprite.OffsetY) &&
@@ -4182,6 +4237,15 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(sceneSeedPacket.AsSpan(HeaderSize + 8), 0);
         if (TryDecodeSceneSeed(sceneSeedPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted a zero scene seed");
+        var additiveScene = new AdditiveSceneLoad("A01_01_02", 14011003);
+        var additivePacket = EncodeAdditiveSceneLoad(46, additiveScene);
+        if (!TryDecodeAdditiveSceneLoad(
+                additivePacket, out sequence, out var actualAdditiveScene) ||
+            sequence != 46 || actualAdditiveScene != additiveScene)
+            throw new InvalidOperationException("Additive scene load round-trip failed");
+        BinaryPrimitives.WriteInt32LittleEndian(additivePacket.AsSpan(HeaderSize), 0);
+        if (TryDecodeAdditiveSceneLoad(additivePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted an invalid additive scene id");
         var cargoState = new CargoState(SceneId("A02_01_01"), 9f, 13f, 0f, 7);
         var cargoPacket = EncodeCargoState(46, cargoState);
         if (!TryDecodeCargoState(cargoPacket, out sequence, out var actualCargoState) ||
@@ -4623,7 +4687,8 @@ internal static class Protocol
             new ManagerEvent(4, 0, 1235, 16, 32, 12345, 0),
             new ManagerEvent(5, 0, 1236, 16, 33, 12345, 67),
             new ManagerEvent(6, 0, 1237, 16, 34, 12345, 1),
-            new ManagerEvent(7, 0, 1238, 3, 35, 23456, 0),
+            new ManagerEvent(7, 0, 1238, 3, 35, 23456,
+                (int)TutorialStep.Open_Sushi_Ingredient + 1),
             new ManagerEvent(8, 0, 1239, 3, 36, 23456, 3),
             new ManagerEvent(9, 0, 1240, 3, 37, 23456, 1),
             new ManagerEvent(10, 0, 1241, 3, 38, 71, 0),
@@ -4649,7 +4714,9 @@ internal static class Protocol
             new ManagerEvent(12, 0, 1243, 17, 40, 100, 1),
             new ManagerEvent(13, 0, 1244, 17, 69, 1, 250),
             new ManagerEvent(0, 0, 1245, 17, 69, 1, -100),
-            new ManagerEvent(14, 0, 1246, 17, 70, 10017, 3)
+            new ManagerEvent(14, 0, 1246, 17, 70, 10017, 3),
+            new ManagerEvent(15, 0, 1247, 17, 81,
+                (int)TutorialStep.Open_Sushi_Ingredient, 0)
         };
         foreach (var progressionEvent in progressionEvents)
         {
@@ -4658,6 +4725,11 @@ internal static class Protocol
                 managerEvent != progressionEvent)
                 throw new InvalidOperationException("Progression manager event round-trip failed");
         }
+        managerEventPacket = EncodeManagerEvent(61, progressionEvents[^1]);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            managerEventPacket.AsSpan(HeaderSize + 18), (int)TutorialStep.AllDone + 1);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid tutorial step");
         var timeEvents = new[]
         {
             new ManagerEvent(15, 0, 1247, 18, 78, 3, BitConverter.SingleToInt32Bits(0.25f)),
@@ -4781,6 +4853,32 @@ internal static class Protocol
                     decodedDialogue.Arguments.Length != 0)))
                 throw new InvalidOperationException("Dialogue invocation round-trip failed");
         }
+        var dialogueScope = 17 | 3 << 8;
+        var dialogueVoteEvents = new[]
+        {
+            new ManagerEvent(0, 0, 1248, 3, 82, dialogueKey,
+                dialogueScope | 1 << 24),
+            new ManagerEvent(18, 0, 1249, 3, 82, dialogueKey,
+                dialogueScope | 1 << 16 | 1 << 24),
+            new ManagerEvent(19, 0, 1250, 3, 83, dialogueKey,
+                dialogueScope | 2 << 16)
+        };
+        foreach (var dialogueVoteEvent in dialogueVoteEvents)
+        {
+            managerEventPacket = EncodeManagerEvent(65, dialogueVoteEvent);
+            if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+                managerEvent != dialogueVoteEvent)
+                throw new InvalidOperationException(
+                    "Dialogue vote manager event round-trip failed");
+        }
+        managerEventPacket = EncodeManagerEvent(65,
+            new ManagerEvent(17, 0, 1248, 3, 35, dialogueKey,
+                (int)TutorialStep.AllDone + 1, dialogueInvocations[0]));
+        BinaryPrimitives.WriteInt32LittleEndian(
+            managerEventPacket.AsSpan(HeaderSize + 22), (int)TutorialStep.AllDone + 2);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException(
+                "Protocol accepted invalid dialogue tutorial context");
 
         var timelineInvocation = new ManagerInvocationDescriptor(
             ManagerInvocationKind.TimelineByTid, null, null,
@@ -5056,7 +5154,7 @@ internal static class Protocol
             sequence != 70 || resultState != new DiveResultState(7, 1))
             throw new InvalidOperationException("Dive result state round-trip failed");
 
-        var expectedMissionState = new MissionState(8, 501, 2, 2, 7001, new[]
+        var expectedMissionState = new MissionState(8, 501, 2, 2, 7001, true, false, new[]
         {
             new MissionConditionState(101, 6), new MissionConditionState(102, 7)
         });
@@ -5064,6 +5162,10 @@ internal static class Protocol
         if (!TryDecodeMissionState(missionStatePacket, out sequence, out var missionState) ||
             sequence != 71 || !SameMissionState(missionState, expectedMissionState))
             throw new InvalidOperationException("Mission state round-trip failed");
+        missionStatePacket[HeaderSize + 17] = 4;
+        if (TryDecodeMissionState(missionStatePacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid mission HUD flags");
+        missionStatePacket = EncodeMissionState(71, expectedMissionState);
         BinaryPrimitives.WriteInt32LittleEndian(missionStatePacket.AsSpan(MissionStateFixedSize), 0);
         if (TryDecodeMissionState(missionStatePacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid mission state");
@@ -5223,6 +5325,8 @@ internal static class Protocol
         if (left.Revision != right.Revision || left.MissionId != right.MissionId ||
             left.Progress != right.Progress || left.State != right.State ||
             left.CurrentTaskId != right.CurrentTaskId ||
+            left.Selected != right.Selected ||
+            left.WasExplicitlyDeselected != right.WasExplicitlyDeselected ||
             left.Conditions == null || right.Conditions == null ||
             left.Conditions.Length != right.Conditions.Length)
             return false;
