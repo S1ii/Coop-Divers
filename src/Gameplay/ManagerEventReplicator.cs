@@ -369,6 +369,11 @@ internal sealed class ManagerEventReplicator
             !ShouldWaitForManagementPanelClose(false, true) ||
             ShouldWaitForManagementPanelClose(false, false))
             throw new InvalidOperationException("Management panel close gate self-test failed");
+        if (!CanReleaseClosedManagementPanel(true, false, false) ||
+            CanReleaseClosedManagementPanel(false, false, false) ||
+            CanReleaseClosedManagementPanel(true, true, false) ||
+            CanReleaseClosedManagementPanel(true, false, true))
+            throw new InvalidOperationException("Management panel release self-test failed");
         if (!ShouldConsumeUnavailableProgression(ManagerAction.Unlock) ||
             !ShouldConsumeUnavailableProgression(ManagerAction.TutorialStep) ||
             ShouldConsumeUnavailableProgression(ManagerAction.RewardFirst))
@@ -2064,8 +2069,7 @@ internal sealed class ManagerEventReplicator
         try
         {
             var tutorial = TutorialManager.Instance;
-            tutorial?.GetHandler()?.DeactivateTutorial();
-            tutorial?.HideTutorialUI();
+            ReleaseTutorialPresentation(tutorial, tutorial?.GetHandler());
             _log?.LogInfo(
                 $"Client tutorial presentation cleared: step={_clientTutorialAppliedStep}; " +
                 $"scene={_clientTutorialAppliedSceneId}");
@@ -3949,22 +3953,90 @@ internal sealed class ManagerEventReplicator
         bundleKey != 0 && (bundleKey == tutorialBundleKey ||
             bundleId?.StartsWith("Tutorial_", StringComparison.Ordinal) == true);
 
-    private static void ReleaseTutorialPresentation(
+    private void ReleaseTutorialPresentation(
         TutorialManager tutorial, TutorialHandler handler)
     {
-        var branch = handler?.m_CurrentBranchTutorial;
-        handler?.StopAllCoroutines();
-        if (branch != handler)
-            branch?.StopAllCoroutines();
-        handler?.DeactivateTutorial();
-        DisableTutorialLocks(handler);
-        if (branch != handler)
-            DisableTutorialLocks(branch);
+        var handlers = new List<TutorialHandler>();
+        CollectTutorialHandlers(handler, handlers, new HashSet<int>());
+        foreach (var item in handlers)
+        {
+            try
+            {
+                ReleaseTutorialHandler(item);
+            }
+            catch (Exception exception)
+            {
+                _log?.LogWarning(
+                    $"Tutorial handler release failed: name={item?.name}; " +
+                    $"error={exception.Message}");
+            }
+        }
         tutorial?.HideTutorialUI();
         var guide = UnityEngine.Object.FindFirstObjectByType<GuideHelperPanel>();
         guide?.StopAllCoroutines();
         guide?.HideGuideTextUI();
         guide?.HideGuidePointerUI();
+        ReleaseSushiManagementSheet();
+        _log?.LogInfo($"Tutorial presentation owners released: handlers={handlers.Count}");
+    }
+
+    private static void CollectTutorialHandlers(
+        TutorialHandler handler,
+        List<TutorialHandler> handlers,
+        HashSet<int> seen)
+    {
+        if (handler == null || !seen.Add(handler.GetInstanceID()))
+            return;
+        handlers.Add(handler);
+        CollectTutorialHandlers(handler.m_CurrentBranchTutorial, handlers, seen);
+        var branches = handler.m_BranchList;
+        if (branches == null)
+            return;
+        for (var index = 0; index < branches.Count; index++)
+            CollectTutorialHandlers(branches[index], handlers, seen);
+    }
+
+    private void ReleaseTutorialHandler(TutorialHandler handler)
+    {
+        var blockers = handler.m_CustomBlockerList;
+        _log?.LogInfo(
+            $"Tutorial handler release begin: name={handler.name}; " +
+            $"step={handler.tutorialStep}; activated={handler.IsActivated}; " +
+            $"actionLock={handler.actionLock?.IsEnable == true}; " +
+            $"inputLock={handler.inputLocker?.IsEnable == true}; " +
+            $"blockers={blockers?.Count ?? 0}");
+        try
+        {
+            handler.StopAllCoroutines();
+            handler.DeactivateTutorial();
+        }
+        catch (Exception exception)
+        {
+            _log?.LogWarning(
+                $"Native tutorial deactivation failed: name={handler.name}; " +
+                $"error={exception.Message}");
+        }
+        DisableTutorialLocks(handler);
+        if (blockers != null)
+        {
+            for (var index = 0; index < blockers.Count; index++)
+            {
+                var blocker = blockers[index];
+                if (blocker == null)
+                    continue;
+                var wasActive = blocker.activeInHierarchy;
+                blocker.SetActive(false);
+                _log?.LogInfo(
+                    $"Tutorial custom blocker released: handler={handler.name}; " +
+                    $"name={blocker.name}; wasActive={wasActive}; " +
+                    $"activeNow={blocker.activeInHierarchy}");
+            }
+        }
+        _log?.LogInfo(
+            $"Tutorial handler release end: name={handler.name}; " +
+            $"activated={handler.IsActivated}; " +
+            $"actionLock={handler.actionLock?.IsEnable == true}; " +
+            $"inputLock={handler.inputLocker?.IsEnable == true}");
     }
 
     private static void DisableTutorialLocks(TutorialHandler handler)
@@ -3980,6 +4052,29 @@ internal sealed class ManagerEventReplicator
     private static bool ShouldWaitForManagementPanelClose(
         bool isShown, bool isTransitioning) =>
         isShown || isTransitioning;
+
+    private static bool CanReleaseClosedManagementPanel(
+        bool exists, bool isShown, bool isTransitioning) =>
+        exists && !isShown && !isTransitioning;
+
+    private void ReleaseSushiManagementSheet()
+    {
+        var helper = UnityEngine.Object.FindFirstObjectByType<SushiBarTutorialHelper>();
+        if (helper != null)
+        {
+            if (helper.m_Coroutine != null)
+                helper.StopCoroutine(helper.m_Coroutine);
+            helper.SetBlockCurrentManagementSheet(false);
+        }
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        if (CanReleaseClosedManagementPanel(
+                panel != null, panel?.IsShow == true, panel?.IsTransitioning == true))
+            panel.EnaableMenuScroller(true);
+        _log?.LogInfo(
+            $"Sushi tutorial sheet released: helper={helper != null}; " +
+            $"panel={panel != null}; shown={panel?.IsShow == true}; " +
+            $"transitioning={panel?.IsTransitioning == true}");
+    }
 
     private bool WaitForManagementPanelClose()
     {
