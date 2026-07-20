@@ -90,7 +90,8 @@ internal enum ManagerAction : byte
     TimeReset = 80,
     TutorialStep = 81,
     DialogueVote = 82,
-    DialogueChoice = 83
+    DialogueChoice = 83,
+    ManagementPanelState = 84
 }
 
 internal sealed class ManagerEventReplicator
@@ -213,7 +214,8 @@ internal sealed class ManagerEventReplicator
     private bool _applyingDialogueAuthority;
     private bool _applyingTimeAuthority;
     private bool _remoteTimeScopeActive;
-    private bool _waitingForManagementPanelClose;
+    private int _hostManagementPanelShown = -1;
+    private int _hostManagementPanelFocus = -1;
     private int _suppressPublish;
     private float _nextSushiScan;
     private float _nextProgressionScan;
@@ -365,10 +367,10 @@ internal sealed class ManagerEventReplicator
             throw new InvalidOperationException("Tutorial presentation release self-test failed");
         if (!ShouldDeferTutorialReplay(17) || ShouldDeferTutorialReplay(0))
             throw new InvalidOperationException("Tutorial dialogue ordering self-test failed");
-        if (!ShouldWaitForManagementPanelClose(true, false) ||
-            !ShouldWaitForManagementPanelClose(false, true) ||
-            ShouldWaitForManagementPanelClose(false, false))
-            throw new InvalidOperationException("Management panel close gate self-test failed");
+        if (!ShouldPublishManagementPanelState(-1, -1, 1, 3) ||
+            ShouldPublishManagementPanelState(1, 3, 1, 3) ||
+            !ShouldPublishManagementPanelState(1, 3, 0, 3))
+            throw new InvalidOperationException("Management panel state self-test failed");
         if (!CanReleaseSushiManagementSheet(true, false, false, 0, 1) ||
             CanReleaseSushiManagementSheet(false, false, false, 0, 1) ||
             CanReleaseSushiManagementSheet(true, true, false, 0, 1) ||
@@ -663,6 +665,7 @@ internal sealed class ManagerEventReplicator
 
         if (role == SessionRole.Host)
         {
+            PublishManagementPanelChanges(session);
             TryAcceptScenarioStart(ScenarioManager.Instance, session);
             ObserveLiveHostDialogue(session);
         }
@@ -1928,7 +1931,8 @@ internal sealed class ManagerEventReplicator
             }
         }
         _remoteTimeScopeActive = false;
-        _waitingForManagementPanelClose = false;
+        _hostManagementPanelShown = -1;
+        _hostManagementPanelFocus = -1;
         _suppressPublish = 0;
         _nextSushiScan = 0f;
         _nextProgressionScan = 0f;
@@ -2435,8 +2439,6 @@ internal sealed class ManagerEventReplicator
                         $"scale={scale}; unityScale={Time.timeScale}");
                     return true;
                 case ManagerAction.TimeStop:
-                    if (WaitForManagementPanelClose())
-                        return false;
                     TimeManager.Instance?.TimeStop("DaveTheDiverMP", false);
                     _remoteTimeScopeActive = true;
                     _log?.LogInfo(
@@ -2510,9 +2512,9 @@ internal sealed class ManagerEventReplicator
         var manager = DialogueManager.Instance;
         switch (action)
         {
+            case ManagerAction.ManagementPanelState:
+                return ApplyManagementPanelState(bundleKey != 0, index);
             case ManagerAction.DialogueStarted:
-                if (WaitForManagementPanelClose())
-                    return false;
                 if (manager?.IsPlaying == true &&
                     IsLocalDialogueBundle(manager.CurrentBundleID))
                 {
@@ -4062,9 +4064,67 @@ internal sealed class ManagerEventReplicator
     private static bool ShouldDeferTutorialReplay(int activeDialogueBundleKey) =>
         activeDialogueBundleKey != 0;
 
-    private static bool ShouldWaitForManagementPanelClose(
-        bool isShown, bool isTransitioning) =>
-        isShown || isTransitioning;
+    private static bool ShouldPublishManagementPanelState(
+        int previousShown, int previousFocus, int shown, int focus) =>
+        previousShown != shown || shown != 0 && previousFocus != focus;
+
+    private static bool ShouldSyncTutorialManagementPanel(TutorialStep step) =>
+        step is >= TutorialStep.Open_Sushi_Ingredient and <= TutorialStep.Close_Sushi_Menu;
+
+    private void PublishManagementPanelChanges(UdpSession session)
+    {
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        var tutorial = TutorialManager.Instance;
+        if (panel == null || tutorial == null)
+            return;
+        var inTutorial = ShouldSyncTutorialManagementPanel(tutorial.CurrentStep);
+        if (!inTutorial && _hostManagementPanelShown < 0)
+            return;
+        var shown = panel.IsShow ? 1 : 0;
+        var focus = Math.Max(panel.m_FocusIndex, 0);
+        if (!ShouldPublishManagementPanelState(
+                _hostManagementPanelShown, _hostManagementPanelFocus, shown, focus))
+            return;
+        _hostManagementPanelShown = shown;
+        _hostManagementPanelFocus = focus;
+        Publish(session, ManagerDomain.Dialogue, ManagerAction.ManagementPanelState,
+            shown, focus);
+        _log?.LogInfo(
+            $"Tutorial management panel published: shown={shown != 0}; " +
+            $"transitioning={panel.IsTransitioning}; focus={focus}");
+        if (!inTutorial && shown == 0)
+        {
+            _hostManagementPanelShown = -1;
+            _hostManagementPanelFocus = -1;
+        }
+    }
+
+    private bool ApplyManagementPanelState(bool shown, int focus)
+    {
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        if (panel == null || focus < 0 || panel.IsTransitioning)
+            return false;
+        if (shown)
+        {
+            if (!panel.IsShow)
+            {
+                panel.SetActiveSheet(true);
+                _log?.LogInfo($"Tutorial management panel opening: focus={focus}");
+                return false;
+            }
+            panel.SetFocus(Math.Min(
+                focus, Math.Max(panel.m_SheetList?.Count - 1 ?? 0, 0)));
+        }
+        else if (panel.IsShow)
+        {
+            panel.OnClickClose();
+            _log?.LogInfo("Tutorial management panel closing");
+            return false;
+        }
+        _log?.LogInfo(
+            $"Tutorial management panel applied: shown={shown}; focus={panel.m_FocusIndex}");
+        return true;
+    }
 
     private static bool CanReleaseSushiManagementSheet(
         bool exists,
@@ -4144,29 +4204,6 @@ internal sealed class ManagerEventReplicator
             $"previous=0x{previous?.Pointer.ToInt64() ?? 0:X}; " +
             $"dialogue=0x{manager.handler.Pointer.ToInt64():X}; " +
             $"managementOwner={previous != null && management?.handler != null && previous.Pointer == management.handler.Pointer}");
-    }
-
-    private bool WaitForManagementPanelClose()
-    {
-        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
-        if (!ShouldWaitForManagementPanelClose(
-                panel?.IsShow == true, panel?.IsTransitioning == true))
-        {
-            if (_waitingForManagementPanelClose)
-                _log?.LogInfo("Management panel closed; shared pause may continue");
-            _waitingForManagementPanelClose = false;
-            return false;
-        }
-
-        if (panel.IsShow && !panel.IsTransitioning)
-            panel.OnClickClose();
-        if (!_waitingForManagementPanelClose)
-            _log?.LogInfo(
-                $"Management panel close deferred shared pause: " +
-                $"shown={panel.IsShow}; transitioning={panel.IsTransitioning}; " +
-                $"unityScale={Time.timeScale}");
-        _waitingForManagementPanelClose = true;
-        return true;
     }
 
     private void TryApplyPendingTutorial(uint sceneId)
