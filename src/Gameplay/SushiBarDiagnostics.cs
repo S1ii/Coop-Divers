@@ -158,14 +158,6 @@ internal static class SushiCustomerImplDispatchSyncPatch
 }
 
 [HarmonyPatch(typeof(SushiBar.Customer.SushiBarCustomer),
-    nameof(SushiBar.Customer.SushiBarCustomer.OnEventOrderSucceed))]
-internal static class SushiCustomerOrderAuthorityPatch
-{
-    private static bool Prefix() =>
-        ProbeBehaviour.Instance?.AllowSushiAuthority() ?? true;
-}
-
-[HarmonyPatch(typeof(SushiBar.Customer.SushiBarCustomer),
     nameof(SushiBar.Customer.SushiBarCustomer.OrderDrink))]
 internal static class SushiCustomerDrinkOrderAuthorityPatch
 {
