@@ -159,6 +159,7 @@ internal sealed class ManagerEventReplicator
         internal Il2CppSystem.Action<int> ChoiceCallback;
         internal bool UseButton;
         internal bool ShowCurtain;
+        internal bool TutorialOwned;
     }
 
     private sealed class TimelineLease
@@ -216,6 +217,12 @@ internal sealed class ManagerEventReplicator
     private bool _remoteTimeScopeActive;
     private int _hostManagementPanelShown = -1;
     private int _hostManagementPanelFocus = -1;
+    private uint _clientManagementPanelRevision;
+    private int _clientManagementPanelShown = -1;
+    private bool _clientManagementPanelIssued;
+    private int _clientManagementPanelAttempts;
+    private float _nextClientManagementPanelAttempt;
+    private bool _clientManagementPanelFailureLogged;
     private int _suppressPublish;
     private float _nextSushiScan;
     private float _nextProgressionScan;
@@ -225,7 +232,12 @@ internal sealed class ManagerEventReplicator
     private int _pendingClientTutorialStep = -1;
     private int _clientTutorialAppliedStep = -1;
     private uint _clientTutorialAppliedSceneId;
-    private bool _allowClientTutorialActivation;
+    private int _lastClientDialogueFinishedBundleKey;
+    private TutorialHandler _pendingClientTutorialGuide;
+    private int _pendingClientTutorialTextAttempts;
+    private int _pendingClientTutorialPointerAttempts;
+    private float _nextClientTutorialGuideAttempt;
+    private bool _clientTutorialGuideFailureLogged;
     private SushiBarOrderQueue.ProgressData _remoteSushiPlate;
     private bool _clientRemoteSushiPlate;
     private bool _wasConnected;
@@ -352,15 +364,13 @@ internal sealed class ManagerEventReplicator
             ShouldForceScenarioMilestoneKeyframe(
                 false, SessionRole.Host, true, 17, 18))
             throw new InvalidOperationException("Manager scenario keyframe gate self-test failed");
-        if (ShouldAllowNativeTutorialActivation(SessionRole.Client, true, false) ||
-            !ShouldAllowNativeTutorialActivation(SessionRole.Client, true, true) ||
-            !ShouldAllowNativeTutorialActivation(SessionRole.Client, false, false) ||
-            !ShouldAllowNativeTutorialActivation(SessionRole.Host, true, false))
+        if (ShouldAllowNativeTutorialActivation(SessionRole.Client, true) ||
+            !ShouldAllowNativeTutorialActivation(SessionRole.Client, false) ||
+            !ShouldAllowNativeTutorialActivation(SessionRole.Host, true))
             throw new InvalidOperationException("Tutorial activation authority self-test failed");
-        if (!ShouldCompleteTutorialDialogue(17, 17, true) ||
-            ShouldCompleteTutorialDialogue(17, 18, true) ||
-            ShouldCompleteTutorialDialogue(17, 17, false))
-            throw new InvalidOperationException("Tutorial dialogue completion self-test failed");
+        if (!IsTutorialDialogueOwner(17, 17) || IsTutorialDialogueOwner(17, 18) ||
+            IsTutorialDialogueOwner(0, 0))
+            throw new InvalidOperationException("Tutorial dialogue ownership self-test failed");
         if (!ShouldReleaseTutorialPresentation(17, 17, "other") ||
             !ShouldReleaseTutorialPresentation(17, 18, "Tutorial_Test") ||
             ShouldReleaseTutorialPresentation(17, 18, "Story_Test"))
@@ -371,6 +381,11 @@ internal sealed class ManagerEventReplicator
             ShouldPublishManagementPanelState(1, 3, 1, 3) ||
             !ShouldPublishManagementPanelState(1, 3, 0, 3))
             throw new InvalidOperationException("Management panel state self-test failed");
+        if (!ShouldIssueManagementPanelCommand(0, -1, false, 98, 1) ||
+            ShouldIssueManagementPanelCommand(98, 1, true, 98, 1) ||
+            !ShouldIssueManagementPanelCommand(98, 1, true, 99, 1) ||
+            !ShouldIssueManagementPanelCommand(98, 1, true, 98, 0))
+            throw new InvalidOperationException("Management panel command self-test failed");
         if (!CanReleaseSushiManagementSheet(true, false, false, 0, 1) ||
             CanReleaseSushiManagementSheet(false, false, false, 0, 1) ||
             CanReleaseSushiManagementSheet(true, true, false, 0, 1) ||
@@ -379,7 +394,7 @@ internal sealed class ManagerEventReplicator
             CanReleaseSushiManagementSheet(true, false, false, 1, 1))
             throw new InvalidOperationException("Management panel release self-test failed");
         if (!ShouldConsumeUnavailableProgression(ManagerAction.Unlock) ||
-            !ShouldConsumeUnavailableProgression(ManagerAction.TutorialStep) ||
+            ShouldConsumeUnavailableProgression(ManagerAction.TutorialStep) ||
             ShouldConsumeUnavailableProgression(ManagerAction.RewardFirst))
             throw new InvalidOperationException(
                 "Unavailable progression consumption self-test failed");
@@ -421,6 +436,13 @@ internal sealed class ManagerEventReplicator
                 dialogueCancels += choice == -1 ? 1 : 100)
         };
         callbackReplicator.CancelPendingDialogueStart();
+        callbackReplicator.CancelPendingDialogueStart();
+        var tutorialCancels = 0;
+        callbackReplicator._pendingClientDialogueStart = new PendingDialogueStart
+        {
+            TutorialOwned = true,
+            Callback = (Il2CppSystem.Action<bool>)(Action<bool>)(_ => tutorialCancels++)
+        };
         callbackReplicator.CancelPendingDialogueStart();
         var timelineStarts = 0;
         var timelineCancels = 0;
@@ -484,7 +506,7 @@ internal sealed class ManagerEventReplicator
             dialogueScope, DialogueVoteChoiceBase + 2, DialogueVoteSkip);
         var dialogueChoice = PackDialogueChoice(dialogueScope, 2);
         var dialogueVoteText = FormatDialogueVoteText("Choice", 1);
-        if (scenarioCancels != 1 || dialogueCancels != 1 ||
+        if (scenarioCancels != 1 || dialogueCancels != 1 || tutorialCancels != 0 ||
             timelineStarts != 1 || timelineCancels != 1 ||
             dialogueRevision != 0 || dialoguePending.Count != 1 ||
             storyRevision != 2 || applied.Count != 2 || applied[0] != 1 || applied[1] != 2 ||
@@ -744,19 +766,13 @@ internal sealed class ManagerEventReplicator
                 }
                 if (!TryQueuePendingHostEvent(session, lane, state))
                     return;
-                if ((ManagerDomain)state.Domain == ManagerDomain.Progression &&
-                    (ManagerAction)state.Action == ManagerAction.TutorialStep &&
-                    IsValidTutorialStep(state.Value) &&
-                    (TutorialManager.Instance == null || ShouldQueueTutorialReplay(
-                        state.Value, _clientTutorialAppliedStep,
-                        _clientTutorialAppliedSceneId, sceneId)))
-                    _pendingClientTutorialStep = state.Value;
             }
         }
         if (role == SessionRole.Client)
         {
-            TryApplyPendingTutorial(sceneId);
             ApplyPendingHostEvents(session, sceneId);
+            TryApplyPendingTutorial(sceneId);
+            TryShowClientTutorialGuide();
             AlignTimeline();
             while (session.TryTakeSushiResultState(out var state))
                 if (IsNewer(state.Revision, _clientSushiRevision))
@@ -1394,6 +1410,9 @@ internal sealed class ManagerEventReplicator
             InvokeClientPresentationCallback(() => choiceCallback?.Invoke(-1), "dialogue choice");
             return false;
         }
+        var tutorialOwned = IsTutorialDialogueOwner(
+                key, TutorialManager.Instance?.GetHandler()) ||
+            IsTutorialDialogueBundle(bundleId);
         CancelPendingDialogueStart();
         _pendingClientDialogueStart = new PendingDialogueStart
         {
@@ -1406,8 +1425,11 @@ internal sealed class ManagerEventReplicator
             Callback = callback,
             ChoiceCallback = choiceCallback,
             UseButton = useButton,
-            ShowCurtain = showCurtain
+            ShowCurtain = showCurtain,
+            TutorialOwned = tutorialOwned
         };
+        if (tutorialOwned)
+            _log?.LogInfo($"Tutorial dialogue callback retained as host-owned: bundle={key:X8}");
         return false;
     }
 
@@ -1904,7 +1926,8 @@ internal sealed class ManagerEventReplicator
         _pendingClientTutorialStep = -1;
         _clientTutorialAppliedStep = -1;
         _clientTutorialAppliedSceneId = 0;
-        _allowClientTutorialActivation = false;
+        _lastClientDialogueFinishedBundleKey = 0;
+        ClearPendingClientTutorialGuide();
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
         _sushiRevision = 0;
@@ -1933,6 +1956,7 @@ internal sealed class ManagerEventReplicator
         _remoteTimeScopeActive = false;
         _hostManagementPanelShown = -1;
         _hostManagementPanelFocus = -1;
+        ResetClientManagementPanelOperation();
         _suppressPublish = 0;
         _nextSushiScan = 0f;
         _nextProgressionScan = 0f;
@@ -2052,7 +2076,15 @@ internal sealed class ManagerEventReplicator
     internal void OnSceneChanged(SessionRole role)
     {
         if (role == SessionRole.Client)
+        {
             ClearClientTutorialPresentation();
+            ResetClientManagementPanelOperation();
+        }
+        else if (role == SessionRole.Host)
+        {
+            _hostManagementPanelShown = -1;
+            _hostManagementPanelFocus = -1;
+        }
         ResetDialogueVotes();
         ResetDialogueCommit();
         _remoteSushiPlate = null;
@@ -2090,6 +2122,8 @@ internal sealed class ManagerEventReplicator
         }
         _clientTutorialAppliedStep = -1;
         _clientTutorialAppliedSceneId = 0;
+        _lastClientDialogueFinishedBundleKey = 0;
+        ClearPendingClientTutorialGuide();
     }
 
     private void ResetClientTimelineState()
@@ -2114,11 +2148,14 @@ internal sealed class ManagerEventReplicator
         var lane = LaneOf(domain);
         var revision = NextRevision(GetRevision(_hostRevisions, lane));
         _hostRevisions[lane] = revision;
+        var sceneLocal = domain == ManagerDomain.Dialogue &&
+            action == ManagerAction.ManagementPanelState;
         var state = new ManagerEvent(
             revision,
-            IsGlobal(domain) ? 0 : _sceneId,
+            IsGlobal(domain) && !sceneLocal ? 0 : _sceneId,
             CurrentTick(),
-            (byte)domain, (byte)action, value, context, invocation);
+            (byte)domain, (byte)action, value, context, invocation,
+            SceneEpoch: sceneLocal ? session?.LocalSceneEpoch ?? 0 : 0);
         TraceManagerEvent("publish", state, lane, revision, _outboundEvents.Count);
         TryQueueOutbound(session, state);
         FlushOutbound(session);
@@ -2330,7 +2367,7 @@ internal sealed class ManagerEventReplicator
                     return ApplyJungleSushi((ManagerAction)state.Action, state.Value != 0);
                 case ManagerDomain.Dialogue:
                     return ApplyDialogueState(
-                        (ManagerAction)state.Action, state.Value, state.Context,
+                        state.Revision, (ManagerAction)state.Action, state.Value, state.Context,
                         state.Invocation);
                 case ManagerDomain.Scenario:
                     return ApplyScenarioState(
@@ -2504,6 +2541,7 @@ internal sealed class ManagerEventReplicator
     }
 
     private bool ApplyDialogueState(
+        uint revision,
         ManagerAction action,
         int bundleKey,
         int index,
@@ -2513,7 +2551,7 @@ internal sealed class ManagerEventReplicator
         switch (action)
         {
             case ManagerAction.ManagementPanelState:
-                return ApplyManagementPanelState(bundleKey != 0, index);
+                return ApplyManagementPanelState(revision, bundleKey != 0, index);
             case ManagerAction.DialogueStarted:
                 if (manager?.IsPlaying == true &&
                     IsLocalDialogueBundle(manager.CurrentBundleID))
@@ -2553,6 +2591,8 @@ internal sealed class ManagerEventReplicator
                 _clientDialogueIndex = -1;
                 if (bundleKey == 0)
                     return false;
+                if (_lastClientDialogueFinishedBundleKey == bundleKey)
+                    _lastClientDialogueFinishedBundleKey = 0;
                 if (manager?.IsPlaying == true && ContentKey(manager.CurrentBundleID) == bundleKey)
                 {
                     _clientDialogueIndex = manager.m_CurrentDialogueIndex;
@@ -2622,7 +2662,6 @@ internal sealed class ManagerEventReplicator
                     manager.TotalFinishDialogue();
                 if (!CompleteDialogueCallback(bundleKey, index != 0))
                 {
-                    CompleteSynthesizedTutorialDialogue(bundleKey, index != 0);
                     var ui = GlobalUI.Instance;
                     var wasHudOn = ui?.CurMainCanvas?.IsHudOn == true;
                     ui?.ShowHUD(HUDLockType.Dialogue);
@@ -2630,6 +2669,9 @@ internal sealed class ManagerEventReplicator
                         $"Shared dialogue HUD lock released: bundle={bundleKey:X8}; " +
                         $"wasOn={wasHudOn}; nowOn={ui?.CurMainCanvas?.IsHudOn == true}");
                 }
+                _lastClientDialogueFinishedBundleKey = index != 0 ? bundleKey : 0;
+                if (index != 0)
+                    ShowClientTutorialGuide(bundleKey);
                 _clientDialogueBundleKey = 0;
                 _clientDialogueIndex = -1;
                 _clientDialogueSpectating = false;
@@ -2992,24 +3034,18 @@ internal sealed class ManagerEventReplicator
         }
         var pending = _pendingClientDialogueStart;
         _pendingClientDialogueStart = null;
+        if (pending?.TutorialOwned == true)
+        {
+            pending.Callback = null;
+            pending.ChoiceCallback = null;
+            _log?.LogInfo($"Tutorial dialogue callback suppressed: bundle={bundleKey:X8}");
+            return false;
+        }
         var callback = pending?.Callback;
         if (pending != null)
             pending.Callback = null;
         InvokeClientPresentationCallback(() => callback?.Invoke(result), "dialogue");
         return callback != null;
-    }
-
-    private void CompleteSynthesizedTutorialDialogue(int bundleKey, bool result)
-    {
-        var tutorial = TutorialManager.Instance;
-        var handler = tutorial?.GetHandler();
-        var tutorialBundleKey = ContentKey(handler?.startDialogueID);
-        if (!ShouldCompleteTutorialDialogue(bundleKey, tutorialBundleKey, result))
-            return;
-        InvokeClientPresentationCallback(() => handler.FinishDialogue(result), "tutorial dialogue");
-        _log?.LogInfo(
-            $"Shared tutorial dialogue callback completed: bundle={bundleKey:X8}; " +
-            $"step={tutorial.CurrentStep}");
     }
 
     private void CompleteDialogueChoiceCallback(int bundleKey, int choice)
@@ -3023,6 +3059,12 @@ internal sealed class ManagerEventReplicator
             return;
         }
         var callback = _pendingClientDialogueStart?.ChoiceCallback;
+        if (_pendingClientDialogueStart?.TutorialOwned == true)
+        {
+            _pendingClientDialogueStart = null;
+            _log?.LogInfo($"Tutorial dialogue choice callback suppressed: bundle={bundleKey:X8}");
+            return;
+        }
         if (_pendingClientDialogueStart != null)
             _pendingClientDialogueStart.ChoiceCallback = null;
         InvokeClientPresentationCallback(() => callback?.Invoke(choice), "dialogue choice");
@@ -3067,6 +3109,13 @@ internal sealed class ManagerEventReplicator
     {
         var pending = _pendingClientDialogueStart;
         _pendingClientDialogueStart = null;
+        if (pending?.TutorialOwned == true)
+        {
+            pending.Callback = null;
+            pending.ChoiceCallback = null;
+            _log?.LogInfo($"Tutorial dialogue cancellation suppressed: bundle={pending.BundleKey:X8}");
+            return;
+        }
         var callback = pending?.Callback;
         var choiceCallback = pending?.ChoiceCallback;
         if (pending != null)
@@ -3847,8 +3896,6 @@ internal sealed class ManagerEventReplicator
             {
                 if (!IsValidTutorialStep(value))
                     return false;
-                if (TutorialManager.Instance == null)
-                    return ShouldConsumeUnavailableProgression(action);
                 if (ShouldQueueTutorialReplay(
                         value, _clientTutorialAppliedStep,
                         _clientTutorialAppliedSceneId, _sceneId))
@@ -3937,16 +3984,16 @@ internal sealed class ManagerEventReplicator
         value is >= (int)TutorialStep.None and <= (int)TutorialStep.AllDone;
 
     private static bool ShouldConsumeUnavailableProgression(ManagerAction action) =>
-        action is ManagerAction.Unlock or ManagerAction.TutorialStep;
+        action == ManagerAction.Unlock;
 
     private static bool ShouldAllowNativeTutorialActivation(
-        SessionRole role, bool connected, bool controlledActivation) =>
-        role != SessionRole.Client || !connected || controlledActivation;
+        SessionRole role, bool connected) =>
+        role != SessionRole.Client || !connected;
 
     internal bool AllowNativeTutorialActivation(SessionRole role, UdpSession session)
     {
         var allowed = ShouldAllowNativeTutorialActivation(
-            role, session?.Connected == true, _allowClientTutorialActivation);
+            role, session?.Connected == true);
         if (!allowed)
             _log?.LogInfo(
                 $"Duplicate tutorial activation suppressed: " +
@@ -3958,18 +4005,44 @@ internal sealed class ManagerEventReplicator
         int step, int appliedStep, uint appliedScene, uint scene) =>
         step != appliedStep || appliedScene != scene;
 
-    private static bool ShouldCompleteTutorialDialogue(
-        int bundleKey, int tutorialBundleKey, bool result) =>
-        result && bundleKey != 0 && bundleKey == tutorialBundleKey;
+    private static bool IsTutorialDialogueOwner(int bundleKey, int tutorialBundleKey) =>
+        bundleKey != 0 && bundleKey == tutorialBundleKey;
+
+    private static bool IsTutorialDialogueBundle(string bundleId) =>
+        bundleId?.StartsWith("Tutorial_", StringComparison.Ordinal) == true;
+
+    private static bool IsTutorialDialogueOwner(int bundleKey, TutorialHandler root) =>
+        FindTutorialDialogueOwner(bundleKey, root) != null;
+
+    private static TutorialHandler FindTutorialDialogueOwner(int bundleKey, TutorialHandler root)
+    {
+        if (bundleKey == 0 || root == null)
+            return null;
+        var active = root;
+        var activeSeen = new HashSet<int>();
+        while (active != null && activeSeen.Add(active.GetInstanceID()))
+        {
+            if (IsTutorialDialogueOwner(bundleKey, ContentKey(active.startDialogueID)))
+                return active;
+            active = active.m_CurrentBranchTutorial;
+        }
+        var handlers = new List<TutorialHandler>();
+        CollectTutorialHandlers(root, handlers, new HashSet<int>());
+        foreach (var handler in handlers)
+            if (IsTutorialDialogueOwner(bundleKey, ContentKey(handler.startDialogueID)))
+                return handler;
+        return null;
+    }
 
     private static bool ShouldReleaseTutorialPresentation(
         int bundleKey, int tutorialBundleKey, string bundleId) =>
         bundleKey != 0 && (bundleKey == tutorialBundleKey ||
-            bundleId?.StartsWith("Tutorial_", StringComparison.Ordinal) == true);
+            IsTutorialDialogueBundle(bundleId));
 
     private void ReleaseTutorialPresentation(
         TutorialManager tutorial, TutorialHandler handler, bool releaseSushiSheet = true)
     {
+        ClearPendingClientTutorialGuide();
         var handlers = new List<TutorialHandler>();
         CollectTutorialHandlers(handler, handlers, new HashSet<int>());
         foreach (var item in handlers)
@@ -3986,10 +4059,13 @@ internal sealed class ManagerEventReplicator
             }
         }
         tutorial?.HideTutorialUI();
-        var guide = UnityEngine.Object.FindFirstObjectByType<GuideHelperPanel>();
-        guide?.StopAllCoroutines();
-        guide?.HideGuideTextUI();
-        guide?.HideGuidePointerUI();
+        foreach (var guide in UnityEngine.Object.FindObjectsByType<GuideHelperPanel>(
+                     FindObjectsSortMode.None))
+        {
+            guide.StopAllCoroutines();
+            guide.HideGuideTextUI();
+            guide.HideGuidePointerUI();
+        }
         if (releaseSushiSheet)
             ReleaseSushiManagementSheet();
         _log?.LogInfo($"Tutorial presentation owners released: handlers={handlers.Count}");
@@ -4068,11 +4144,21 @@ internal sealed class ManagerEventReplicator
         int previousShown, int previousFocus, int shown, int focus) =>
         previousShown != shown || shown != 0 && previousFocus != focus;
 
+    private static bool ShouldIssueManagementPanelCommand(
+        uint operationRevision,
+        int operationShown,
+        bool issued,
+        uint revision,
+        int shown) =>
+        !issued || operationRevision != revision || operationShown != shown;
+
     private static bool ShouldSyncTutorialManagementPanel(TutorialStep step) =>
         step is >= TutorialStep.Open_Sushi_Ingredient and <= TutorialStep.Close_Sushi_Menu;
 
     private void PublishManagementPanelChanges(UdpSession session)
     {
+        if (_sceneId == 0 || session?.SceneMatches(_sceneId) != true)
+            return;
         var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
         var tutorial = TutorialManager.Instance;
         if (panel == null || tutorial == null)
@@ -4099,31 +4185,112 @@ internal sealed class ManagerEventReplicator
         }
     }
 
-    private bool ApplyManagementPanelState(bool shown, int focus)
+    private bool ApplyManagementPanelState(uint revision, bool shown, int focus)
     {
-        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
-        if (panel == null || focus < 0 || panel.IsTransitioning)
+        if (focus < 0)
             return false;
-        if (shown)
+        var desiredShown = shown ? 1 : 0;
+        if (_clientManagementPanelRevision != revision ||
+            _clientManagementPanelShown != desiredShown)
         {
-            if (!panel.IsShow)
-            {
-                panel.SetActiveSheet(true);
-                _log?.LogInfo($"Tutorial management panel opening: focus={focus}");
-                return false;
-            }
-            panel.SetFocus(Math.Min(
-                focus, Math.Max(panel.m_SheetList?.Count - 1 ?? 0, 0)));
+            _clientManagementPanelRevision = revision;
+            _clientManagementPanelShown = desiredShown;
+            _clientManagementPanelIssued = false;
+            _clientManagementPanelAttempts = 0;
+            _nextClientManagementPanelAttempt = 0f;
+            _clientManagementPanelFailureLogged = false;
         }
-        else if (panel.IsShow)
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        if (panel == null)
         {
-            panel.OnClickClose();
-            _log?.LogInfo("Tutorial management panel closing");
+            var tutorial = TutorialManager.Instance;
+            if (tutorial != null && !ShouldSyncTutorialManagementPanel(tutorial.CurrentStep))
+            {
+                _log?.LogInfo(
+                    $"Tutorial management panel event obsolete: revision={revision}; " +
+                    $"step={tutorial.CurrentStep}");
+                ResetClientManagementPanelOperation();
+                return true;
+            }
             return false;
+        }
+        var sheetCount = panel.m_SheetList?.Count ?? 0;
+        var targetFocus = Math.Min(focus, Math.Max(sheetCount - 1, 0));
+        if (!panel.IsTransitioning && panel.IsShow == shown)
+        {
+            if (shown && (panel.LoadComplete?.Value != true || sheetCount <= 0))
+                return false;
+            if (shown)
+            {
+                panel.SetFocus(targetFocus);
+                if (panel.m_FocusIndex != targetFocus)
+                    return false;
+            }
+            _log?.LogInfo(
+                $"Tutorial management panel applied: revision={revision}; " +
+                $"shown={shown}; focus={panel.m_FocusIndex}");
+            ResetClientManagementPanelOperation();
+            return true;
+        }
+        if (panel.IsTransitioning)
+            return false;
+        if (shown && (panel.LoadComplete?.Value != true || sheetCount <= 0))
+            return false;
+        if (Time.unscaledTime < _nextClientManagementPanelAttempt)
+            return false;
+        if (!ShouldIssueManagementPanelCommand(
+                _clientManagementPanelRevision,
+                _clientManagementPanelShown,
+                _clientManagementPanelIssued,
+                revision,
+                desiredShown))
+            return false;
+        try
+        {
+            _clientManagementPanelAttempts++;
+            if (shown)
+                panel.OnPopupUI(targetFocus);
+            else
+                panel.OnClickClose();
+        }
+        catch (Exception exception)
+        {
+            _clientManagementPanelIssued = false;
+            _nextClientManagementPanelAttempt = Time.unscaledTime +
+                (_clientManagementPanelAttempts >= 3 ? 2f : 0.25f);
+            if (!_clientManagementPanelFailureLogged || _clientManagementPanelAttempts < 3)
+                _log?.LogWarning(
+                    $"Tutorial management panel command failed: revision={revision}; " +
+                    $"attempt={_clientManagementPanelAttempts}; error={exception.Message}");
+            _clientManagementPanelFailureLogged |= _clientManagementPanelAttempts >= 3;
+            return false;
+        }
+        _clientManagementPanelIssued = panel.IsTransitioning || panel.IsShow == shown;
+        if (!_clientManagementPanelIssued)
+        {
+            _nextClientManagementPanelAttempt = Time.unscaledTime +
+                (_clientManagementPanelAttempts >= 3 ? 2f : 0.25f);
+            if (!_clientManagementPanelFailureLogged || _clientManagementPanelAttempts < 3)
+                _log?.LogWarning(
+                    $"Tutorial management panel command ignored: revision={revision}; " +
+                    $"attempt={_clientManagementPanelAttempts}; shown={shown}");
+            _clientManagementPanelFailureLogged |= _clientManagementPanelAttempts >= 3;
         }
         _log?.LogInfo(
-            $"Tutorial management panel applied: shown={shown}; focus={panel.m_FocusIndex}");
-        return true;
+            $"Tutorial management panel command issued: revision={revision}; " +
+            $"shown={shown}; focus={targetFocus}; attempt={_clientManagementPanelAttempts}; " +
+            $"accepted={_clientManagementPanelIssued}");
+        return false;
+    }
+
+    private void ResetClientManagementPanelOperation()
+    {
+        _clientManagementPanelRevision = 0;
+        _clientManagementPanelShown = -1;
+        _clientManagementPanelIssued = false;
+        _clientManagementPanelAttempts = 0;
+        _nextClientManagementPanelAttempt = 0f;
+        _clientManagementPanelFailureLogged = false;
     }
 
     private static bool CanReleaseSushiManagementSheet(
@@ -4219,19 +4386,19 @@ internal sealed class ManagerEventReplicator
         var step = (TutorialStep)_pendingClientTutorialStep;
         var probe = ProbeBehaviour.Instance;
         var previousApplying = _applying;
-        var initialized = false;
+        TutorialHandler handler = null;
         probe?.BeginRemoteMissionApply();
         _applying = true;
         try
         {
             try
             {
-                tutorial.GetHandler()?.DeactivateTutorial();
+                ReleaseTutorialPresentation(tutorial, tutorial.GetHandler(), false);
             }
             catch (Exception exception)
             {
                 _log.LogWarning(
-                    $"Passive tutorial stale handler cleanup failed: step={step}; " +
+                    $"Passive tutorial handler graph cleanup failed: step={step}; " +
                     $"error={exception.Message}");
             }
             tutorial.ApplyStep(step);
@@ -4242,8 +4409,7 @@ internal sealed class ManagerEventReplicator
                 tutorial.ApplyStep(step);
                 tutorial.RefreshTutorialHandler();
             }
-            tutorial.InitActivateTutorial();
-            initialized = true;
+            handler = CurrentTutorialPresentationHandler(tutorial.GetHandler());
         }
         catch (Exception exception)
         {
@@ -4256,29 +4422,172 @@ internal sealed class ManagerEventReplicator
             _applying = previousApplying;
             probe?.EndRemoteMissionApply();
         }
-        if (!initialized)
+        if (handler == null)
             return;
-        try
+        _pendingClientTutorialStep = -1;
+        _clientTutorialAppliedStep = (int)step;
+        _clientTutorialAppliedSceneId = sceneId;
+        var dialogueKey = ContentKey(handler.startDialogueID);
+        if (dialogueKey == 0 || dialogueKey == _lastClientDialogueFinishedBundleKey)
+            ShowClientTutorialGuide(handler);
+        else
         {
-            _allowClientTutorialActivation = true;
-            tutorial.ActivateTutorial();
-            _pendingClientTutorialStep = -1;
-            _clientTutorialAppliedStep = (int)step;
-            _clientTutorialAppliedSceneId = sceneId;
-            _log.LogInfo(
-                $"Shared tutorial runtime activated: step={step}; scene={sceneId}; " +
-                "dialogueAuthority=host");
+            QueueClientTutorialGuide(handler, 1f);
+            _log?.LogInfo(
+                $"Shared tutorial guide fallback armed: handler={handler.name}; " +
+                $"dialogue={dialogueKey:X8}");
         }
-        catch (Exception exception)
+        _log.LogInfo(
+            $"Shared tutorial presentation prepared: step={step}; scene={sceneId}; " +
+            "authority=host");
+    }
+
+    private static TutorialHandler CurrentTutorialPresentationHandler(TutorialHandler root)
+    {
+        var current = root;
+        var seen = new HashSet<int>();
+        while (current?.m_CurrentBranchTutorial != null &&
+               seen.Add(current.GetInstanceID()))
+            current = current.m_CurrentBranchTutorial;
+        return current;
+    }
+
+    private void ShowClientTutorialGuide(int bundleKey) =>
+        QueueClientTutorialGuide(
+            FindTutorialDialogueOwner(bundleKey, TutorialManager.Instance?.GetHandler()));
+
+    private void ShowClientTutorialGuide(TutorialHandler handler) =>
+        QueueClientTutorialGuide(handler);
+
+    private void QueueClientTutorialGuide(TutorialHandler handler, float delay = 0.05f)
+    {
+        if (handler == null)
+            return;
+        _pendingClientTutorialGuide = handler;
+        _pendingClientTutorialTextAttempts = 0;
+        _pendingClientTutorialPointerAttempts = 0;
+        _clientTutorialGuideFailureLogged = false;
+        _nextClientTutorialGuideAttempt = Time.unscaledTime + Math.Max(delay, 0f);
+    }
+
+    private void TryShowClientTutorialGuide()
+    {
+        var handler = _pendingClientTutorialGuide;
+        if (handler == null || _clientDialogueBundleKey != 0 ||
+            DialogueManager.Instance?.IsPlaying == true)
+            return;
+        var expectsText = !string.IsNullOrEmpty(handler.guideTextID);
+        var expectsPointer = handler.guideArrowTarget != null;
+        if (!expectsText && !expectsPointer)
         {
-            _log.LogWarning(
-                $"Shared tutorial activation not ready: step={step}; scene={sceneId}; " +
-                $"error={exception.Message}");
+            ClearPendingClientTutorialGuide();
+            return;
         }
-        finally
+        var panel = FindActiveGuidePanel();
+        if (panel == null ||
+            Time.unscaledTime < _nextClientTutorialGuideAttempt)
+            return;
+
+        var textVisible = IsGuideTextVisible(expectsText);
+        var pointerVisible = IsGuidePointerVisible(expectsPointer);
+        if (!textVisible)
         {
-            _allowClientTutorialActivation = false;
+            try
+            {
+                handler.ShowText();
+                _pendingClientTutorialTextAttempts++;
+            }
+            catch (Exception exception)
+            {
+                _pendingClientTutorialTextAttempts++;
+                _log?.LogWarning(
+                    $"Shared tutorial text attempt failed: handler={handler.name}; " +
+                    $"attempt={_pendingClientTutorialTextAttempts}; error={exception.Message}");
+            }
         }
+        if (!pointerVisible)
+        {
+            try
+            {
+                handler.ShowPointer();
+                _pendingClientTutorialPointerAttempts++;
+            }
+            catch (Exception exception)
+            {
+                _pendingClientTutorialPointerAttempts++;
+                _log?.LogWarning(
+                    $"Shared tutorial pointer attempt failed: handler={handler.name}; " +
+                    $"attempt={_pendingClientTutorialPointerAttempts}; error={exception.Message}");
+            }
+        }
+        textVisible = IsGuideTextVisible(expectsText);
+        pointerVisible = IsGuidePointerVisible(expectsPointer);
+        if (textVisible && pointerVisible)
+        {
+            _log?.LogInfo(
+                $"Shared tutorial guide shown: handler={handler.name}; " +
+                $"text={expectsText}; pointer={expectsPointer}");
+            ClearPendingClientTutorialGuide();
+            return;
+        }
+        if (!_clientTutorialGuideFailureLogged &&
+            (!textVisible && _pendingClientTutorialTextAttempts >= 3 ||
+             !pointerVisible && _pendingClientTutorialPointerAttempts >= 3))
+        {
+            _clientTutorialGuideFailureLogged = true;
+            _log?.LogWarning(
+                $"Shared tutorial guide still hidden: handler={handler.name}; " +
+                $"text={textVisible}/{expectsText}; pointer={pointerVisible}/{expectsPointer}; " +
+                $"rootAlpha={panel.RootCanvasAlpha}");
+        }
+        _nextClientTutorialGuideAttempt = Time.unscaledTime +
+            (_pendingClientTutorialTextAttempts >= 3 ||
+             _pendingClientTutorialPointerAttempts >= 3 ? 2f : 0.25f);
+    }
+
+    private static GuideHelperPanel FindActiveGuidePanel()
+    {
+        foreach (var panel in UnityEngine.Object.FindObjectsByType<GuideHelperPanel>(
+                     FindObjectsSortMode.None))
+            if (panel != null && panel.gameObject?.activeInHierarchy == true &&
+                panel.RootCanvasAlpha > 0f)
+                return panel;
+        return null;
+    }
+
+    private static bool IsGuideTextVisible(bool expected)
+    {
+        if (!expected)
+            return true;
+        foreach (var panel in UnityEngine.Object.FindObjectsByType<GuideHelperPanel>(
+                     FindObjectsSortMode.None))
+            if (panel != null && panel.RootCanvasAlpha > 0f && panel.IsShowGuideText() &&
+                panel.m_CanvasGroup != null && panel.m_CanvasGroup.alpha > 0f &&
+                panel.m_CanvasGroup.gameObject.activeInHierarchy)
+                return true;
+        return false;
+    }
+
+    private static bool IsGuidePointerVisible(bool expected)
+    {
+        if (!expected)
+            return true;
+        foreach (var panel in UnityEngine.Object.FindObjectsByType<GuideHelperPanel>(
+                     FindObjectsSortMode.None))
+            if (panel != null && panel.RootCanvasAlpha > 0f && panel.pointerIcon != null &&
+                panel.pointerIcon.gameObject.activeSelf &&
+                panel.pointerIcon.gameObject.activeInHierarchy)
+                return true;
+        return false;
+    }
+
+    private void ClearPendingClientTutorialGuide()
+    {
+        _pendingClientTutorialGuide = null;
+        _pendingClientTutorialTextAttempts = 0;
+        _pendingClientTutorialPointerAttempts = 0;
+        _nextClientTutorialGuideAttempt = 0f;
+        _clientTutorialGuideFailureLogged = false;
     }
 
     private void PublishWalletIfChanged(UdpSession session, GoodsType type)

@@ -2135,8 +2135,10 @@ internal static class Protocol
         };
         if (!pairIsValid)
             return false;
+        var sceneBoundPanel = state.Domain == 3 && state.Action == 84;
         if ((state.SceneId == 0) != (state.SceneEpoch == 0) ||
-            state.Domain is 3 or 16 or 18 && state.SceneId != 0)
+            state.Domain is 16 or 18 && state.SceneId != 0 ||
+            state.Domain == 3 && (sceneBoundPanel ? state.SceneId == 0 : state.SceneId != 0))
             return false;
         if (state.Action == 32 && (state.Value == 0 || state.Context != 0) ||
             state.Action == 35 &&
@@ -4693,8 +4695,7 @@ internal static class Protocol
             new ManagerEvent(8, 0, 1239, 3, 36, 23456, 3),
             new ManagerEvent(9, 0, 1240, 3, 37, 23456, 1),
             new ManagerEvent(10, 0, 1241, 3, 38, 71, 0),
-            new ManagerEvent(11, 0, 1242, 3, 39, 71, 0),
-            new ManagerEvent(12, 0, 1243, 3, 84, 1, 3)
+            new ManagerEvent(11, 0, 1242, 3, 39, 71, 0)
         };
         for (var index = 0; index < sessionEvents.Length; index++)
         {
@@ -4712,7 +4713,10 @@ internal static class Protocol
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted identity-free dialogue finish");
         managerEventPacket = EncodeManagerEvent(60,
-            new ManagerEvent(12, 0, 1243, 3, 84, 1, 3));
+            new ManagerEvent(12, fishSceneId, 1243, 3, 84, 1, 3, SceneEpoch: 7));
+        if (!TryDecodeManagerEvent(managerEventPacket, out _, out managerEvent) ||
+            managerEvent.SceneId != fishSceneId || managerEvent.SceneEpoch != 7)
+            throw new InvalidOperationException("Management panel state round-trip failed");
         BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 18), 2);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted invalid management panel state");
