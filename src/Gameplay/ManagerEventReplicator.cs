@@ -369,10 +369,12 @@ internal sealed class ManagerEventReplicator
             !ShouldWaitForManagementPanelClose(false, true) ||
             ShouldWaitForManagementPanelClose(false, false))
             throw new InvalidOperationException("Management panel close gate self-test failed");
-        if (!CanReleaseClosedManagementPanel(true, false, false) ||
-            CanReleaseClosedManagementPanel(false, false, false) ||
-            CanReleaseClosedManagementPanel(true, true, false) ||
-            CanReleaseClosedManagementPanel(true, false, true))
+        if (!CanReleaseSushiManagementSheet(true, false, false, 0, 1) ||
+            CanReleaseSushiManagementSheet(false, false, false, 0, 1) ||
+            CanReleaseSushiManagementSheet(true, true, false, 0, 1) ||
+            CanReleaseSushiManagementSheet(true, false, true, 0, 1) ||
+            CanReleaseSushiManagementSheet(true, false, false, -1, 1) ||
+            CanReleaseSushiManagementSheet(true, false, false, 1, 1))
             throw new InvalidOperationException("Management panel release self-test failed");
         if (!ShouldConsumeUnavailableProgression(ManagerAction.Unlock) ||
             !ShouldConsumeUnavailableProgression(ManagerAction.TutorialStep) ||
@@ -2069,7 +2071,7 @@ internal sealed class ManagerEventReplicator
         try
         {
             var tutorial = TutorialManager.Instance;
-            ReleaseTutorialPresentation(tutorial, tutorial?.GetHandler());
+            ReleaseTutorialPresentation(tutorial, tutorial?.GetHandler(), false);
             _log?.LogInfo(
                 $"Client tutorial presentation cleared: step={_clientTutorialAppliedStep}; " +
                 $"scene={_clientTutorialAppliedSceneId}");
@@ -2550,6 +2552,7 @@ internal sealed class ManagerEventReplicator
                 {
                     _clientDialogueIndex = manager.m_CurrentDialogueIndex;
                     _clientDialogueSpectating = false;
+                    FocusSharedDialogueInput(manager, bundleKey);
                     _log?.LogInfo(
                         $"Dialogue client start matched native: bundle={bundleKey:X8}; " +
                         $"node={_clientDialogueIndex}");
@@ -2576,6 +2579,7 @@ internal sealed class ManagerEventReplicator
                 }
                 _clientDialogueSpectating = false;
                 ReplayDialogueStart(manager, _pendingClientDialogueStart);
+                FocusSharedDialogueInput(manager, bundleKey);
                 _log?.LogInfo($"Dialogue client replay started: bundle={bundleKey:X8}");
                 return true;
             case ManagerAction.DialogueNode:
@@ -3954,7 +3958,7 @@ internal sealed class ManagerEventReplicator
             bundleId?.StartsWith("Tutorial_", StringComparison.Ordinal) == true);
 
     private void ReleaseTutorialPresentation(
-        TutorialManager tutorial, TutorialHandler handler)
+        TutorialManager tutorial, TutorialHandler handler, bool releaseSushiSheet = true)
     {
         var handlers = new List<TutorialHandler>();
         CollectTutorialHandlers(handler, handlers, new HashSet<int>());
@@ -3976,7 +3980,8 @@ internal sealed class ManagerEventReplicator
         guide?.StopAllCoroutines();
         guide?.HideGuideTextUI();
         guide?.HideGuidePointerUI();
-        ReleaseSushiManagementSheet();
+        if (releaseSushiSheet)
+            ReleaseSushiManagementSheet();
         _log?.LogInfo($"Tutorial presentation owners released: handlers={handlers.Count}");
     }
 
@@ -4053,27 +4058,59 @@ internal sealed class ManagerEventReplicator
         bool isShown, bool isTransitioning) =>
         isShown || isTransitioning;
 
-    private static bool CanReleaseClosedManagementPanel(
-        bool exists, bool isShown, bool isTransitioning) =>
-        exists && !isShown && !isTransitioning;
+    private static bool CanReleaseSushiManagementSheet(
+        bool exists,
+        bool isShown,
+        bool isTransitioning,
+        int focusIndex,
+        int sheetCount) =>
+        exists && !isShown && !isTransitioning &&
+        focusIndex >= 0 && focusIndex < sheetCount;
 
     private void ReleaseSushiManagementSheet()
     {
+        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        var sheetCount = panel?.m_SheetList?.Count ?? 0;
+        var canRelease = CanReleaseSushiManagementSheet(
+            panel != null,
+            panel?.IsShow == true,
+            panel?.IsTransitioning == true,
+            panel?.m_FocusIndex ?? -1,
+            sheetCount);
         var helper = UnityEngine.Object.FindFirstObjectByType<SushiBarTutorialHelper>();
-        if (helper != null)
+        if (helper != null && canRelease)
         {
             if (helper.m_Coroutine != null)
                 helper.StopCoroutine(helper.m_Coroutine);
             helper.SetBlockCurrentManagementSheet(false);
         }
-        var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
-        if (CanReleaseClosedManagementPanel(
-                panel != null, panel?.IsShow == true, panel?.IsTransitioning == true))
+        if (canRelease)
             panel.EnaableMenuScroller(true);
         _log?.LogInfo(
             $"Sushi tutorial sheet released: helper={helper != null}; " +
             $"panel={panel != null}; shown={panel?.IsShow == true}; " +
-            $"transitioning={panel?.IsTransitioning == true}");
+            $"transitioning={panel?.IsTransitioning == true}; " +
+            $"focus={panel?.m_FocusIndex ?? -1}/{sheetCount}; released={canRelease}");
+    }
+
+    private void FocusSharedDialogueInput(DialogueManager manager, int bundleKey)
+    {
+        var input = manager?._inputAsset;
+        var handler = manager?.handler;
+        if (input == null || handler == null)
+        {
+            _log?.LogWarning(
+                $"Shared dialogue input focus unavailable: bundle={bundleKey:X8}; " +
+                $"input={input != null}; handler={handler != null}");
+            return;
+        }
+        var previous = input.currentHandler;
+        input.currentHandler = handler;
+        _log?.LogInfo(
+            $"Shared dialogue input focused: bundle={bundleKey:X8}; " +
+            $"previous={previous?.GetType().Name ?? "none"}; " +
+            $"current={input.currentHandler?.GetType().Name ?? "none"}; " +
+            $"dialogueHandlerEmpty={handler.IsEmpty}");
     }
 
     private bool WaitForManagementPanelClose()
