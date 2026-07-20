@@ -476,6 +476,7 @@ public sealed class ProbeBehaviour : MonoBehaviour
 
     private void LateUpdate()
     {
+        _managerEventReplicator?.MaintainSharedDialogueInput(Role, _session);
         _travelCoordinator?.LateUpdate();
         _fishReplicator?.LateUpdate();
     }

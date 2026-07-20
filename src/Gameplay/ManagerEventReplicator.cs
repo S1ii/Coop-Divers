@@ -615,6 +615,9 @@ internal sealed class ManagerEventReplicator
              !DialogueVotesMatch(DialogueVoteContinue, DialogueVoteContinue) ||
              DialogueVotesMatch(DialogueVoteContinue, DialogueVoteSkip) ||
              DialogueVotesMatch(0, 0) ||
+             !IsDialogueVoteCodeValid(DialogueVoteFinish) ||
+             IsDialogueVoteCodeValid(0) ||
+             IsDialogueVoteCodeValid(0x80) ||
              StripDialogueVoteText(dialogueVoteText) != "Choice" ||
              FormatDialogueVoteText(dialogueVoteText, 2) != "Choice  2/2" ||
              GetTimelineTargets()[0] == null || GetTimelineTargets()[1] == null ||
@@ -2646,9 +2649,14 @@ internal sealed class ManagerEventReplicator
                         $"scope={voteScope}; live={DialogueVoteScope(manager)}");
                     return true;
                 }
-                if (hostVote != 0 && !IsDialogueVoteValid(manager, hostVote) ||
-                    clientVote != 0 && !IsDialogueVoteValid(manager, clientVote))
+                if (hostVote != 0 && !IsDialogueVoteCodeValid(hostVote) ||
+                    clientVote != 0 && !IsDialogueVoteCodeValid(clientVote))
+                {
+                    _log?.LogWarning(
+                        $"Dialogue votes rejected: bundle={bundleKey:X8}; scope={voteScope}; " +
+                        $"host={hostVote}; client={clientVote}");
                     return true;
+                }
                 SetDialogueVoteScope(bundleKey, voteScope);
                 _hostDialogueVote = hostVote;
                 _clientDialogueVote = clientVote;
@@ -4113,6 +4121,31 @@ internal sealed class ManagerEventReplicator
             $"dialogueHandlerEmpty={handler.IsEmpty}");
     }
 
+    internal void MaintainSharedDialogueInput(SessionRole role, UdpSession session)
+    {
+        if (session?.Connected != true)
+            return;
+        var manager = DialogueManager.Instance;
+        var bundleKey = role == SessionRole.Host
+            ? _hostDialogueBundleKey
+            : _clientDialogueBundleKey;
+        if (manager?.IsPlaying != true || bundleKey == 0 ||
+            IsLocalDialogueBundle(manager.CurrentBundleID) ||
+            ContentKey(manager.CurrentBundleID) != bundleKey ||
+            manager._inputAsset == null || manager.handler == null)
+            return;
+        var previous = manager._inputAsset.currentHandler;
+        if (previous != null && previous.Pointer == manager.handler.Pointer)
+            return;
+        manager._inputAsset.currentHandler = manager.handler;
+        var management = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
+        _log?.LogWarning(
+            $"Shared dialogue input focus recovered: role={role}; bundle={bundleKey:X8}; " +
+            $"previous=0x{previous?.Pointer.ToInt64() ?? 0:X}; " +
+            $"dialogue=0x{manager.handler.Pointer.ToInt64():X}; " +
+            $"managementOwner={previous != null && management?.handler != null && previous.Pointer == management.handler.Pointer}");
+    }
+
     private bool WaitForManagementPanelClose()
     {
         var panel = UnityEngine.Object.FindFirstObjectByType<ManagementPanel>();
@@ -4328,6 +4361,9 @@ internal sealed class ManagerEventReplicator
 
     private static bool DialogueVotesMatch(int hostVote, int clientVote) =>
         hostVote != 0 && hostVote == clientVote;
+
+    private static bool IsDialogueVoteCodeValid(int vote) =>
+        vote > 0 && vote <= 0x7f;
 
     private static bool IsDialogueVoteValid(DialogueManager manager, int vote)
     {
