@@ -108,6 +108,10 @@ public sealed class ProbeBehaviour : MonoBehaviour
             ShouldEmitSessionDesyncDump(
                 SessionRole.Host, true, true, 7, 11, 0))
             throw new InvalidOperationException("Session desync dump gate self-test failed");
+        if (ShouldAbortRoleSwitchAfterRestoreFailure(SessionRole.Offline) ||
+            !ShouldAbortRoleSwitchAfterRestoreFailure(SessionRole.Host) ||
+            !ShouldAbortRoleSwitchAfterRestoreFailure(SessionRole.Client))
+            throw new InvalidOperationException("Profile restore role-switch self-test failed");
     }
 
     private void Start()
@@ -740,7 +744,8 @@ public sealed class ProbeBehaviour : MonoBehaviour
         }
 
         if (restoreOriginalProfile &&
-            !MultiplayerSaveSync.TryRestoreOriginalProfile(Logger))
+            !MultiplayerSaveSync.TryRestoreOriginalProfile(Logger) &&
+            ShouldAbortRoleSwitchAfterRestoreFailure(role))
         {
             replacement.Dispose();
             error = MultiplayerSaveSync.Status;
@@ -766,6 +771,9 @@ public sealed class ProbeBehaviour : MonoBehaviour
         Logger.LogInfo($"Network identity: {_localName}; build={_buildId:X8}; role={Role}");
         return true;
     }
+
+    private static bool ShouldAbortRoleSwitchAfterRestoreFailure(SessionRole nextRole) =>
+        nextRole != SessionRole.Offline;
 
     internal string TitlePlayerName => _localName;
     internal string TitleLanAddress => LobbyInput.FindLanAddress();

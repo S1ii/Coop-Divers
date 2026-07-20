@@ -182,14 +182,6 @@ internal static class SushiCustomerOrderStartAuthorityPatch
 }
 
 [HarmonyPatch(typeof(SushiBar.Customer.SushiBarCustomer),
-    nameof(SushiBar.Customer.SushiBarCustomer.OrderInternal))]
-internal static class SushiCustomerOrderInternalAuthorityPatch
-{
-    private static bool Prefix() =>
-        ProbeBehaviour.Instance?.AllowSushiAuthority() ?? true;
-}
-
-[HarmonyPatch(typeof(SushiBar.Customer.SushiBarCustomer),
     nameof(SushiBar.Customer.SushiBarCustomer.TryOrder))]
 internal static class SushiCustomerTryOrderAuthorityPatch
 {

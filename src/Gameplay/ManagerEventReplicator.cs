@@ -388,6 +388,10 @@ internal sealed class ManagerEventReplicator
             ShouldForceStorySafetyKeyframe(true, true, 0f, 6f) ||
             ShouldForceStorySafetyKeyframe(true, true, 6f, 5f))
             throw new InvalidOperationException("Manager story safety keyframe gate self-test failed");
+        if (!ShouldPublishSushiOpenSnapshot(false, true) ||
+            ShouldPublishSushiOpenSnapshot(true, true) ||
+            ShouldPublishSushiOpenSnapshot(false, false))
+            throw new InvalidOperationException("Sushi open snapshot self-test failed");
         if (!ShouldScheduleReconnectKeyframe(SessionRole.Host, false, true) ||
             ShouldScheduleReconnectKeyframe(SessionRole.Host, true, true) ||
             ShouldScheduleReconnectKeyframe(SessionRole.Host, false, false) ||
@@ -3971,8 +3975,15 @@ internal sealed class ManagerEventReplicator
 
     private void PublishSushiRuntimeChanges(UdpSession session)
     {
-        if (UnityEngine.Object.FindFirstObjectByType<SushiBarManager>() == null)
+        var manager = UnityEngine.Object.FindFirstObjectByType<SushiBarManager>();
+        if (manager == null)
             return;
+        if (ShouldPublishSushiOpenSnapshot(_hostSushiOpened, true))
+        {
+            _hostSushiOpened = true;
+            Publish(session, ManagerDomain.MainSushi, ManagerAction.Start, 0, 0);
+            _log?.LogInfo("Sushi open inferred from active SushiBarManager");
+        }
         try
         {
             var customerKeyframe = Time.unscaledTime >= _nextSushiCustomerKeyframe;
@@ -4099,6 +4110,10 @@ internal sealed class ManagerEventReplicator
             _log.LogWarning($"Sushi runtime read failed: {exception.Message}");
         }
     }
+
+    private static bool ShouldPublishSushiOpenSnapshot(
+        bool hostSushiOpened, bool managerPresent) =>
+        managerPresent && !hostSushiOpened;
 
     private static bool ApplyMenuState(ManagerAction action, int value, int slotId)
     {
