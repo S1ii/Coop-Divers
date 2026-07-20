@@ -1812,7 +1812,7 @@ internal static class Protocol
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
         if (state.Domain == 0 || state.Domain > 18 || state.Action == 0 ||
-            state.Action > (byte)ManagerAction.DialogueChoice)
+            state.Action > (byte)ManagerAction.ManagementPanelState)
             throw new ArgumentOutOfRangeException(nameof(state));
         var invocationSize = 0;
         if (state.Invocation is { } invocation &&
@@ -2118,7 +2118,7 @@ internal static class Protocol
         var pairIsValid = state.Domain switch
         {
             1 or 2 => state.Action is 1 or 2 or 3,
-            3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39 or 82 or 83,
+            3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39 or 82 or 83 or 84,
             4 or 5 or 6 or 7 => state.Action == 8,
             8 => state.Action is 9 or 10 or 11 or >= 71 and <= 74,
             9 => state.Action is 8 or 77,
@@ -2145,6 +2145,7 @@ internal static class Protocol
             state.Action == 33 && (state.Value == 0 || state.Context == 0) ||
             state.Action == 36 && (state.Value == 0 || state.Context < 0) ||
             state.Action is 82 or 83 && (state.Value == 0 || state.Context < 0) ||
+            state.Action == 84 && (state.Value is not 0 and not 1 || state.Context < 0) ||
             (state.Action is 34 or 37) &&
                 (state.Value == 0 || state.Context is not 0 and not 1))
             return false;
@@ -4692,7 +4693,8 @@ internal static class Protocol
             new ManagerEvent(8, 0, 1239, 3, 36, 23456, 3),
             new ManagerEvent(9, 0, 1240, 3, 37, 23456, 1),
             new ManagerEvent(10, 0, 1241, 3, 38, 71, 0),
-            new ManagerEvent(11, 0, 1242, 3, 39, 71, 0)
+            new ManagerEvent(11, 0, 1242, 3, 39, 71, 0),
+            new ManagerEvent(12, 0, 1243, 3, 84, 1, 3)
         };
         for (var index = 0; index < sessionEvents.Length; index++)
         {
@@ -4709,6 +4711,11 @@ internal static class Protocol
         BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 18), 0);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted identity-free dialogue finish");
+        managerEventPacket = EncodeManagerEvent(60,
+            new ManagerEvent(12, 0, 1243, 3, 84, 1, 3));
+        BinaryPrimitives.WriteInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 18), 2);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid management panel state");
         var progressionEvents = new[]
         {
             new ManagerEvent(12, 0, 1243, 17, 40, 100, 1),
