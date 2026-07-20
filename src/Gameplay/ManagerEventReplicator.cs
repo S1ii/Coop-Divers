@@ -349,7 +349,7 @@ internal sealed class ManagerEventReplicator
     {
         var drinkResult = PackDrinkResult(QTEResult.Perfect, 1250);
         var drinkOrder = PackDrinkOrder(QTEType.GreenTea, 17.5f);
-        var customerIdentity = PackSushiCustomerIdentity(200101, 17);
+        var customerTarget = PackSushiCustomerTarget(SushiBar.Place.Branch, 7, 17);
         if (!TryUnpackDrinkResult(
                 drinkResult, out var unpackedDrinkResult, out var unpackedDrinkPay) ||
             unpackedDrinkResult != QTEResult.Perfect || unpackedDrinkPay != 1250 ||
@@ -358,9 +358,11 @@ internal sealed class ManagerEventReplicator
                 drinkOrder, out var unpackedDrinkType, out var unpackedDrinkWait) ||
             unpackedDrinkType != QTEType.GreenTea ||
             MathF.Abs(unpackedDrinkWait - 17.5f) > 0.01f ||
-            !TryUnpackSushiCustomerIdentity(
-                customerIdentity, out var unpackedTid, out var unpackedGeneration) ||
-            unpackedTid != 200101 || unpackedGeneration != 17)
+            !TryUnpackSushiCustomerTarget(
+                customerTarget, out var unpackedPlace, out var unpackedSeat,
+                out var unpackedGeneration) ||
+            unpackedPlace != SushiBar.Place.Branch || unpackedSeat != 7 ||
+            unpackedGeneration != 17)
             throw new InvalidOperationException("Sushi drink protocol self-test failed");
         if (!IsLocalTimeScope(TimeScaleController.Type.PauseMenumAuto) ||
             IsLocalTimeScope(TimeScaleController.Type.InGameQTE) ||
@@ -2102,6 +2104,31 @@ internal sealed class ManagerEventReplicator
 
     internal void Clear(bool preserveHostSessions = false)
     {
+        if (!preserveHostSessions && _clientDialogueBundleKey != 0 &&
+            DialogueManager.Instance?.IsPlaying == true)
+        {
+            var previousApplying = _applying;
+            var previousDialogueAuthority = _applyingDialogueAuthority;
+            try
+            {
+                _applying = true;
+                _applyingDialogueAuthority = true;
+                DialogueManager.Instance.TotalFinishDialogue();
+                _log?.LogInfo(
+                    $"Stale shared dialogue closed on session reset: " +
+                    $"bundle={_clientDialogueBundleKey:X8}");
+            }
+            catch (Exception exception)
+            {
+                _log?.LogWarning(
+                    $"Stale shared dialogue cleanup failed: {exception.Message}");
+            }
+            finally
+            {
+                _applying = previousApplying;
+                _applyingDialogueAuthority = previousDialogueAuthority;
+            }
+        }
         if (HasClientOriginals())
         {
             _restorePending = true;
@@ -3621,8 +3648,20 @@ internal sealed class ManagerEventReplicator
     {
         if (!_clientSushiOpened)
             return false;
-        if (!TryUnpackSushiTarget(target, out var place, out var seat))
+        var generation = 0;
+        SushiBar.Place place;
+        int seat;
+        if (action == ManagerAction.SushiCustomerUpsert)
+        {
+            if (value <= 0 || !TryUnpackSushiCustomerTarget(
+                    target, out place, out seat, out generation))
+                return true;
+            target = PackSushiTarget(place, seat);
+        }
+        else if (!TryUnpackSushiTarget(target, out place, out seat))
+        {
             return true;
+        }
         var manager = SushiBar.Customer.SushiBarCustomerManager.Instance;
         var impl = manager?.GetImpl(place);
         if (manager == null || impl == null)
@@ -3630,8 +3669,7 @@ internal sealed class ManagerEventReplicator
         var customer = manager.GetVisitCustomer(seat, place);
         if (action == ManagerAction.SushiCustomerUpsert)
         {
-            if (!TryUnpackSushiCustomerIdentity(value, out var tid, out var generation))
-                return true;
+            var tid = value;
             _clientSushiGenerations[target] = generation;
             if (customer != null && customer.Entity == null)
                 return false;
@@ -3904,17 +3942,23 @@ internal sealed class ManagerEventReplicator
             ? (uint)generation
             : 0;
 
-    private static int PackSushiCustomerIdentity(int tid, int generation) =>
-        tid is > 0 and <= 0xfffff && generation is > 0 and <= 0x7ff
-            ? generation << 20 | tid
-            : -1;
-
-    private static bool TryUnpackSushiCustomerIdentity(
-        int packed, out int tid, out int generation)
+    private static int PackSushiCustomerTarget(
+        SushiBar.Place place, int seat, int generation)
     {
-        tid = packed & 0xfffff;
-        generation = (int)((uint)packed >> 20);
-        return packed > 0 && tid > 0 && generation is > 0 and <= 0x7ff;
+        var target = PackSushiTarget(place, seat);
+        return target >= 0 && generation is > 0 and <= 0x7ff
+            ? generation << 17 | target
+            : -1;
+    }
+
+    private static bool TryUnpackSushiCustomerTarget(
+        int packed, out SushiBar.Place place, out int seat, out int generation)
+    {
+        place = SushiBar.Place.Main;
+        seat = 0;
+        generation = (int)((uint)packed >> 17);
+        return packed >= 0 && generation is > 0 and <= 0x7ff &&
+            TryUnpackSushiTarget(packed & 0x1ffff, out place, out seat);
     }
 
     private static bool TryUnpackSushiTarget(
@@ -3968,9 +4012,17 @@ internal sealed class ManagerEventReplicator
                         ManagerAction.SushiCustomerExit, 0, target);
                 if (!known)
                 {
+                    var customerTarget = PackSushiCustomerTarget(
+                        customer.PlaceTag, customer.SeatNumber, current.Generation);
+                    if (customerTarget < 0)
+                    {
+                        _log?.LogError(
+                            $"Sushi customer publish rejected locally: tid={current.Tid}; " +
+                            $"generation={current.Generation}; target={target}");
+                        continue;
+                    }
                     Publish(session, ManagerDomain.SushiMenu,
-                        ManagerAction.SushiCustomerUpsert,
-                        PackSushiCustomerIdentity(current.Tid, current.Generation), target);
+                        ManagerAction.SushiCustomerUpsert, current.Tid, customerTarget);
                     _log?.LogInfo(
                         $"Sushi customer published: tid={current.Tid}; " +
                         $"generation={current.Generation}; target={target}");

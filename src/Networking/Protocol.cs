@@ -668,7 +668,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 54;
+    private const byte Version = 55;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -2224,12 +2224,14 @@ internal static class Protocol
             if (request != (state.Revision == 0))
                 return false;
             var validTarget = state.Context >= 0 && ((uint)state.Context >> 16) < 2;
-            var validCustomerIdentity = (state.Value & 0xfffff) > 0 &&
-                ((uint)state.Value >> 20) is >= 1 and <= 0x7ff;
+            var customerTarget = state.Context & 0x1ffff;
+            var validCustomerTarget = state.Context >= 0 && state.Value > 0 &&
+                ((uint)state.Context >> 17) is >= 1 and <= 0x7ff &&
+                ((uint)customerTarget >> 16) < 2;
             var validDrinkResult = state.Value >= 0 && (state.Value & 3) <= 2 &&
                 ((uint)state.Value >> 2) <= 1_000_000;
             if (state.Action == 85 && (state.Value != 0 || state.Context != 0) ||
-                state.Action == 86 && (!validCustomerIdentity || !validTarget) ||
+                state.Action == 86 && !validCustomerTarget ||
                 state.Action == 87 && (state.Value is not 0 and not 1 || !validTarget) ||
                 state.Action == 88 && (state.Value < 0 || !validTarget) ||
                 state.Action == 89 && (state.Value < 0 || !validTarget) ||
@@ -4789,7 +4791,7 @@ internal static class Protocol
             new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5, SceneEpoch: 7),
             new ManagerEvent(0, fishSceneId, 1254, 1, 85, 0, 0, SceneEpoch: 7),
             new ManagerEvent(17, fishSceneId, 1255, 8, 86,
-                (17 << 20) | 200101, 7, SceneEpoch: 7),
+                9020028, (17 << 17) | (1 << 16) | 7, SceneEpoch: 7),
             new ManagerEvent(18, fishSceneId, 1256, 8, 88, 1011001, 7, SceneEpoch: 7),
             new ManagerEvent(19, fishSceneId, 1257, 8, 89, (1750 << 16) | 2, 7,
                 SceneEpoch: 7),
