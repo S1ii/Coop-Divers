@@ -668,7 +668,7 @@ internal readonly record struct SushiResultState(
 internal static class Protocol
 {
     private const uint Magic = 0x504D5444; // DTMP
-    private const byte Version = 53;
+    private const byte Version = 54;
     internal const int HeaderSize = 18;
     private const int SnapshotSize = HeaderSize + 45;
     private const int DiverRuntimePayloadSize = 50;
@@ -1812,7 +1812,7 @@ internal static class Protocol
     internal static byte[] EncodeManagerEvent(uint sequence, ManagerEvent state)
     {
         if (state.Domain == 0 || state.Domain > 18 || state.Action == 0 ||
-            state.Action > (byte)ManagerAction.ManagementPanelState)
+            state.Action > (byte)ManagerAction.SushiDrinkServeResult)
             throw new ArgumentOutOfRangeException(nameof(state));
         var invocationSize = 0;
         if (state.Invocation is { } invocation &&
@@ -2117,10 +2117,11 @@ internal static class Protocol
     {
         var pairIsValid = state.Domain switch
         {
-            1 or 2 => state.Action is 1 or 2 or 3,
+            1 => state.Action is 1 or 2 or 3 or 85,
+            2 => state.Action is 1 or 2 or 3,
             3 => state.Action is 4 or 5 or 6 or 7 or 35 or 36 or 37 or 38 or 39 or 82 or 83 or 84,
             4 or 5 or 6 or 7 => state.Action == 8,
-            8 => state.Action is 9 or 10 or 11 or >= 71 and <= 74,
+            8 => state.Action is 9 or 10 or 11 or >= 71 and <= 74 or >= 86 and <= 91,
             9 => state.Action is 8 or 77,
             10 => state.Action is 12 or 75 or 76,
             11 => state.Action is >= 13 and <= 20 or >= 28 and <= 30,
@@ -2208,12 +2209,34 @@ internal static class Protocol
             var validTarget = state.Context >= 0 && ((uint)state.Context >> 16) < 2;
             if (state.Action == 71 && (state.Value is < 0 or > 1 || state.Context != 0) ||
                 state.Action == 72 && (state.Value < 0 || !validTarget) ||
-                state.Action == 73 && (state.Value != 0 || !validTarget) ||
-                state.Action == 74 && (state.Value is not 0 and not 1 || !validTarget) ||
+                state.Action == 73 &&
+                    (state.Value != 0 || !validTarget || state.HostTick is < 1 or > 0x7ff) ||
+                state.Action == 74 && (state.Value is < 0 or > 2 || !validTarget) ||
                 state.Action == 75 && (state.Value is < 0 or > 1_000_000 || !validTarget) ||
                 state.Action == 76 && (state.Value is < -1 or > 1_000_000 || !validTarget) ||
                 state.Action == 77 &&
                     (state.Value is < 0 or > 1 || state.Context is < 1 or > 1000))
+                return false;
+        }
+        if (state.Action is >= 85 and <= 91)
+        {
+            var request = state.Action is 85 or 90;
+            if (request != (state.Revision == 0))
+                return false;
+            var validTarget = state.Context >= 0 && ((uint)state.Context >> 16) < 2;
+            var validCustomerIdentity = (state.Value & 0xfffff) > 0 &&
+                ((uint)state.Value >> 20) is >= 1 and <= 0x7ff;
+            var validDrinkResult = state.Value >= 0 && (state.Value & 3) <= 2 &&
+                ((uint)state.Value >> 2) <= 1_000_000;
+            if (state.Action == 85 && (state.Value != 0 || state.Context != 0) ||
+                state.Action == 86 && (!validCustomerIdentity || !validTarget) ||
+                state.Action == 87 && (state.Value is not 0 and not 1 || !validTarget) ||
+                state.Action == 88 && (state.Value < 0 || !validTarget) ||
+                state.Action == 89 && (state.Value < 0 || !validTarget) ||
+                state.Action == 90 &&
+                    (!validDrinkResult || !validTarget || state.HostTick is < 1 or > 0x7ff) ||
+                state.Action == 91 &&
+                    (state.Value != -1 && !validDrinkResult || !validTarget))
                 return false;
         }
         return true;
@@ -4760,10 +4783,21 @@ internal static class Protocol
             new ManagerEvent(15, fishSceneId, 1248, 8, 72, 1011001, (1 << 16) | 7,
                 SceneEpoch: 7),
             new ManagerEvent(0, fishSceneId, 1249, 8, 73, 0, (1 << 16) | 7, SceneEpoch: 7),
-            new ManagerEvent(16, fishSceneId, 1250, 8, 74, 1, (1 << 16) | 7, SceneEpoch: 7),
+            new ManagerEvent(16, fishSceneId, 1250, 8, 74, 2, (1 << 16) | 7, SceneEpoch: 7),
             new ManagerEvent(0, fishSceneId, 1251, 10, 75, 100, 7, SceneEpoch: 7),
             new ManagerEvent(16, fishSceneId, 1252, 10, 76, 100, 7, SceneEpoch: 7),
-            new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5, SceneEpoch: 7)
+            new ManagerEvent(0, fishSceneId, 1253, 9, 77, 0, 5, SceneEpoch: 7),
+            new ManagerEvent(0, fishSceneId, 1254, 1, 85, 0, 0, SceneEpoch: 7),
+            new ManagerEvent(17, fishSceneId, 1255, 8, 86,
+                (17 << 20) | 200101, 7, SceneEpoch: 7),
+            new ManagerEvent(18, fishSceneId, 1256, 8, 88, 1011001, 7, SceneEpoch: 7),
+            new ManagerEvent(19, fishSceneId, 1257, 8, 89, (1750 << 16) | 2, 7,
+                SceneEpoch: 7),
+            new ManagerEvent(0, fishSceneId, 1258, 8, 90, (1250 << 2) | 2, 7,
+                SceneEpoch: 7),
+            new ManagerEvent(20, fishSceneId, 1259, 8, 91, (1250 << 2) | 2, 7,
+                SceneEpoch: 7),
+            new ManagerEvent(21, fishSceneId, 1260, 8, 87, 1, 7, SceneEpoch: 7)
         };
         foreach (var sushiActionEvent in sushiActionEvents)
         {
@@ -4772,6 +4806,12 @@ internal static class Protocol
                 managerEvent != sushiActionEvent)
                 throw new InvalidOperationException("Sushi action event round-trip failed");
         }
+        managerEventPacket = EncodeManagerEvent(62, sushiActionEvents[^2]);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            managerEventPacket.AsSpan(HeaderSize + 18), (1250 << 2) | 3);
+        if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
+            throw new InvalidOperationException("Protocol accepted invalid sushi drink result");
+        managerEventPacket = EncodeManagerEvent(62, sushiActionEvents[^1]);
         BinaryPrimitives.WriteUInt32LittleEndian(managerEventPacket.AsSpan(HeaderSize + 8), 0);
         if (TryDecodeManagerEvent(managerEventPacket, out _, out _))
             throw new InvalidOperationException("Protocol accepted manager event without scene epoch");

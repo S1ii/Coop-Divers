@@ -6,6 +6,7 @@ using DR.GameData;
 using DR.Save;
 using HarmonyLib;
 using Il2CppInterop.Runtime.InteropTypes;
+using SushiBar.QTE;
 using TMPro;
 using UnityEngine;
 
@@ -91,7 +92,14 @@ internal enum ManagerAction : byte
     TutorialStep = 81,
     DialogueVote = 82,
     DialogueChoice = 83,
-    ManagementPanelState = 84
+    ManagementPanelState = 84,
+    SushiOpenRequest = 85,
+    SushiCustomerUpsert = 86,
+    SushiCustomerExit = 87,
+    SushiCustomerOrder = 88,
+    SushiCustomerDrinkOrder = 89,
+    SushiDrinkCommitRequest = 90,
+    SushiDrinkServeResult = 91
 }
 
 internal sealed class ManagerEventReplicator
@@ -112,6 +120,9 @@ internal sealed class ManagerEventReplicator
 
     private readonly record struct MenuSlotState(
         int RecipeId, int NowCount, int MaxCount, int Flags);
+
+    private readonly record struct SushiCustomerState(
+        int Tid, int Generation, int InstanceId, int RecipeId, int Drink, bool Exiting);
 
     private enum ScenarioStartKind { Normal, Branch }
     internal enum DialogueStartKind { Normal, Arguments, Small, VisualNovel }
@@ -206,6 +217,10 @@ internal sealed class ManagerEventReplicator
     private readonly Dictionary<ManagerDomain, uint> _clientManagerRevisions = new();
     private readonly Dictionary<ManagerDomain, uint> _lastBlockedTraceRevisions = new();
     private readonly Dictionary<int, MenuSlotState> _hostMenuSlots = new();
+    private readonly Dictionary<int, SushiCustomerState> _hostSushiCustomers = new();
+    private readonly Dictionary<int, int> _pendingClientSushiCustomers = new();
+    private readonly Dictionary<int, float> _pendingClientSushiCustomerSince = new();
+    private readonly Dictionary<int, int> _clientSushiGenerations = new();
     private readonly int[] _hostWasabi = new int[(int)SushiBar.Place.Max];
     private uint _sushiRevision;
     private uint _clientSushiRevision;
@@ -225,6 +240,7 @@ internal sealed class ManagerEventReplicator
     private bool _clientManagementPanelFailureLogged;
     private int _suppressPublish;
     private float _nextSushiScan;
+    private float _nextSushiCustomerKeyframe;
     private float _nextProgressionScan;
     private readonly int[] _hostWallet = new int[6];
     private readonly Dictionary<int, byte> _hostUnlocks = new();
@@ -240,6 +256,15 @@ internal sealed class ManagerEventReplicator
     private bool _clientTutorialGuideFailureLogged;
     private SushiBarOrderQueue.ProgressData _remoteSushiPlate;
     private bool _clientRemoteSushiPlate;
+    private bool _hostSushiOpened;
+    private bool _clientSushiOpened;
+    private bool _clientSushiAutonomyStopped;
+    private bool _clientFoodServeRequestActive;
+    private int _nextSushiVisitGeneration;
+    private int _activeDrinkTarget = -1;
+    private int _replayDrinkResult = -1;
+    private int _pendingClientDrinkTarget = -1;
+    private Il2CppSystem.Action<QTEResult, int> _pendingClientDrinkCallback;
     private bool _wasConnected;
     private bool _storySnapshotPublished;
     private float _nextStoryScan;
@@ -322,6 +347,21 @@ internal sealed class ManagerEventReplicator
 
     internal static void SelfTest()
     {
+        var drinkResult = PackDrinkResult(QTEResult.Perfect, 1250);
+        var drinkOrder = PackDrinkOrder(QTEType.GreenTea, 17.5f);
+        var customerIdentity = PackSushiCustomerIdentity(200101, 17);
+        if (!TryUnpackDrinkResult(
+                drinkResult, out var unpackedDrinkResult, out var unpackedDrinkPay) ||
+            unpackedDrinkResult != QTEResult.Perfect || unpackedDrinkPay != 1250 ||
+            TryUnpackDrinkResult((1250 << 2) | 3, out _, out _) ||
+            !TryUnpackDrinkOrder(
+                drinkOrder, out var unpackedDrinkType, out var unpackedDrinkWait) ||
+            unpackedDrinkType != QTEType.GreenTea ||
+            MathF.Abs(unpackedDrinkWait - 17.5f) > 0.01f ||
+            !TryUnpackSushiCustomerIdentity(
+                customerIdentity, out var unpackedTid, out var unpackedGeneration) ||
+            unpackedTid != 200101 || unpackedGeneration != 17)
+            throw new InvalidOperationException("Sushi drink protocol self-test failed");
         if (!IsLocalTimeScope(TimeScaleController.Type.PauseMenumAuto) ||
             IsLocalTimeScope(TimeScaleController.Type.InGameQTE) ||
             !IsActivityTerminal(ManagerDomain.Karaoke, ManagerAction.Result) ||
@@ -770,6 +810,7 @@ internal sealed class ManagerEventReplicator
         }
         if (role == SessionRole.Client)
         {
+            StopClientSushiAutonomy();
             ApplyPendingHostEvents(session, sceneId);
             TryApplyPendingTutorial(sceneId);
             TryShowClientTutorialGuide();
@@ -860,6 +901,20 @@ internal sealed class ManagerEventReplicator
         int value = 0,
         int context = 0)
     {
+        if (!_applying && _suppressPublish == 0 && role == SessionRole.Host &&
+            domain == ManagerDomain.MainSushi && action == ManagerAction.Start)
+        {
+            if (_hostSushiOpened)
+                return false;
+            _hostSushiOpened = true;
+            _hostSushiCustomers.Clear();
+            _nextSushiScan = 0f;
+            _nextSushiCustomerKeyframe = 0f;
+            if (session?.Connected != true)
+                return true;
+            Publish(session, domain, action, value, context);
+            return true;
+        }
         if (_applying || _suppressPublish > 0 || session == null || !session.Connected)
             return true;
         if (domain == ManagerDomain.Dialogue &&
@@ -874,6 +929,14 @@ internal sealed class ManagerEventReplicator
                 role, session.Connected,
                 ProbeBehaviour.Instance?.HasActiveNpcLease == true, action))
             return true;
+        if (role == SessionRole.Client && domain == ManagerDomain.MainSushi &&
+            action == ManagerAction.Start)
+        {
+            QueueClientRequest(session, ManagerDomain.MainSushi,
+                ManagerAction.SushiOpenRequest, 0, 0);
+            _log?.LogInfo("Sushi open requested by client");
+            return false;
+        }
         if (role == SessionRole.Host)
         {
             Publish(session, domain, action, value, context);
@@ -1003,16 +1066,144 @@ internal sealed class ManagerEventReplicator
             return true;
         if (!_clientRemoteSushiPlate)
         {
+            if (FindNearestDrinkCustomer(staff?.transform.position ?? default) != null)
+                return true;
             QueueClientRequest(session, ManagerDomain.SushiMenu,
                 ManagerAction.SushiPickupRequest, (int)SushiBar.Place.Main, 0);
             return false;
         }
         var customer = FindNearestCustomer(staff?.transform.position ?? default);
         if (customer != null)
+        {
+            var target = PackSushiTarget(customer.PlaceTag, customer.SeatNumber);
+            var generation = GetClientSushiGeneration(target);
+            if (generation == 0)
+            {
+                _log?.LogWarning($"Sushi serve blocked without visit token: target={target}");
+                return false;
+            }
             QueueClientRequest(session, ManagerDomain.SushiMenu,
-                ManagerAction.SushiServeRequest, 0,
-                PackSushiTarget(customer.PlaceTag, customer.SeatNumber));
+                ManagerAction.SushiServeRequest, 0, target, generation);
+        }
         return false;
+    }
+
+    internal bool AllowSushiAutonomy(SessionRole role, UdpSession session) =>
+        _applying || role != SessionRole.Client || session?.Connected != true;
+
+    internal bool AllowSushiAuthority(SessionRole role, UdpSession session) =>
+        role != SessionRole.Client || session?.Connected != true;
+
+    internal void BeginSushiDrink(
+        SessionRole role, UdpSession session,
+        SushiBar.Customer.SushiBarCustomer customer)
+    {
+        if (customer == null || session?.Connected != true)
+            return;
+        _activeDrinkTarget = PackSushiTarget(customer.PlaceTag, customer.SeatNumber);
+    }
+
+    internal void EndSushiDrink() => _activeDrinkTarget = -1;
+
+    internal bool InterceptSushiDrinkQte(
+        SessionRole role,
+        UdpSession session,
+        ref Il2CppSystem.Action<QTEResult, int> callback)
+    {
+        var target = _activeDrinkTarget;
+        _activeDrinkTarget = -1;
+        if (target < 0 || session?.Connected != true || callback == null)
+            return true;
+        if (_replayDrinkResult >= 0)
+        {
+            var packed = _replayDrinkResult;
+            _replayDrinkResult = -1;
+            if (TryUnpackDrinkResult(packed, out var result, out var pay))
+                callback.Invoke(result, pay);
+            return false;
+        }
+
+        var native = callback;
+        if (role == SessionRole.Client)
+        {
+            var completed = false;
+            callback = (Il2CppSystem.Action<QTEResult, int>)(Action<QTEResult, int>)((result, pay) =>
+            {
+                if (result == QTEResult.Ready)
+                {
+                    native.Invoke(result, pay);
+                    return;
+                }
+                if (completed)
+                    return;
+                completed = true;
+                var packed = PackDrinkResult(result, pay);
+                if (packed < 0)
+                {
+                    _log?.LogWarning(
+                        $"Sushi drink result rejected locally: result={result}; pay={pay}");
+                    native.Invoke(QTEResult.Bad, 0);
+                    return;
+                }
+                var generation = GetClientSushiGeneration(target);
+                if (generation == 0)
+                {
+                    _log?.LogWarning(
+                        $"Sushi drink blocked without visit token: target={target}");
+                    native.Invoke(QTEResult.Bad, 0);
+                    return;
+                }
+                CancelPendingClientDrink();
+                _pendingClientDrinkTarget = target;
+                _pendingClientDrinkCallback = native;
+                QueueClientRequest(session, ManagerDomain.SushiMenu,
+                    ManagerAction.SushiDrinkCommitRequest, packed, target, generation);
+                _log?.LogInfo(
+                    $"Sushi drink result requested: target={target}; result={result}; pay={pay}");
+            });
+            return true;
+        }
+        if (role != SessionRole.Host)
+            return true;
+        var hostCompleted = false;
+        callback = (Il2CppSystem.Action<QTEResult, int>)(Action<QTEResult, int>)((result, pay) =>
+        {
+            if (result == QTEResult.Ready)
+            {
+                native.Invoke(result, pay);
+                return;
+            }
+            if (hostCompleted)
+                return;
+            hostCompleted = true;
+            native.Invoke(result, pay);
+            var packed = PackDrinkResult(result, pay);
+            if (packed >= 0)
+            {
+                Publish(session, ManagerDomain.SushiMenu,
+                    ManagerAction.SushiDrinkServeResult, packed, target);
+                _log?.LogInfo(
+                    $"Sushi drink committed: target={target}; result={result}; pay={pay}");
+            }
+        });
+        return true;
+    }
+
+    internal void ObserveSushiFoodServed(
+        SessionRole role, UdpSession session,
+        SushiBar.Customer.SushiBarCustomer customer, bool success)
+    {
+        if (_applying || role != SessionRole.Host || session?.Connected != true ||
+            customer == null || !success)
+            return;
+        var target = PackSushiTarget(customer.PlaceTag, customer.SeatNumber);
+        if (target < 0)
+            return;
+        Publish(session, ManagerDomain.SushiMenu,
+            ManagerAction.SushiServeResult,
+            _clientFoodServeRequestActive ? 2 : 1, target);
+        _log?.LogInfo(
+            $"Sushi food committed: target={target}; recipe={customer.LastOrderedRecipeID}");
     }
 
     internal bool InterceptSushiClean(
@@ -1039,10 +1230,12 @@ internal sealed class ManagerEventReplicator
     }
 
     private void QueueClientRequest(
-        UdpSession session, ManagerDomain domain, ManagerAction action, int value, int context)
+        UdpSession session, ManagerDomain domain, ManagerAction action, int value, int context,
+        uint requestToken = 0)
     {
         TryQueueOutbound(session, new ManagerEvent(
-            0, _sceneId, CurrentTick(), (byte)domain, (byte)action, value, context));
+            0, _sceneId, requestToken == 0 ? CurrentTick() : requestToken,
+            (byte)domain, (byte)action, value, context));
         FlushOutbound(session);
     }
 
@@ -1919,6 +2112,10 @@ internal sealed class ManagerEventReplicator
         ResetLaneState(_pendingHostEvents, _hostRevisions, _clientManagerRevisions);
         _lastBlockedTraceRevisions.Clear();
         _hostMenuSlots.Clear();
+        _hostSushiCustomers.Clear();
+        _pendingClientSushiCustomers.Clear();
+        _pendingClientSushiCustomerSince.Clear();
+        _clientSushiGenerations.Clear();
         Array.Fill(_hostWasabi, -1);
         Array.Fill(_hostWallet, -1);
         _hostUnlocks.Clear();
@@ -1930,6 +2127,14 @@ internal sealed class ManagerEventReplicator
         ClearPendingClientTutorialGuide();
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
+        if (!preserveHostSessions)
+            _hostSushiOpened = false;
+        _clientSushiOpened = false;
+        _clientSushiAutonomyStopped = false;
+        _clientFoodServeRequestActive = false;
+        _activeDrinkTarget = -1;
+        _replayDrinkResult = -1;
+        CancelPendingClientDrink();
         _sushiRevision = 0;
         _clientSushiRevision = 0;
         _pendingSushiResult = null;
@@ -1959,6 +2164,7 @@ internal sealed class ManagerEventReplicator
         ResetClientManagementPanelOperation();
         _suppressPublish = 0;
         _nextSushiScan = 0f;
+        _nextSushiCustomerKeyframe = 0f;
         _nextProgressionScan = 0f;
         _nextDayScan = 0f;
         _nextStoryScan = 0f;
@@ -2033,6 +2239,9 @@ internal sealed class ManagerEventReplicator
         _hostTutorialStep = -1;
         _nextProgressionScan = 0f;
         _activeSessionSnapshotPublished = false;
+        _hostSushiCustomers.Clear();
+        _nextSushiScan = 0f;
+        _nextSushiCustomerKeyframe = 0f;
     }
 
     private void ForceHostStoryKeyframe()
@@ -2089,6 +2298,17 @@ internal sealed class ManagerEventReplicator
         ResetDialogueCommit();
         _remoteSushiPlate = null;
         _clientRemoteSushiPlate = false;
+        _hostSushiOpened = false;
+        _clientSushiOpened = false;
+        _clientSushiAutonomyStopped = false;
+        _clientFoodServeRequestActive = false;
+        _activeDrinkTarget = -1;
+        _replayDrinkResult = -1;
+        CancelPendingClientDrink();
+        _hostSushiCustomers.Clear();
+        _pendingClientSushiCustomers.Clear();
+        _pendingClientSushiCustomerSince.Clear();
+        _clientSushiGenerations.Clear();
         _pendingHostTimelineInvocation = null;
         CompletePendingPhoneCallback(false);
         _clientPhoneTid = 0;
@@ -2249,6 +2469,16 @@ internal sealed class ManagerEventReplicator
             PublishWallet(session, type);
             return;
         }
+        if (domain == ManagerDomain.MainSushi &&
+            (ManagerAction)state.Action == ManagerAction.SushiOpenRequest &&
+            state.SceneId == _sceneId && state.SceneId != 0 &&
+            state.SceneEpoch == session.LocalSceneEpoch && session.SceneMatches(_sceneId))
+        {
+            if (!_hostSushiOpened)
+                UnityEngine.Object.FindFirstObjectByType<SushiBarManager>()?
+                    .OnEventSushiBarOpened();
+            return;
+        }
         if ((domain is ManagerDomain.SushiMenu or ManagerDomain.SushiTable or
                 ManagerDomain.SushiWasabi) &&
             state.SceneId == _sceneId && state.SceneId != 0 &&
@@ -2362,6 +2592,18 @@ internal sealed class ManagerEventReplicator
             switch (domain)
             {
                 case ManagerDomain.MainSushi:
+                    if ((ManagerAction)state.Action == ManagerAction.Start)
+                    {
+                        if (_clientSushiOpened)
+                            return true;
+                        _pendingClientSushiCustomers.Clear();
+                        _pendingClientSushiCustomerSince.Clear();
+                        PurgeClientSushiCustomers();
+                        if (!ApplyMainSushi(ManagerAction.Start))
+                            return false;
+                        _clientSushiOpened = true;
+                        return true;
+                    }
                     return ApplyMainSushi((ManagerAction)state.Action);
                 case ManagerDomain.JungleSushi:
                     return ApplyJungleSushi((ManagerAction)state.Action, state.Value != 0);
@@ -2407,6 +2649,13 @@ internal sealed class ManagerEventReplicator
                     if ((ManagerAction)state.Action is ManagerAction.SushiPickupResult or
                         ManagerAction.SushiServeResult)
                         return ApplySushiFoodResult(
+                            (ManagerAction)state.Action, state.Value, state.Context);
+                    if ((ManagerAction)state.Action == ManagerAction.SushiDrinkServeResult)
+                        return ApplySushiDrinkResult(state.Value, state.Context);
+                    if ((ManagerAction)state.Action is ManagerAction.SushiCustomerUpsert or
+                        ManagerAction.SushiCustomerExit or ManagerAction.SushiCustomerOrder or
+                        ManagerAction.SushiCustomerDrinkOrder)
+                        return ApplySushiCustomerState(
                             (ManagerAction)state.Action, state.Value, state.Context);
                     return ApplyMenuState((ManagerAction)state.Action, state.Value, state.Context);
                 case ManagerDomain.SushiWasabi:
@@ -3175,6 +3424,43 @@ internal sealed class ManagerEventReplicator
     private void ApplySushiClientRequest(UdpSession session, ManagerEvent state)
     {
         var action = (ManagerAction)state.Action;
+        if (action == ManagerAction.SushiDrinkCommitRequest)
+        {
+            var success = false;
+            if (TryUnpackDrinkResult(state.Value, out _, out _) &&
+                _hostSushiCustomers.TryGetValue(state.Context, out var drinkState) &&
+                state.HostTick == (uint)drinkState.Generation &&
+                TryUnpackSushiTarget(state.Context, out var drinkPlace, out var drinkSeat))
+            {
+                var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
+                    .GetVisitCustomer(drinkSeat, drinkPlace);
+                var staff = SushiBarManager.Instance?.dave;
+                if (customer?.IsDrinkOrderWaiting == true && staff != null)
+                {
+                    try
+                    {
+                        _replayDrinkResult = state.Value;
+                        success = customer.ServedDrink(staff, null);
+                    }
+                    catch (Exception exception)
+                    {
+                        _log?.LogWarning(
+                            $"Sushi drink request replay failed: {exception.Message}");
+                    }
+                    finally
+                    {
+                        _replayDrinkResult = -1;
+                        _activeDrinkTarget = -1;
+                    }
+                }
+            }
+            Publish(session, ManagerDomain.SushiMenu,
+                ManagerAction.SushiDrinkServeResult, success ? state.Value : -1,
+                state.Context);
+            _log?.LogInfo(
+                $"Sushi drink request applied: target={state.Context}; success={success}");
+            return;
+        }
         if (action == ManagerAction.SushiPickupRequest)
         {
             var place = (SushiBar.Place)state.Value;
@@ -3198,6 +3484,8 @@ internal sealed class ManagerEventReplicator
         {
             var success = false;
             if (_remoteSushiPlate != null &&
+                _hostSushiCustomers.TryGetValue(state.Context, out var customerState) &&
+                state.HostTick == (uint)customerState.Generation &&
                 TryUnpackSushiTarget(state.Context, out var place, out var table))
             {
                 var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
@@ -3207,12 +3495,23 @@ internal sealed class ManagerEventReplicator
                 if (customer != null && customer.CanServed() &&
                     staff != null &&
                     (expected == null || expected.GetInstanceID() == customer.GetInstanceID()))
-                    success = customer.Served(staff);
+                {
+                    try
+                    {
+                        _clientFoodServeRequestActive = true;
+                        success = customer.Served(staff);
+                    }
+                    finally
+                    {
+                        _clientFoodServeRequestActive = false;
+                    }
+                }
             }
             if (success)
                 _remoteSushiPlate = null;
-            Publish(session, ManagerDomain.SushiMenu, ManagerAction.SushiServeResult,
-                success ? 1 : 0, state.Context);
+            if (!success)
+                Publish(session, ManagerDomain.SushiMenu,
+                    ManagerAction.SushiServeResult, 0, state.Context);
             return;
         }
         if (action == ManagerAction.SushiCleanRequest && state.Value is >= 0 and <= 1_000_000 &&
@@ -3242,12 +3541,7 @@ internal sealed class ManagerEventReplicator
         {
             if (value <= 0)
                 return true;
-            var place = TryUnpackSushiTarget(context, out var targetPlace, out _)
-                ? targetPlace
-                : SushiBar.Place.Main;
-            var local = SushiBarStaffManager.GetInstanceOrderQueue(place)?
-                .GetNowServingData(CustomerTypeFlag.ALL, null, false);
-            dave.ProgressData = local;
+            dave.ProgressData = null;
             dave.PickupRecipeID.Value = value;
             _clientRemoteSushiPlate = true;
             return true;
@@ -3258,13 +3552,234 @@ internal sealed class ManagerEventReplicator
         {
             var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
                 .GetVisitCustomer(table, placeTag);
-            if (customer?.CanServed() == true)
+            if (value == 2 && customer?.CanServed() == true)
                 customer.Served(dave);
+            else if (customer != null)
+            {
+                if (customer.ActionListener?.ActionType == CustomerActionType.Order)
+                    customer.ActionListener.Deactivate(CustomerActionType.Order);
+                customer.m_IsServed = true;
+                customer.CurrentState = SushiBar.Customer.SushiBarCustomer.StateBehaviour.Eat;
+            }
         }
-        dave.ProgressData = null;
-        dave.PickupRecipeID.Value = 0;
-        _clientRemoteSushiPlate = false;
+        if (value == 2)
+        {
+            dave.ProgressData = null;
+            dave.PickupRecipeID.Value = 0;
+            _clientRemoteSushiPlate = false;
+        }
         return true;
+    }
+
+    private bool ApplySushiDrinkResult(int packed, int target)
+    {
+        if (target == _pendingClientDrinkTarget && _pendingClientDrinkCallback != null)
+        {
+            var callback = _pendingClientDrinkCallback;
+            _pendingClientDrinkCallback = null;
+            _pendingClientDrinkTarget = -1;
+            if (TryUnpackDrinkResult(packed, out var result, out var pay))
+                callback.Invoke(result, pay);
+            else
+                callback.Invoke(QTEResult.Bad, 0);
+            return true;
+        }
+        if (packed < 0 || !TryUnpackSushiTarget(target, out var place, out var seat))
+            return true;
+        var customer = SushiBar.Customer.SushiBarCustomerManager.Instance?
+            .GetVisitCustomer(seat, place);
+        if (customer == null)
+            return false;
+        var staff = SushiBarManager.Instance?.dave;
+        if (staff != null && customer.IsDrinkOrderWaiting)
+        {
+            try
+            {
+                _replayDrinkResult = packed;
+                if (customer.ServedDrink(staff, null))
+                    return true;
+            }
+            catch (Exception exception)
+            {
+                _log?.LogWarning(
+                    $"Sushi drink client replay failed: {exception.Message}");
+            }
+            finally
+            {
+                _replayDrinkResult = -1;
+                _activeDrinkTarget = -1;
+            }
+        }
+        if (customer.ActionListener?.ActionType == CustomerActionType.OrderDrink)
+            customer.ActionListener.Deactivate(CustomerActionType.OrderDrink);
+        customer.m_IsServed = true;
+        customer.CurrentState = SushiBar.Customer.SushiBarCustomer.StateBehaviour.Eat;
+        return true;
+    }
+
+    private bool ApplySushiCustomerState(ManagerAction action, int value, int target)
+    {
+        if (!_clientSushiOpened)
+            return false;
+        if (!TryUnpackSushiTarget(target, out var place, out var seat))
+            return true;
+        var manager = SushiBar.Customer.SushiBarCustomerManager.Instance;
+        var impl = manager?.GetImpl(place);
+        if (manager == null || impl == null)
+            return false;
+        var customer = manager.GetVisitCustomer(seat, place);
+        if (action == ManagerAction.SushiCustomerUpsert)
+        {
+            if (!TryUnpackSushiCustomerIdentity(value, out var tid, out var generation))
+                return true;
+            _clientSushiGenerations[target] = generation;
+            if (customer != null && customer.Entity == null)
+                return false;
+            if (customer?.Entity?.TID == tid)
+            {
+                _pendingClientSushiCustomers.Remove(target);
+                _pendingClientSushiCustomerSince.Remove(target);
+                return true;
+            }
+            if (customer != null)
+            {
+                customer.ForceHide();
+                impl.Exit(customer);
+                return false;
+            }
+            if (_pendingClientSushiCustomers.TryGetValue(target, out var pendingTid) &&
+                pendingTid == tid)
+            {
+                var since = _pendingClientSushiCustomerSince[target];
+                if (!float.IsPositiveInfinity(since) &&
+                    Time.realtimeSinceStartup - since >= 5f)
+                {
+                    _pendingClientSushiCustomerSince[target] = float.PositiveInfinity;
+                    _log?.LogWarning(
+                        $"Sushi customer spawn still pending: tid={tid}; " +
+                        $"place={place}; seat={seat}");
+                }
+                return false;
+            }
+            _pendingClientSushiCustomers[target] = tid;
+            _pendingClientSushiCustomerSince[target] = Time.realtimeSinceStartup;
+            impl.ForceVisitSeatedCustomer(tid, seat);
+            _log?.LogInfo(
+                $"Sushi customer spawn requested: tid={tid}; generation={generation}; " +
+                $"place={place}; seat={seat}");
+            return false;
+        }
+        if (action == ManagerAction.SushiCustomerExit && value == 0)
+            _clientSushiGenerations.Remove(target);
+        if (customer == null)
+            return action == ManagerAction.SushiCustomerExit;
+        if (action == ManagerAction.SushiCustomerExit)
+        {
+            if (value != 0)
+            {
+                if (!customer.m_IsExit)
+                    customer.MoveExit();
+            }
+            else
+            {
+                customer.ForceHide();
+                impl.Exit(customer);
+            }
+            return true;
+        }
+        if (customer.ActionListener == null)
+            return false;
+        if (action == ManagerAction.SushiCustomerOrder)
+        {
+            if (value <= 0)
+            {
+                if (customer.ActionListener.ActionType == CustomerActionType.Order)
+                    customer.ActionListener.Deactivate(CustomerActionType.Order);
+                customer.LastOrderedRecipeID = 0;
+                return true;
+            }
+            if (customer.ActionListener.ActionType == CustomerActionType.Order &&
+                customer.LastOrderedRecipeID == value)
+                return true;
+            customer.LastOrderedRecipeID = value;
+            customer.ActionListener.Active(CustomerActionType.Order,
+                new EventParamCustomerOrder { recipeID = value, isEventParty = false });
+            return true;
+        }
+        if (action != ManagerAction.SushiCustomerDrinkOrder)
+            return false;
+        if (value == 0)
+        {
+            if (customer.ActionListener.ActionType == CustomerActionType.OrderDrink)
+                customer.ActionListener.Deactivate(CustomerActionType.OrderDrink);
+            return true;
+        }
+        if (!TryUnpackDrinkOrder(value, out var drinkType, out var waitTime))
+            return true;
+        if (customer.ActionListener.ActionType == CustomerActionType.OrderDrink &&
+            customer.LastOrderDrink == drinkType)
+            return true;
+        customer.LastOrderDrink = drinkType;
+        customer.SetOrderDrinkAnim();
+        customer.ActionListener.Active(CustomerActionType.OrderDrink,
+            new EventParamCustomerDrink
+            {
+                qteType = drinkType,
+                maxDrinkWaitTime = waitTime,
+                isEventParty = false
+            });
+        return true;
+    }
+
+    private void StopClientSushiAutonomy()
+    {
+        if (_clientSushiAutonomyStopped)
+            return;
+        var manager = SushiBar.Customer.SushiBarCustomerManager.Instance;
+        if (manager == null)
+            return;
+        for (var value = (int)SushiBar.Place.Main; value < (int)SushiBar.Place.Max; value++)
+            manager.GetImpl((SushiBar.Place)value)?.StopmRoutineVisitCustomer();
+        _clientSushiAutonomyStopped = true;
+        _log?.LogInfo("Client sushi customer dispatch stopped");
+    }
+
+    private void PurgeClientSushiCustomers()
+    {
+        var manager = SushiBar.Customer.SushiBarCustomerManager.Instance;
+        if (manager == null)
+            return;
+        var removed = 0;
+        foreach (var customer in UnityEngine.Object.FindObjectsByType<
+                     SushiBar.Customer.SushiBarCustomer>(FindObjectsSortMode.None))
+        {
+            if (customer == null || !customer.gameObject.activeInHierarchy)
+                continue;
+            var impl = manager.GetImpl(customer.PlaceTag);
+            if (impl == null)
+                continue;
+            customer.ForceHide();
+            impl.Exit(customer);
+            removed++;
+        }
+        _log?.LogInfo($"Client sushi customers purged before host snapshot: removed={removed}");
+    }
+
+    private void CancelPendingClientDrink()
+    {
+        var callback = _pendingClientDrinkCallback;
+        _pendingClientDrinkCallback = null;
+        _pendingClientDrinkTarget = -1;
+        if (callback == null)
+            return;
+        try
+        {
+            callback.Invoke(QTEResult.Bad, 0);
+        }
+        catch (Exception exception)
+        {
+            _log?.LogWarning($"Sushi drink callback cancel failed: {exception.Message}");
+        }
     }
 
     private bool ApplySushiCleanResult(int gold, int context)
@@ -3284,7 +3799,30 @@ internal sealed class ManagerEventReplicator
         foreach (var customer in UnityEngine.Object.FindObjectsByType<
                      SushiBar.Customer.SushiBarCustomer>(FindObjectsSortMode.None))
         {
-            if (customer == null || !customer.CanServed())
+            if (customer == null ||
+                customer.ActionListener?.ActionType != CustomerActionType.Order &&
+                !customer.CanServed())
+                continue;
+            var current = (customer.transform.position - position).sqrMagnitude;
+            if (current >= distance)
+                continue;
+            nearest = customer;
+            distance = current;
+        }
+        return nearest;
+    }
+
+    private static SushiBar.Customer.SushiBarCustomer FindNearestDrinkCustomer(
+        Vector3 position)
+    {
+        SushiBar.Customer.SushiBarCustomer nearest = null;
+        var distance = 16f;
+        foreach (var customer in UnityEngine.Object.FindObjectsByType<
+                     SushiBar.Customer.SushiBarCustomer>(FindObjectsSortMode.None))
+        {
+            if (customer == null ||
+                customer.ActionListener?.ActionType != CustomerActionType.OrderDrink &&
+                !customer.IsDrinkOrderWaiting)
                 continue;
             var current = (customer.transform.position - position).sqrMagnitude;
             if (current >= distance)
@@ -3324,6 +3862,61 @@ internal sealed class ManagerEventReplicator
             ? ((int)place << 16) | table
             : -1;
 
+    private static int PackDrinkResult(QTEResult result, int pay) =>
+        result is >= QTEResult.Bad and <= QTEResult.Perfect && pay is >= 0 and <= 1_000_000
+            ? (pay << 2) | (int)result
+            : -1;
+
+    private static bool TryUnpackDrinkResult(
+        int packed, out QTEResult result, out int pay)
+    {
+        result = (QTEResult)(packed & 3);
+        pay = (int)((uint)packed >> 2);
+        return packed >= 0 && result is >= QTEResult.Bad and <= QTEResult.Perfect &&
+            pay <= 1_000_000;
+    }
+
+    private static int PackDrinkOrder(QTEType type, float waitTime)
+    {
+        var wait = Math.Clamp((int)MathF.Round(waitTime * 100f), 0, short.MaxValue);
+        return wait << 16 | (int)type & 0xffff;
+    }
+
+    private static bool TryUnpackDrinkOrder(
+        int packed, out QTEType type, out float waitTime)
+    {
+        type = (QTEType)(packed & 0xffff);
+        waitTime = ((uint)packed >> 16) / 100f;
+        return packed > 0 && type != QTEType.None &&
+            ((int)type & ~(int)QTEType.All) == 0;
+    }
+
+    private int NextSushiVisitGeneration()
+    {
+        _nextSushiVisitGeneration = _nextSushiVisitGeneration >= 0x7ff
+            ? 1
+            : _nextSushiVisitGeneration + 1;
+        return _nextSushiVisitGeneration;
+    }
+
+    private uint GetClientSushiGeneration(int target) =>
+        _clientSushiGenerations.TryGetValue(target, out var generation) && generation > 0
+            ? (uint)generation
+            : 0;
+
+    private static int PackSushiCustomerIdentity(int tid, int generation) =>
+        tid is > 0 and <= 0xfffff && generation is > 0 and <= 0x7ff
+            ? generation << 20 | tid
+            : -1;
+
+    private static bool TryUnpackSushiCustomerIdentity(
+        int packed, out int tid, out int generation)
+    {
+        tid = packed & 0xfffff;
+        generation = (int)((uint)packed >> 20);
+        return packed > 0 && tid > 0 && generation is > 0 and <= 0x7ff;
+    }
+
     private static bool TryUnpackSushiTarget(
         int value, out SushiBar.Place place, out int table)
     {
@@ -3338,6 +3931,70 @@ internal sealed class ManagerEventReplicator
             return;
         try
         {
+            var customerKeyframe = Time.unscaledTime >= _nextSushiCustomerKeyframe;
+            if (customerKeyframe)
+                _nextSushiCustomerKeyframe = Time.unscaledTime + 5f;
+            var seenCustomers = new HashSet<int>();
+            foreach (var customer in UnityEngine.Object.FindObjectsByType<
+                         SushiBar.Customer.SushiBarCustomer>(FindObjectsSortMode.None))
+            {
+                var tid = customer?.Entity?.TID ?? 0;
+                if (customer == null || tid <= 0 || !customer.gameObject.activeInHierarchy)
+                    continue;
+                var target = PackSushiTarget(customer.PlaceTag, customer.SeatNumber);
+                if (target < 0)
+                    continue;
+                seenCustomers.Add(target);
+                var found = _hostSushiCustomers.TryGetValue(target, out var previous);
+                var instanceId = customer.GetInstanceID();
+                var sameVisit = found && previous.InstanceId == instanceId &&
+                    !(previous.Exiting && !customer.m_IsExit);
+                var generation = sameVisit
+                    ? previous.Generation
+                    : NextSushiVisitGeneration();
+                var current = new SushiCustomerState(
+                    tid,
+                    generation,
+                    instanceId,
+                    customer.IsOrderWaiting ? customer.LastOrderedRecipeID : 0,
+                    customer.IsDrinkOrderWaiting
+                        ? PackDrinkOrder(customer.LastOrderDrink, customer.MaxDrinkWaitTime)
+                        : 0,
+                    customer.m_IsExit);
+                var generationChanged = found && previous.Generation != current.Generation;
+                var known = !customerKeyframe && found && !generationChanged;
+                if (generationChanged)
+                    Publish(session, ManagerDomain.SushiMenu,
+                        ManagerAction.SushiCustomerExit, 0, target);
+                if (!known)
+                {
+                    Publish(session, ManagerDomain.SushiMenu,
+                        ManagerAction.SushiCustomerUpsert,
+                        PackSushiCustomerIdentity(current.Tid, current.Generation), target);
+                    _log?.LogInfo(
+                        $"Sushi customer published: tid={current.Tid}; " +
+                        $"generation={current.Generation}; target={target}");
+                }
+                if (!known || previous.RecipeId != current.RecipeId)
+                    Publish(session, ManagerDomain.SushiMenu,
+                        ManagerAction.SushiCustomerOrder, current.RecipeId, target);
+                if (!known || previous.Drink != current.Drink)
+                    Publish(session, ManagerDomain.SushiMenu,
+                        ManagerAction.SushiCustomerDrinkOrder, current.Drink, target);
+                if (current.Exiting && (!known || !previous.Exiting))
+                    Publish(session, ManagerDomain.SushiMenu,
+                        ManagerAction.SushiCustomerExit, 1, target);
+                _hostSushiCustomers[target] = current;
+            }
+            foreach (var target in new List<int>(_hostSushiCustomers.Keys))
+            {
+                if (seenCustomers.Contains(target))
+                    continue;
+                Publish(session, ManagerDomain.SushiMenu,
+                    ManagerAction.SushiCustomerExit, 0, target);
+                _hostSushiCustomers.Remove(target);
+            }
+
             var menu = SushiBarMenuManager.Instance;
             if (menu != null)
             {
@@ -5016,6 +5673,12 @@ internal sealed class ManagerEventReplicator
 
     private void PublishActiveSessionSnapshot(UdpSession session)
     {
+        if (_hostSushiOpened)
+        {
+            Publish(session, ManagerDomain.MainSushi, ManagerAction.Start, 0, 0);
+            _nextSushiScan = 0f;
+            _nextSushiCustomerKeyframe = 0f;
+        }
         if (_hostTimelineTid != 0 && _hostTimelineGeneration != 0)
         {
             Publish(session, ManagerDomain.Timeline, ManagerAction.TimelineStart,

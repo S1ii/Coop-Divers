@@ -1036,6 +1036,28 @@ public sealed class ProbeBehaviour : MonoBehaviour
     internal bool InterceptTimeReset() =>
         _managerEventReplicator?.InterceptTimeReset(Role, _session) ?? true;
 
+    internal bool AllowSushiAutonomy() =>
+        _managerEventReplicator?.AllowSushiAutonomy(Role, _session) ?? true;
+
+    internal bool AllowSushiAuthority() =>
+        _managerEventReplicator?.AllowSushiAuthority(Role, _session) ?? true;
+
+    internal void BeginSushiDrink(SushiBar.Customer.SushiBarCustomer customer) =>
+        _managerEventReplicator?.BeginSushiDrink(Role, _session, customer);
+
+    internal void EndSushiDrink() =>
+        _managerEventReplicator?.EndSushiDrink();
+
+    internal bool InterceptSushiDrinkQte(
+        ref Il2CppSystem.Action<SushiBar.QTE.QTEResult, int> callback) =>
+        _managerEventReplicator?.InterceptSushiDrinkQte(
+            Role, _session, ref callback) ?? true;
+
+    internal void ObserveSushiFoodServed(
+        SushiBar.Customer.SushiBarCustomer customer, bool success) =>
+        _managerEventReplicator?.ObserveSushiFoodServed(
+            Role, _session, customer, success);
+
     internal bool BeginManagerEvent(
         ManagerDomain domain,
         ManagerAction action,
